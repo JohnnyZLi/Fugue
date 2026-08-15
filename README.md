@@ -52,6 +52,18 @@ commit statuses + structured PR attestations
 
 Candidate control-plane changes are proposed future policy; they do not weaken the rules used to review their own PR.
 
+## Repository bootstrap and enforcement
+
+Once a repository already contains its protected-base `AGENTS.md` and `.fugue/**` policy, initialize the GitHub-side protocol state with:
+
+```bash
+fugue init
+```
+
+`fugue init` is idempotent. It creates any missing Fugue protocol labels and configures protection for the policy's default branch. The hard gate requires the configured CI contexts plus `fugue/integration`, requires an up-to-date branch when policy says so, enforces the gate for administrators, requires linear history, and blocks force-push/deletion bypass.
+
+Applying branch protection requires repository-owner/admin GitHub authentication with Administration write permission. If branch protection must be managed separately, `fugue init --no-protection` creates the protocol labels only.
+
 ## Normal workflow
 
 `fugue run` is the foreground orchestrator. Start it in a governed repository and leave it running while work advances. It polls GitHub, performs deterministic transitions automatically, promotes reviewed draft PRs, runs Integration, and reports merge readiness.
@@ -81,6 +93,8 @@ ready work
 ```
 
 If QA requests changes, the planner routes work back to the existing Worker identity. Control-plane acknowledgement, state drift, QA errors, Visual QA, and failed Integration remain explicit intervention boundaries where required.
+
+If a Codex Worker pushed its assigned branch but the process died before PR publication completed, Fugue recovers the existing committed result, revalidates its ownership and protected-base checks, and publishes/links the PR instead of blindly rerunning the Worker.
 
 ## Executors
 
@@ -152,7 +166,7 @@ fugue handoff integration --pr 456
 
 fugue link-pr 456 --issue 123
 
-fugue review 456 --role code --approve --agents-update not-required
+fugue review 456 --role code --approve --agents-update not-required --validation-control acceptable
 fugue review 456 --role security --approve
 fugue review 456 --role visual --approve --runtime-tested --viewports 1440x900,390x844
 
@@ -160,9 +174,9 @@ fugue acknowledge 456 --control-plane
 fugue integrate 456
 ```
 
-`doctor`, `sync`, and `init` are intentionally not part of the implemented bootstrap yet. The state protocol and autonomous coordination layer are being proven first.
+`doctor` and `sync` remain intentionally deferred. The state protocol, repository bootstrap, and autonomous coordination layer are implemented first.
 
-## Local bootstrap installation
+## Local installation
 
 Fugue currently runs from a local checkout.
 
@@ -190,13 +204,32 @@ For normal local use, authenticating the GitHub CLI is sufficient:
 gh auth login
 ```
 
-## Using Fugue on a repository
+## Working on Fugue with Fugue
+
+Fugue is itself a governed repository. After updating the local checkout and linking the current CLI, bootstrap GitHub enforcement once and then use the normal orchestrator:
+
+```bash
+git switch main
+git pull --ff-only origin main
+npm ci
+npm run build
+npm link
+
+fugue init
+fugue status
+fugue run --executor codex
+```
+
+After `fugue init`, normal Fugue issues use the same `state:*`, `agent:*`, ownership metadata, independent QA, and `fugue/integration` gate as any other governed repository. Final merge remains Human-controlled.
+
+## Using Fugue on another repository
 
 Clone a Fugue-governed repository and let the planner handle subsequent deterministic transitions:
 
 ```bash
 git clone https://github.com/JohnnyZLi/Path.git
 cd Path
+fugue init
 fugue status
 fugue run --executor codex
 ```
