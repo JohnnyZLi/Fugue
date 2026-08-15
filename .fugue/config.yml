@@ -1,0 +1,77 @@
+version: 1
+
+protocol:
+  version: 1
+
+repository:
+  default_branch: main
+  agents_file: AGENTS.md
+
+control_plane:
+  paths:
+    - "AGENTS.md"
+    - ".fugue/**"
+    - ".github/workflows/**"
+    - ".github/ISSUE_TEMPLATE/**"
+    - ".github/pull_request_template.md"
+
+validation:
+  install:
+    - npm ci
+  checks:
+    - npm run check
+    - npm test
+    - npm run build
+  required_ci:
+    - test
+  control_paths:
+    - "package.json"
+    - "package-lock.json"
+    - "tsconfig.json"
+    - "scripts/**"
+    - "src/core/validation.ts"
+    - "src/core/ci.ts"
+
+reviews:
+  code:
+    required: always
+
+  security:
+    required: conditional
+    paths:
+      - ".github/workflows/**"
+      - ".fugue/**"
+      - "package.json"
+      - "package-lock.json"
+      - "src/core/github.ts"
+      - "src/core/codex-executor.ts"
+      - "src/core/integration.ts"
+      - "src/core/reviews.ts"
+      - "src/core/attestations.ts"
+      - "src/core/policy.ts"
+      - "src/core/protocol.ts"
+      - "src/core/repository-init.ts"
+      - "src/commands/init.ts"
+
+  visual:
+    required: conditional
+    paths: []
+
+branches:
+  worker_pattern: "agent/{issue}-{slug}"
+  require_up_to_date: true
+
+allocation:
+  coordinator_only: true
+  require_assignment: true
+  require_worker_id: true
+  one_active_pr_per_issue: true
+
+dependencies:
+  require_satisfied_before_integration: true
+
+enforcement:
+  prefer_hard_merge_gate: true
+
+github:
+  source_of_truth: true
