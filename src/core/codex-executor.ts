@@ -75,8 +75,30 @@ export class CodexCliExecutor {
     const issueBody = issueResponse.data.body ?? "";
     const title = issueResponse.data.title;
     const reviewContext = work.pr ? await currentPrDiscussion(github, work.pr.number) : "";
+    const { resolveActivePolicy } = await import("./policy.js");
+    const active = await resolveActivePolicy(github);
 
     return withBranchWorktree(branch, async (worktree) => {
+      await git(["fetch", "--no-tags", "origin", active.identity.baseSha], worktree);
+
+      if (!work.pr) {
+        const committed = await committedWorkerPaths(worktree, active.identity.baseSha);
+        if (committed.length) {
+          assertWorkerChangesWithinOwnership(committed, work.metadata.spec.ownership);
+          await runValidation(worktree, active.config.validation.install, active.config.validation.checks);
+          const headSha = await git(["rev-parse", "HEAD"], worktree);
+          const prNumber = await publishWorkerPr(github, {
+            work,
+            title,
+            branch,
+            workerId,
+            baseBranch: active.identity.baseBranch,
+            report: "Recovered an already-pushed Worker result after interrupted PR publication.",
+          });
+          return { prNumber, headSha };
+        }
+      }
+
       const prompt = workerPrompt(github.repository.fullName, work, title, issueBody, reviewContext);
       const lastMessage = await this.runCodex(worktree, prompt, "workspace-write");
 
@@ -85,9 +107,6 @@ export class CodexCliExecutor {
         throw new Error(`Codex Worker for #${work.issueNumber} produced no repository changes.`);
       }
       assertWorkerChangesWithinOwnership(changedFiles, work.metadata.spec.ownership);
-
-      const { resolveActivePolicy } = await import("./policy.js");
-      const active = await resolveActivePolicy(github);
       await runValidation(worktree, active.config.validation.install, active.config.validation.checks);
 
       await git(["add", "--all"], worktree);
@@ -101,28 +120,15 @@ export class CodexCliExecutor {
 
       if (work.pr) return { prNumber: work.pr.number, headSha };
 
-      const body = upsertPrMetadata(
-        `## Implements\n\nCloses #${work.issueNumber}\n\n## Summary\n\nAutomated Fugue Codex Worker execution for ${work.metadata.work_id}.\n\n${lastMessage ? `## Worker Report\n\n${lastMessage.trim()}\n\n` : ""}`,
-        {
-          version: 1,
-          work_id: work.metadata.work_id,
-          issue: work.issueNumber,
-          worker_id: workerId,
-          branch,
-        },
-      );
-
-      const pr = await github.octokit.rest.pulls.create({
-        owner,
-        repo,
+      const prNumber = await publishWorkerPr(github, {
+        work,
         title,
-        head: branch,
-        base: active.identity.baseBranch,
-        body,
-        draft: true,
+        branch,
+        workerId,
+        baseBranch: active.identity.baseBranch,
+        report: lastMessage.trim(),
       });
-
-      return { prNumber: pr.data.number, headSha };
+      return { prNumber, headSha };
     });
   }
 
@@ -240,6 +246,79 @@ export async function changedPaths(cwd: string): Promise<string[]> {
   const tracked = (await git(["diff", "--name-only", "HEAD"], cwd)).split("\n").filter(Boolean);
   const untracked = (await git(["ls-files", "--others", "--exclude-standard"], cwd)).split("\n").filter(Boolean);
   return [...new Set([...tracked, ...untracked])].sort();
+}
+
+export async function committedWorkerPaths(cwd: string, baseSha: string): Promise<string[]> {
+  const aheadRaw = await git(["rev-list", "--count", `${baseSha}..HEAD`], cwd);
+  const ahead = Number(aheadRaw);
+  if (!Number.isInteger(ahead) || ahead < 0) {
+    throw new Error(`Unable to classify Worker branch against base ${baseSha}: ${aheadRaw}`);
+  }
+  if (ahead === 0) return [];
+
+  const mergeBase = await git(["merge-base", baseSha, "HEAD"], cwd);
+  const output = await git(["diff", "--name-only", `${mergeBase}..HEAD`], cwd);
+  return output.split("\n").filter(Boolean).sort();
+}
+
+async function publishWorkerPr(
+  github: FugueGitHub,
+  input: {
+    work: WorkState;
+    title: string;
+    branch: string;
+    workerId: string;
+    baseBranch: string;
+    report: string;
+  },
+): Promise<number> {
+  const { owner, repo } = github.repository;
+  const generatedBody = upsertPrMetadata(
+    `## Implements\n\nCloses #${input.work.issueNumber}\n\n## Summary\n\nAutomated Fugue Codex Worker execution for ${input.work.metadata.work_id}.\n\n${input.report ? `## Worker Report\n\n${input.report}\n\n` : ""}`,
+    {
+      version: 1,
+      work_id: input.work.metadata.work_id,
+      issue: input.work.issueNumber,
+      worker_id: input.workerId,
+      branch: input.branch,
+    },
+  );
+
+  const existing = await github.octokit.rest.pulls.list({
+    owner,
+    repo,
+    state: "open",
+    head: `${owner}:${input.branch}`,
+    per_page: 100,
+  });
+  if (existing.data.length) {
+    const pr = existing.data.find((candidate) => candidate.base.ref === input.baseBranch);
+    if (!pr) {
+      throw new Error(
+        `Assigned branch ${input.branch} already has an open PR targeting a different base; Coordinator must resolve it.`,
+      );
+    }
+    const body = upsertPrMetadata(pr.body ?? generatedBody, {
+      version: 1,
+      work_id: input.work.metadata.work_id,
+      issue: input.work.issueNumber,
+      worker_id: input.workerId,
+      branch: input.branch,
+    });
+    await github.octokit.rest.pulls.update({ owner, repo, pull_number: pr.number, body });
+    return pr.number;
+  }
+
+  const pr = await github.octokit.rest.pulls.create({
+    owner,
+    repo,
+    title: input.title,
+    head: input.branch,
+    base: input.baseBranch,
+    body: generatedBody,
+    draft: true,
+  });
+  return pr.data.number;
 }
 
 function workerPrompt(
