@@ -6,12 +6,11 @@ import {
   humanControlPlaneAttestationSchema,
   parseAttestation,
   serializeAttestation,
-  type EvaluationIdentity,
   type QaRole,
 } from "./attestations.js";
 import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
 import type { FugueGitHub } from "./github.js";
-import { FUGUE_CLI_VERSION } from "./protocol.js";
+import { FUGUE_CLI_VERSION, type EvaluationIdentity } from "./protocol.js";
 import { completeReview, currentReviewActivities, type CompleteReviewOptions } from "./reviews.js";
 
 const REVIEW_START = "<!-- fugue-review-submit";
@@ -319,10 +318,7 @@ async function canSubmitProtocolEvidence(github: FugueGitHub, actor: string): Pr
       repo,
       username: actor,
     });
-    return response.data.user.permissions.admin ||
-      response.data.user.permissions.maintain ||
-      response.data.user.permissions.push ||
-      response.data.permission === "write" ||
+    return response.data.permission === "write" ||
       response.data.permission === "maintain" ||
       response.data.permission === "admin";
   } catch {
