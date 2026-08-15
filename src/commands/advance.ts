@@ -1,6 +1,6 @@
 import type { QaRole } from "../core/attestations.js";
 import { ManualChatExecutor, type ExecutionRole } from "../core/executor.js";
-import { createGitHub } from "../core/github.js";
+import { requireWritableGitHub, type FugueGitHub } from "../core/github.js";
 import { discoverRepository } from "../core/git.js";
 import { reconstructState, type WorkState } from "../core/state.js";
 import { actionLabel, observeWork, planWork, type WorkflowAction } from "../core/workflow.js";
@@ -15,9 +15,9 @@ export interface AdvanceOptions {
 
 export async function runAdvance(options: AdvanceOptions): Promise<void> {
   const repository = await discoverRepository();
-  const github = await createGitHub(repository);
-  const state = await reconstructState(github);
-  const works = selectWorks(state.works, options);
+  const github = await requireWritableGitHub(repository);
+  const initialState = await reconstructState(github);
+  const works = selectWorks(initialState.works, options);
   const executor = new ManualChatExecutor();
 
   if (!works.length) {
@@ -25,31 +25,40 @@ export async function runAdvance(options: AdvanceOptions): Promise<void> {
     return;
   }
 
-  for (const work of works) {
-    const observation = await observeWork(github, work);
-    const action = planWork(observation);
+  for (const initialWork of works) {
+    let work: WorkState | undefined = initialWork;
 
-    console.log(`FUGUE ADVANCE — #${work.issueNumber} ${work.title}`);
-    console.log(`Current      ${work.stateLabel.replace("state:", "")}${work.pr ? ` / PR #${work.pr.number}` : ""}`);
-    console.log(`Next         ${actionLabel(action)}`);
+    for (let step = 0; step < 8 && work; step += 1) {
+      const observation = await observeWork(github, work);
+      const action = planWork(observation);
 
-    if (options.dryRun) {
-      console.log("Mode         dry-run; no mutation performed");
+      console.log(`FUGUE ADVANCE — #${work.issueNumber} ${work.title}`);
+      console.log(`Current      ${work.stateLabel.replace("state:", "")}${work.pr ? ` / PR #${work.pr.number}` : ""}`);
+      console.log(`Next         ${actionLabel(action)}`);
+
+      if (options.dryRun) {
+        console.log("Mode         dry-run; no mutation performed");
+        console.log("");
+        break;
+      }
+
+      const shouldContinue = await executeAction(repository.fullName, github, work, action, executor);
       console.log("");
-      continue;
-    }
+      if (!shouldContinue) break;
 
-    await executeAction(repository.fullName, work, action, executor);
-    console.log("");
+      const refreshed = await reconstructState(github);
+      work = refreshed.works.find((item) => item.issueNumber === initialWork.issueNumber);
+    }
   }
 }
 
 async function executeAction(
   repository: string,
+  github: FugueGitHub,
   work: WorkState,
   action: WorkflowAction,
   executor: ManualChatExecutor,
-): Promise<void> {
+): Promise<boolean> {
   switch (action.kind) {
     case "allocate_worker": {
       await runHandoff("worker", { issue: String(work.issueNumber) });
@@ -59,7 +68,7 @@ async function executeAction(
         issueNumber: work.issueNumber,
         workId: work.metadata.work_id,
       }));
-      return;
+      return false;
     }
     case "wait_worker":
     case "resume_worker": {
@@ -69,7 +78,7 @@ async function executeAction(
         issueNumber: work.issueNumber,
         workId: work.metadata.work_id,
       }));
-      return;
+      return false;
     }
     case "start_qa": {
       const prNumber = requirePr(work);
@@ -82,7 +91,7 @@ async function executeAction(
           workId: work.metadata.work_id,
         }));
       }
-      return;
+      return false;
     }
     case "wait_qa": {
       const prNumber = requirePr(work);
@@ -94,29 +103,50 @@ async function executeAction(
           workId: work.metadata.work_id,
         }));
       }
-      return;
+      return false;
     }
     case "human_control_plane_ack": {
       const prNumber = requirePr(work);
       console.log("HUMAN ACTION");
       console.log(`Review the control-plane change on PR #${prNumber}, then run:`);
       console.log(`fugue acknowledge ${prNumber} --control-plane`);
-      return;
+      return false;
+    }
+    case "mark_pr_ready": {
+      const prNumber = requirePr(work);
+      await markPrReady(github, prNumber);
+      console.log(`PR #${prNumber} marked ready for review.`);
+      return true;
     }
     case "integrate": {
       await runIntegrate(String(requirePr(work)));
-      return;
+      return true;
     }
     case "wait_integration":
       console.log("Integration is already running for the current head; no action taken.");
-      return;
+      return false;
     case "ready_to_merge":
       console.log(`MERGE READY — PR #${requirePr(work)} has a current successful Fugue Integration attestation.`);
-      return;
+      return false;
     case "blocked":
       console.log(`BLOCKED — ${action.reason}`);
-      return;
+      return false;
   }
+}
+
+async function markPrReady(github: FugueGitHub, prNumber: number): Promise<void> {
+  const { owner, repo } = github.repository;
+  const pr = await github.octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
+  if (!pr.data.draft) return;
+
+  await github.octokit.graphql(
+    `mutation MarkReady($pullRequestId: ID!) {
+      markPullRequestReadyForReview(input: { pullRequestId: $pullRequestId }) {
+        pullRequest { isDraft }
+      }
+    }`,
+    { pullRequestId: pr.data.node_id },
+  );
 }
 
 function printInstruction(instruction: { label: string; prompt: string }): void {
