@@ -25,8 +25,9 @@ export async function currentIntegrationState(
   if (!latest) return { state: "none" };
 
   if (latest.state !== "success") {
+    const state = integrationFailureState(latest.state);
     return {
-      state: latest.state,
+      state,
       ...(latest.target_url ? { targetUrl: latest.target_url } : {}),
     };
   }
@@ -62,4 +63,9 @@ export async function currentIntegrationState(
     attestation: current,
     ...(latest.target_url ? { targetUrl: latest.target_url } : {}),
   };
+}
+
+function integrationFailureState(value: string): "pending" | "failure" | "error" {
+  if (value === "pending" || value === "failure" || value === "error") return value;
+  return "error";
 }
