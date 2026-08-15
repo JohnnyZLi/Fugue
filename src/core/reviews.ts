@@ -12,6 +12,7 @@ import {
 } from "./attestations.js";
 import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
 import { FUGUE_CLI_VERSION } from "./protocol.js";
+import { resolveReviewActivity, type ReviewActivity } from "./review-activity.js";
 
 export interface CompleteReviewOptions {
   verdict: "approved" | "changes_requested" | "error";
@@ -20,12 +21,6 @@ export interface CompleteReviewOptions {
   runtimeTested?: boolean;
   viewports?: string[];
   summary?: string;
-}
-
-export interface ReviewActivity {
-  active: ReviewStart | null;
-  completed: QaAttestation | null;
-  superseded: ReviewStart[];
 }
 
 export async function beginReview(
@@ -168,16 +163,7 @@ export async function currentReviewActivity(
     if (value.kind === "qa" && value.role === role) attestations.push(value);
   }
 
-  const completedSessionIds = new Set(attestations.map((attestation) => attestation.session_id));
-  const activeSessions = sessions.filter((session) => !completedSessionIds.has(session.session_id));
-  const active = activeSessions.at(-1) ?? null;
-  const superseded = active ? activeSessions.slice(0, -1) : activeSessions;
-
-  return {
-    active,
-    completed: attestations.at(-1) ?? null,
-    superseded,
-  };
+  return resolveReviewActivity(sessions, attestations);
 }
 
 export async function currentQaAttestations(
