@@ -1,7 +1,7 @@
 import type { QaRole } from "../core/attestations.js";
 import { discoverRepository } from "../core/git.js";
 import { requireWritableGitHub } from "../core/github.js";
-import { completeReview } from "../core/reviews.js";
+import { completeReview, type CompleteReviewOptions } from "../core/reviews.js";
 
 export interface ReviewCommandOptions {
   role: string;
@@ -22,14 +22,18 @@ export async function runReview(prValue: string, options: ReviewCommandOptions):
   const repository = await discoverRepository();
   const github = await requireWritableGitHub(repository);
 
-  const result = await completeReview(github, prNumber, role, {
-    verdict,
-    agentsUpdate: parseAgentsUpdate(options.agentsUpdate),
-    validationControl: parseValidationControl(options.validationControl),
-    runtimeTested: options.runtimeTested,
-    viewports: parseViewports(options.viewports),
-    summary: options.summary,
-  });
+  const completion: CompleteReviewOptions = { verdict };
+  const agentsUpdate = parseAgentsUpdate(options.agentsUpdate);
+  const validationControl = parseValidationControl(options.validationControl);
+  const viewports = parseViewports(options.viewports);
+
+  if (agentsUpdate !== undefined) completion.agentsUpdate = agentsUpdate;
+  if (validationControl !== undefined) completion.validationControl = validationControl;
+  if (options.runtimeTested !== undefined) completion.runtimeTested = options.runtimeTested;
+  if (viewports !== undefined) completion.viewports = viewports;
+  if (options.summary !== undefined) completion.summary = options.summary;
+
+  const result = await completeReview(github, prNumber, role, completion);
 
   console.log(`${role.toUpperCase()} QA ${verdict === "approved" ? "APPROVED" : verdict === "changes_requested" ? "CHANGES REQUESTED" : "ERROR"}`);
   console.log(`PR           #${prNumber}`);
