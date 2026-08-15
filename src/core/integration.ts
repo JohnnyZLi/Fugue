@@ -18,6 +18,7 @@ import {
 } from "./gates.js";
 import type { FugueGitHub } from "./github.js";
 import {
+  assertValidationMatchesPlan,
   integrationPlanSchema,
   integrationValidationSchema,
   type IntegrationPlan,
@@ -104,6 +105,7 @@ export async function finalizeIntegration(
   if (!sameEvaluationIdentity(plan.identity, validation.identity)) {
     throw new Error("Integration validation evidence does not match the prepared evaluation identity.");
   }
+  assertValidationMatchesPlan(plan, validation);
 
   const snapshot = await captureEvaluation(github, plan.identity.prNumber);
   if (!sameEvaluationIdentity(plan.identity, snapshot.identity)) {
