@@ -4,7 +4,7 @@ import { resolveActivePolicy } from "../core/policy.js";
 import { applyBranchProtection, ensureProtocolLabels } from "../core/repository-init.js";
 
 export interface InitOptions {
-  noProtection?: boolean;
+  protection?: boolean;
 }
 
 export async function runInit(options: InitOptions): Promise<void> {
@@ -13,7 +13,7 @@ export async function runInit(options: InitOptions): Promise<void> {
   const policy = await resolveActivePolicy(github);
 
   const labels = await ensureProtocolLabels(github);
-  const protection = options.noProtection
+  const protection = options.protection === false
     ? null
     : await applyBranchProtection(github, policy.config);
 
