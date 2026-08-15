@@ -10,6 +10,7 @@ function observation(overrides: Partial<WorkflowObservation> = {}): WorkflowObse
     workerClaimed: true,
     hasPr: true,
     prNumber: 11,
+    prDraft: false,
     drift: [],
     qa: [{ role: "code", state: "approved", supersededSessions: 0 }],
     controlPlaneChanged: false,
@@ -26,12 +27,13 @@ describe("workflow planner", () => {
       workerClaimed: false,
       hasPr: false,
       prNumber: undefined,
+      prDraft: false,
       qa: [],
     }))).toEqual({ kind: "allocate_worker" });
   });
 
   it("waits for a claimed Worker to publish a PR", () => {
-    expect(planWork(observation({ hasPr: false, prNumber: undefined, qa: [] }))).toEqual({ kind: "wait_worker" });
+    expect(planWork(observation({ hasPr: false, prNumber: undefined, prDraft: false, qa: [] }))).toEqual({ kind: "wait_worker" });
   });
 
   it("starts all required QA that has no active evidence", () => {
@@ -62,7 +64,11 @@ describe("workflow planner", () => {
     }))).toEqual({ kind: "human_control_plane_ack" });
   });
 
-  it("runs Integration after all current QA is approved", () => {
+  it("promotes a draft PR before Integration", () => {
+    expect(planWork(observation({ prDraft: true }))).toEqual({ kind: "mark_pr_ready" });
+  });
+
+  it("runs Integration after all current QA is approved and the PR is ready", () => {
     expect(planWork(observation())).toEqual({ kind: "integrate" });
   });
 
