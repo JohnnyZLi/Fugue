@@ -44,3 +44,18 @@ export function parseIntegrationPlan(value: unknown): IntegrationPlan {
 export function parseIntegrationValidation(value: unknown): IntegrationValidation {
   return integrationValidationSchema.parse(value);
 }
+
+export function expectedValidationCommands(plan: IntegrationPlan): string[] {
+  return [...plan.validation.install, ...plan.validation.checks];
+}
+
+export function assertValidationMatchesPlan(
+  plan: IntegrationPlan,
+  validation: IntegrationValidation,
+): void {
+  const expected = expectedValidationCommands(plan);
+  if (validation.commands.length !== expected.length ||
+    validation.commands.some((command, index) => command !== expected[index])) {
+    throw new Error("Integration validation evidence does not match the protected-base command plan.");
+  }
+}
