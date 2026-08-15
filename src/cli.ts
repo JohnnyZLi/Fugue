@@ -7,6 +7,7 @@ import { runHandoff } from "./commands/handoff.js";
 import { runIntegrate } from "./commands/integrate.js";
 import { runLinkPr } from "./commands/link-pr.js";
 import { runReview } from "./commands/review.js";
+import { runOrchestrator } from "./commands/run.js";
 import { runStatus } from "./commands/status.js";
 import { FUGUE_CLI_VERSION } from "./core/protocol.js";
 
@@ -29,6 +30,14 @@ program
   .option("--pr <number>", "Advance only the work item linked to one PR")
   .option("--dry-run", "Plan the next transition without mutating GitHub")
   .action(runAdvance);
+
+program
+  .command("run")
+  .description("Continuously watch GitHub and advance Fugue work until external or Human action changes")
+  .option("--issue <number>", "Watch only one Fugue work issue")
+  .option("--pr <number>", "Watch only the work item linked to one PR")
+  .option("--interval <seconds>", "GitHub polling interval in seconds", "15")
+  .action(runOrchestrator);
 
 program
   .command("handoff")
