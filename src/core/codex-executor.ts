@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { z } from "zod";
 import type { QaRole } from "./attestations.js";
 import type { EvaluationSnapshot } from "./evaluation.js";
-import { git, repositoryRoot } from "./git.js";
+import { git } from "./git.js";
 import { matchesAnyPath } from "./glob.js";
 import type { FugueGitHub } from "./github.js";
 import type { WorkState } from "./state.js";
@@ -66,9 +66,10 @@ export class CodexCliExecutor {
     const issueResponse = await github.octokit.rest.issues.get({ owner, repo, issue_number: work.issueNumber });
     const issueBody = issueResponse.data.body ?? "";
     const title = issueResponse.data.title;
+    const reviewContext = work.pr ? await currentPrDiscussion(github, work.pr.number) : "";
 
     return withBranchWorktree(branch, async (worktree) => {
-      const prompt = workerPrompt(github.repository.fullName, work, title, issueBody);
+      const prompt = workerPrompt(github.repository.fullName, work, title, issueBody, reviewContext);
       const lastMessage = await this.runCodex(worktree, prompt, "workspace-write");
 
       const changedFiles = await changedPaths(worktree);
@@ -77,14 +78,16 @@ export class CodexCliExecutor {
       }
       assertWorkerChangesWithinOwnership(changedFiles, work.metadata.spec.ownership);
 
-      const policy = (await import("./policy.js")).resolveActivePolicy;
-      const active = await policy(github);
+      const { resolveActivePolicy } = await import("./policy.js");
+      const active = await resolveActivePolicy(github);
       await runValidation(worktree, active.config.validation.install, active.config.validation.checks);
 
       await git(["add", "--all"], worktree);
-      await git(["commit", "-m", `Implement #${work.issueNumber}: ${title}`], worktree);
+      await git(["commit", "-m", `${work.pr ? "Address review for" : "Implement"} #${work.issueNumber}: ${title}`], worktree);
       const headSha = await git(["rev-parse", "HEAD"], worktree);
       await git(["push", "origin", `HEAD:refs/heads/${branch}`], worktree);
+
+      if (work.pr) return { prNumber: work.pr.number, headSha };
 
       const body = upsertPrMetadata(
         `## Implements\n\nCloses #${work.issueNumber}\n\n## Summary\n\nAutomated Fugue Codex Worker execution for ${work.metadata.work_id}.\n\n${lastMessage ? `## Worker Report\n\n${lastMessage.trim()}\n\n` : ""}`,
@@ -128,8 +131,11 @@ export class CodexCliExecutor {
       const schema = role === "code" ? codeQaJsonSchema() : genericQaJsonSchema();
       const prompt = qaPrompt(snapshot, role);
       const output = await this.runCodex(worktree, prompt, "read-only", schema);
-      const parsed = JSON.parse(output);
+      const parsed: unknown = JSON.parse(output);
       const result = role === "code" ? codeQaResultSchema.parse(parsed) : genericQaResultSchema.parse(parsed);
+
+      const dirty = await git(["status", "--porcelain"], worktree);
+      if (dirty) throw new Error(`Codex ${role} QA modified the exact-head review worktree; verdict rejected.`);
 
       if (role === "code") {
         const code = codeQaResultSchema.parse(result);
@@ -147,8 +153,6 @@ export class CodexCliExecutor {
         });
       }
 
-      const dirty = await git(["status", "--porcelain"], worktree);
-      if (dirty) throw new Error(`Codex ${role} QA modified the exact-head review worktree; verdict rejected.`);
       return result;
     });
   }
@@ -200,7 +204,13 @@ export async function changedPaths(cwd: string): Promise<string[]> {
   return [...new Set([...tracked, ...untracked])].sort();
 }
 
-function workerPrompt(repository: string, work: WorkState, title: string, issueBody: string): string {
+function workerPrompt(
+  repository: string,
+  work: WorkState,
+  title: string,
+  issueBody: string,
+  reviewContext: string,
+): string {
   return [
     `You are the Fugue implementation Worker for ${repository} issue #${work.issueNumber} (${work.metadata.work_id}).`,
     `Task: ${title}`,
@@ -208,12 +218,13 @@ function workerPrompt(repository: string, work: WorkState, title: string, issueB
     "--- ISSUE BODY ---",
     issueBody,
     "--- END ISSUE BODY ---",
+    reviewContext ? `Current PR review discussion follows. Address only actionable findings relevant to the issue scope.\n--- REVIEW DISCUSSION ---\n${reviewContext}\n--- END REVIEW DISCUSSION ---` : "",
     `Owned paths: ${work.metadata.spec.ownership.owned.join(", ") || "none"}`,
     `Coordinate paths: ${work.metadata.spec.ownership.coordinate.join(", ") || "none"}`,
     `Forbidden paths: ${work.metadata.spec.ownership.forbidden.join(", ") || "none"}`,
     "Read AGENTS.md and repository code. Implement only this issue. Run relevant checks. Do not commit, push, open a PR, or modify GitHub; Fugue will publish the result. Do not broaden scope.",
     "Finish with a concise summary of changes and validation.",
-  ].join("\n\n");
+  ].filter(Boolean).join("\n\n");
 }
 
 function qaPrompt(snapshot: EvaluationSnapshot, role: Exclude<QaRole, "visual">): string {
@@ -228,6 +239,17 @@ function qaPrompt(snapshot: EvaluationSnapshot, role: Exclude<QaRole, "visual">)
       ? "Set agents_update to not-required, present, or missing. Set validation_control when candidate validation machinery changed."
       : "Focus on security regressions, privilege/input boundaries, dependencies, CI/CD, and control-plane implications in scope.",
   ].join("\n\n");
+}
+
+async function currentPrDiscussion(github: FugueGitHub, prNumber: number): Promise<string> {
+  const { owner, repo } = github.repository;
+  const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
+    owner,
+    repo,
+    issue_number: prNumber,
+    per_page: 100,
+  });
+  return comments.slice(-20).map((comment) => comment.body ?? "").filter(Boolean).join("\n\n---\n\n");
 }
 
 function formatQaSummary(summary: string, findings: string[]): string {
