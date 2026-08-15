@@ -1,7 +1,12 @@
 import { beginReview } from "../core/reviews.js";
 import type { QaRole } from "../core/attestations.js";
 import { captureEvaluation } from "../core/evaluation.js";
-import { createWorkId, parseWorkMetadata, upsertWorkMetadata, workMetadataSchema, workSpecDigest } from "../core/metadata.js";
+import {
+  assertWorkMetadataForIssue,
+  parseWorkMetadata,
+  upsertWorkMetadata,
+  workSpecDigest,
+} from "../core/metadata.js";
 import { discoverRepository } from "../core/git.js";
 import { createGitHub, requireWritableGitHub } from "../core/github.js";
 import { resolveActivePolicy } from "../core/policy.js";
@@ -75,6 +80,7 @@ async function runCoordinatorHandoff(): Promise<void> {
   console.log("COORDINATOR RULES");
   console.log("- GitHub and protected-base Fugue policy are durable truth.");
   console.log("- Decompose user intent into bounded GitHub issues before allocation.");
+  console.log("- Prepare fugue-work metadata before handing an issue to a Worker.");
   console.log("- Keep specification changes in issue body/spec metadata, not only comments.");
   console.log("- Allocate one Worker claim per issue and resolve ownership/dependency conflicts.");
   console.log("- Sequence expensive final QA when strict-base churn would waste review work.");
@@ -165,22 +171,17 @@ async function runWorkerHandoff(options: HandoffOptions): Promise<void> {
 
   const labels = issue.labels.map(labelName);
   const body = issue.body ?? "";
-  let metadata = parseWorkMetadata(body);
-
+  const metadata = parseWorkMetadata(body);
   if (!metadata) {
-    if (options.resume) throw new Error(`Issue #${issueNumber} has no Fugue work metadata to resume.`);
-    if (!labels.includes("state:ready")) throw new Error(`Issue #${issueNumber} must have state:ready before allocation.`);
-    if (!labels.includes("agent:ready")) throw new Error(`Issue #${issueNumber} must have agent:ready before allocation.`);
-
-    metadata = workMetadataSchema.parse({
-      version: 1,
-      work_id: createWorkId(issueNumber),
-      spec: {},
-      execution: {},
-    });
+    throw new Error(
+      `Issue #${issueNumber} is not Fugue-prepared. Coordinator must add a valid fugue-work metadata block before Worker allocation.`,
+    );
   }
+  assertWorkMetadataForIssue(metadata, issueNumber);
 
   if (!options.resume) {
+    if (!labels.includes("state:ready")) throw new Error(`Issue #${issueNumber} must have state:ready before allocation.`);
+    if (!labels.includes("agent:ready")) throw new Error(`Issue #${issueNumber} must have agent:ready before allocation.`);
     await assertDependenciesSatisfied(github, metadata.spec.dependencies);
   }
 
