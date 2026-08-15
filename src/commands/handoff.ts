@@ -1,9 +1,11 @@
 import { beginReview } from "../core/reviews.js";
 import type { QaRole } from "../core/attestations.js";
+import { captureEvaluation } from "../core/evaluation.js";
 import { createWorkId, parseWorkMetadata, upsertWorkMetadata, workMetadataSchema, workSpecDigest } from "../core/metadata.js";
 import { discoverRepository } from "../core/git.js";
-import { requireWritableGitHub } from "../core/github.js";
+import { createGitHub, requireWritableGitHub } from "../core/github.js";
 import { resolveActivePolicy } from "../core/policy.js";
+import { reconstructState } from "../core/state.js";
 import { claimWorker } from "../core/worker.js";
 
 export interface HandoffOptions {
@@ -13,6 +15,11 @@ export interface HandoffOptions {
 }
 
 export async function runHandoff(role: string, options: HandoffOptions): Promise<void> {
+  if (role === "coordinator") {
+    await runCoordinatorHandoff();
+    return;
+  }
+
   if (role === "worker") {
     await runWorkerHandoff(options);
     return;
@@ -24,7 +31,91 @@ export async function runHandoff(role: string, options: HandoffOptions): Promise
     return;
   }
 
-  throw new Error(`Role ${role} is not implemented yet.`);
+  if (role === "integration") {
+    await runIntegrationHandoff(options);
+    return;
+  }
+
+  throw new Error(`Unknown Fugue role: ${role}`);
+}
+
+async function runCoordinatorHandoff(): Promise<void> {
+  const repository = await discoverRepository();
+  const github = await createGitHub(repository);
+  const state = await reconstructState(github);
+
+  console.log("FUGUE COORDINATOR HANDOFF");
+  console.log("");
+  console.log(`Repository   ${repository.fullName}`);
+  console.log(`Base         ${state.policy.identity.baseBranch} @ ${state.policy.identity.baseSha.slice(0, 8)}`);
+  console.log(`Policy       ${state.policy.identity.policyDigest.slice(0, 19)}`);
+  console.log(`Protocol     ${state.policy.identity.protocolVersion}`);
+  console.log("");
+  console.log("ACTIVE WORK");
+
+  if (!state.works.length) {
+    console.log("- none");
+  } else {
+    for (const work of state.works) {
+      const pr = work.pr ? `PR #${work.pr.number}${work.pr.draft ? " draft" : ""}` : "no PR";
+      const worker = work.metadata.execution.worker_id ?? "unclaimed";
+      const dependencyText = work.metadata.spec.dependencies.length
+        ? `deps ${work.metadata.spec.dependencies.map((n) => `#${n}`).join(", ")}`
+        : "no deps";
+      console.log(
+        `- #${work.issueNumber} ${work.title} — ${work.stateLabel.replace("state:", "")} — ${worker} — ${pr} — ${dependencyText}`,
+      );
+      for (const drift of work.drift) console.log(`  STATE DRIFT: ${drift}`);
+    }
+  }
+
+  for (const drift of state.drift) console.log(`REPOSITORY DRIFT: ${drift}`);
+
+  console.log("");
+  console.log("COORDINATOR RULES");
+  console.log("- GitHub and protected-base Fugue policy are durable truth.");
+  console.log("- Decompose user intent into bounded GitHub issues before allocation.");
+  console.log("- Keep specification changes in issue body/spec metadata, not only comments.");
+  console.log("- Allocate one Worker claim per issue and resolve ownership/dependency conflicts.");
+  console.log("- Sequence expensive final QA when strict-base churn would waste review work.");
+  console.log("- Do not rely on previous chat memory to reconstruct state.");
+}
+
+async function runIntegrationHandoff(options: HandoffOptions): Promise<void> {
+  if (!options.pr) throw new Error("Integration handoff requires --pr <number>.");
+  const prNumber = parsePositiveInteger(options.pr, "PR");
+  const repository = await discoverRepository();
+  const github = await createGitHub(repository);
+  const snapshot = await captureEvaluation(github, prNumber);
+
+  console.log("FUGUE INTEGRATION HANDOFF");
+  console.log("");
+  console.log(`Repository   ${repository.fullName}`);
+  console.log(`PR           #${prNumber} — ${snapshot.pr.title}`);
+  console.log(`Head         ${snapshot.identity.headSha}`);
+  console.log(`Base         ${snapshot.identity.baseBranch} @ ${snapshot.identity.baseSha.slice(0, 8)}`);
+  console.log(`Policy       ${snapshot.identity.policyDigest.slice(0, 19)}`);
+  console.log(`Work spec    ${snapshot.identity.workSpecDigest.slice(0, 19)}`);
+  console.log("");
+  console.log("REQUIRED QA");
+  for (const requirement of snapshot.qa.required) {
+    console.log(`- ${requirement.role}: ${requirement.reasons.join("; ")}`);
+  }
+  if (!snapshot.qa.required.length) console.log("- none");
+  console.log("");
+  console.log("DEPENDENCIES");
+  console.log(
+    snapshot.workMetadata.spec.dependencies.length
+      ? snapshot.workMetadata.spec.dependencies.map((n) => `#${n}`).join(", ")
+      : "none",
+  );
+  console.log("");
+  console.log("INTEGRATION RULES");
+  console.log("- Do not infer PASS from this handoff; run fugue integrate for the composite gate.");
+  console.log("- Validation must execute in an exact-head clean worktree.");
+  console.log("- Validation commands come from protected-base policy.");
+  console.log("- Control-plane changes require current Human acknowledgement.");
+  console.log("- A final snapshot recheck must match head/base/policy/work spec before success.");
 }
 
 async function runQaHandoff(role: QaRole, options: HandoffOptions): Promise<void> {
