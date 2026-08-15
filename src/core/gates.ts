@@ -1,6 +1,16 @@
 import type { FugueGitHub } from "./github.js";
 import { parsePrMetadata } from "./pr-metadata.js";
 
+export class IntegrationGateFailure extends Error {
+  readonly gate: string;
+
+  constructor(gate: string, message: string) {
+    super(message);
+    this.name = "IntegrationGateFailure";
+    this.gate = gate;
+  }
+}
+
 export async function verifyBaseCurrent(
   github: FugueGitHub,
   baseSha: string,
@@ -14,7 +24,8 @@ export async function verifyBaseCurrent(
   });
 
   if (response.data.status !== "ahead" && response.data.status !== "identical") {
-    throw new Error(
+    throw new IntegrationGateFailure(
+      "base-current",
       `PR head is not current with base ${baseSha.slice(0, 8)} (compare status: ${response.data.status}).`,
     );
   }
@@ -51,12 +62,15 @@ export async function verifyDependenciesSatisfied(
   for (const dependency of dependencies) {
     const issue = await github.octokit.rest.issues.get({ owner, repo, issue_number: dependency });
     if (issue.data.state !== "closed") {
-      throw new Error(`Dependency #${dependency} is not satisfied; the issue is still open.`);
+      throw new IntegrationGateFailure("dependencies", `Dependency #${dependency} is not satisfied; the issue is still open.`);
     }
 
     const linked = linkedByIssue.get(dependency) ?? [];
     if (linked.length && !linked.some((pull) => pull.merged_at !== null)) {
-      throw new Error(`Dependency #${dependency} has Fugue-linked PRs but none are merged.`);
+      throw new IntegrationGateFailure(
+        "dependencies",
+        `Dependency #${dependency} has Fugue-linked PRs but none are merged.`,
+      );
     }
   }
 }
@@ -65,7 +79,7 @@ export async function verifyMergeability(github: FugueGitHub, prNumber: number):
   const { owner, repo } = github.repository;
   const response = await github.octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
   if (response.data.mergeable === false) {
-    throw new Error(`PR #${prNumber} is not mergeable.`);
+    throw new IntegrationGateFailure("conflicts", `PR #${prNumber} is not mergeable.`);
   }
   if (response.data.mergeable === null) {
     throw new Error(`GitHub has not resolved mergeability for PR #${prNumber}; retry Integration.`);
