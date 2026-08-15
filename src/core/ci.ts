@@ -1,3 +1,4 @@
+import { IntegrationGateFailure } from "./gates.js";
 import type { FugueGitHub } from "./github.js";
 
 export interface CiVerification {
@@ -37,7 +38,10 @@ export async function verifyRequiredCi(
         : latestStatus
           ? `status=${latestStatus.state}`
           : "not found";
-      throw new Error(`Required CI '${name}' has not passed on ${headSha.slice(0, 8)} (${detail}).`);
+      throw new IntegrationGateFailure(
+        "ci",
+        `Required CI '${name}' has not passed on ${headSha.slice(0, 8)} (${detail}).`,
+      );
     }
   }
 
