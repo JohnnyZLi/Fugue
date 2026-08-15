@@ -111,6 +111,7 @@ integrationRuntime
   .command("prepare")
   .argument("<pr>", "GitHub pull request number")
   .requiredOption("--out <path>", "Write the immutable Integration plan JSON")
+  .requiredOption("--runtime-sha <sha>", "Protected-base commit containing the trusted Integration runtime")
   .option("--github-output <path>", "Append GitHub Actions job outputs")
   .action(runIntegrationPrepare);
 
