@@ -23,6 +23,8 @@ export interface CompleteReviewOptions {
   summary?: string;
 }
 
+const QA_ROLES: readonly QaRole[] = ["code", "security", "visual"];
+
 export async function beginReview(
   github: FugueGitHub,
   prNumber: number,
@@ -141,6 +143,14 @@ export async function currentReviewActivity(
   snapshot: EvaluationSnapshot,
   role: QaRole,
 ): Promise<ReviewActivity> {
+  const activities = await currentReviewActivities(github, snapshot);
+  return activities.get(role) ?? resolveReviewActivity([], []);
+}
+
+export async function currentReviewActivities(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+): Promise<Map<QaRole, ReviewActivity>> {
   const { owner, repo } = github.repository;
   const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
     owner,
@@ -149,8 +159,13 @@ export async function currentReviewActivity(
     per_page: 100,
   });
 
-  const sessions: ReviewStart[] = [];
-  const attestations: QaAttestation[] = [];
+  const sessions = new Map<QaRole, ReviewStart[]>();
+  const attestations = new Map<QaRole, QaAttestation[]>();
+  for (const role of QA_ROLES) {
+    sessions.set(role, []);
+    attestations.set(role, []);
+  }
+
   for (const comment of comments) {
     let value: ReturnType<typeof parseAttestation>;
     try {
@@ -159,36 +174,26 @@ export async function currentReviewActivity(
       continue;
     }
     if (!value || !sameEvaluationIdentity(value.identity, snapshot.identity)) continue;
-    if (value.kind === "review_start" && value.role === role) sessions.push(value);
-    if (value.kind === "qa" && value.role === role) attestations.push(value);
+    if (value.kind === "review_start") sessions.get(value.role)?.push(value);
+    if (value.kind === "qa") attestations.get(value.role)?.push(value);
   }
 
-  return resolveReviewActivity(sessions, attestations);
+  const activities = new Map<QaRole, ReviewActivity>();
+  for (const role of QA_ROLES) {
+    activities.set(role, resolveReviewActivity(sessions.get(role) ?? [], attestations.get(role) ?? []));
+  }
+  return activities;
 }
 
 export async function currentQaAttestations(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
 ): Promise<Map<QaRole, QaAttestation>> {
-  const { owner, repo } = github.repository;
-  const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
-    owner,
-    repo,
-    issue_number: snapshot.pr.number,
-    per_page: 100,
-  });
-
+  const activities = await currentReviewActivities(github, snapshot);
   const current = new Map<QaRole, QaAttestation>();
-  for (const comment of comments) {
-    let value: ReturnType<typeof parseAttestation>;
-    try {
-      value = parseAttestation(comment.body ?? "");
-    } catch {
-      continue;
-    }
-    if (value?.kind !== "qa") continue;
-    if (!sameEvaluationIdentity(value.identity, snapshot.identity)) continue;
-    current.set(value.role, value);
+
+  for (const [role, activity] of activities) {
+    if (!activity.active && activity.completed) current.set(role, activity.completed);
   }
   return current;
 }
