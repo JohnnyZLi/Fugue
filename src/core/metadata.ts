@@ -44,6 +44,15 @@ export function parseWorkMetadata(issueBody: string): WorkMetadata | null {
   return workMetadataSchema.parse(parseYaml(yaml));
 }
 
+export function assertWorkMetadataForIssue(metadata: WorkMetadata, issueNumber: number): void {
+  const expected = createWorkId(issueNumber);
+  if (metadata.work_id !== expected) {
+    throw new Error(
+      `Issue #${issueNumber} declares work_id ${metadata.work_id}; expected ${expected}. Coordinator must repair the machine metadata.`,
+    );
+  }
+}
+
 export function stripWorkMetadata(issueBody: string): string {
   const start = issueBody.indexOf(START);
   if (start < 0) return normalizeRequirements(issueBody);
