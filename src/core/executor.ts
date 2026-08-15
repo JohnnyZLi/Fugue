@@ -32,7 +32,7 @@ export class ManualChatExecutor implements Executor {
         executor: "manual-chat",
         role: request.role,
         label: `Worker — ${request.repository} #${request.issueNumber}`,
-        prompt: `Fugue Worker for ${request.repository} ${request.workId}. Reconstruct your assignment from GitHub, work only the assigned issue and branch, validate it, open/link the implementation PR, and record durable findings. Do not merge or self-approve.`,
+        prompt: `Fugue Worker for ${request.repository} ${request.workId}. Reconstruct the current assignment, Worker claim, assigned branch, repository contract, and scope from GitHub. Implement only that work on the assigned branch, use GitHub CI as authoritative remote validation, and open or update the implementation PR. Do not merge or self-approve. Do not ask the Human to operate Fugue from the terminal.`,
       };
     }
 
@@ -50,7 +50,7 @@ export class ManualChatExecutor implements Executor {
       executor: "manual-chat",
       role: request.role,
       label: `${readableRole} — ${request.repository} PR #${request.prNumber}`,
-      prompt: `Fugue ${readableRole} for ${request.repository} PR #${request.prNumber}. Reconstruct the current pending Fugue review session from GitHub, review the exact committed evaluation identity independently, and record the verdict durably. Do not implement fixes.`,
+      prompt: `Fugue ${readableRole} for ${request.repository} PR #${request.prNumber}. Reconstruct the current pending Fugue review session from GitHub, review the exact committed evaluation identity independently, and submit the verdict as a fugue-review-submit PR comment for that session. Do not implement fixes. Do not ask the Human to run fugue review or relay the verdict.`,
     };
   }
 }

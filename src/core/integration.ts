@@ -17,6 +17,13 @@ import {
   verifyMergeability,
 } from "./gates.js";
 import type { FugueGitHub } from "./github.js";
+import {
+  integrationPlanSchema,
+  integrationValidationSchema,
+  type IntegrationPlan,
+  type IntegrationValidation,
+} from "./integration-plan.js";
+import { assertOwnership } from "./ownership.js";
 import { FUGUE_CLI_VERSION } from "./protocol.js";
 import { currentQaAttestations } from "./reviews.js";
 import { runValidation } from "./validation.js";
@@ -28,7 +35,21 @@ export interface IntegrationResult {
   url: string;
 }
 
-export async function integrate(github: FugueGitHub, prNumber: number): Promise<IntegrationResult> {
+export interface PreparedIntegration {
+  snapshot: EvaluationSnapshot;
+  plan: IntegrationPlan;
+}
+
+interface Prerequisites {
+  qa: Map<QaRole, QaAttestation>;
+  codeAttestation: QaAttestation;
+  humanAcknowledgement: HumanControlPlaneAttestation | null;
+}
+
+export async function prepareIntegration(
+  github: FugueGitHub,
+  prNumber: number,
+): Promise<PreparedIntegration> {
   const snapshot = await captureEvaluation(github, prNumber);
   const { owner, repo } = github.repository;
 
@@ -42,153 +63,218 @@ export async function integrate(github: FugueGitHub, prNumber: number): Promise<
   });
 
   try {
-    await verifyBaseCurrent(github, snapshot.identity.baseSha, snapshot.identity.headSha);
-
-    const qa = await currentQaAttestations(github, snapshot);
-    verifyQa(snapshot, qa);
-
-    await verifyDependenciesSatisfied(github, snapshot.workMetadata.spec.dependencies);
-
-    const codeAttestation = qa.get("code");
-    if (!codeAttestation?.agents_md?.reviewed) {
-      throw new IntegrationGateFailure("agents", "Current Code QA lacks AGENTS.md impact attestation.");
-    }
-    if (codeAttestation.agents_md.update_required && !codeAttestation.agents_md.update_present) {
-      throw new IntegrationGateFailure("agents", "AGENTS.md update is required but not present.");
-    }
-
-    if (snapshot.qa.validationControlChanged) {
-      const validationControl = codeAttestation.validation_control;
-      if (!validationControl?.reviewed || !validationControl.acceptable) {
-        throw new IntegrationGateFailure(
-          "validation-control",
-          "Validation-control changes have not received an acceptable current Code QA attestation.",
-        );
-      }
-    }
-
-    let humanAcknowledgement: HumanControlPlaneAttestation | null = null;
-    if (snapshot.qa.controlPlaneChanged) {
-      humanAcknowledgement = await findCurrentHumanAcknowledgement(github, snapshot);
-      if (!humanAcknowledgement) {
-        throw new IntegrationGateFailure(
-          "control-plane",
-          "Control-plane changes require a current head-bound Human acknowledgement.",
-        );
-      }
-    }
-
-    const validation = await withCleanWorktree(snapshot.identity.headSha, (worktree) =>
-      runValidation(
-        worktree,
-        snapshot.policy.config.validation.install,
-        snapshot.policy.config.validation.checks,
-      ),
-    );
-
-    const ci = await verifyRequiredCi(
-      github,
-      snapshot.identity.headSha,
-      snapshot.policy.config.validation.required_ci,
-    );
-
-    await verifyMergeability(github, prNumber);
-
-    const finalSnapshot = await captureEvaluation(github, prNumber);
-    if (!sameEvaluationIdentity(snapshot.identity, finalSnapshot.identity)) {
-      throw new Error("Integration snapshot changed before success could be published; rerun Integration.");
-    }
-
-    const attestation = integrationAttestationSchema.parse({
+    const prerequisites = await verifyPrerequisites(github, snapshot);
+    const validationControl = prerequisites.codeAttestation.validation_control;
+    const plan = integrationPlanSchema.parse({
       version: 1,
-      kind: "integration",
-      attestation_id: createAttestationId("integration"),
       identity: snapshot.identity,
-      fugue_version: FUGUE_CLI_VERSION,
-      qa: {
-        code: qaGate(snapshot, qa, "code"),
-        security: qaGate(snapshot, qa, "security"),
-        visual: qaGate(snapshot, qa, "visual"),
+      validation: {
+        install: snapshot.policy.config.validation.install,
+        checks: snapshot.policy.config.validation.checks,
       },
-      dependencies: { passed: true },
+      required_ci: snapshot.policy.config.validation.required_ci,
+      qa_required: snapshot.qa.required.map((requirement) => requirement.role),
       agents_md: {
-        impact_reviewed: true,
-        update_required: codeAttestation.agents_md.update_required,
-        update_present: codeAttestation.agents_md.update_present,
+        update_required: prerequisites.codeAttestation.agents_md?.update_required ?? false,
+        update_present: prerequisites.codeAttestation.agents_md?.update_present ?? false,
       },
       control_plane: {
         changed: snapshot.qa.controlPlaneChanged,
-        human_acknowledgement: humanAcknowledgement ? "passed" : "not_required",
+        human_acknowledgement: prerequisites.humanAcknowledgement ? "passed" : "not_required",
       },
       validation_control: {
         changed: snapshot.qa.validationControlChanged,
-        reviewed: codeAttestation.validation_control?.reviewed ?? !snapshot.qa.validationControlChanged,
-        acceptable: codeAttestation.validation_control?.acceptable ?? !snapshot.qa.validationControlChanged,
+        reviewed: validationControl?.reviewed ?? !snapshot.qa.validationControlChanged,
+        acceptable: validationControl?.acceptable ?? !snapshot.qa.validationControlChanged,
       },
-      validation: {
-        clean_worktree: true,
-        passed: validation.passed,
-        commands: validation.commands,
-      },
-      ci: {
-        passed: ci.passed,
-        checks: ci.checks,
-      },
-      base_current: { passed: true },
-      conflicts: { none: true },
-      verdict: "approved",
       created_at: new Date().toISOString(),
     });
+    return { snapshot, plan };
+  } catch (error) {
+    await publishIntegrationFailure(github, snapshot.identity, error);
+    throw error;
+  }
+}
 
+export async function finalizeIntegration(
+  github: FugueGitHub,
+  plan: IntegrationPlan,
+  validation: IntegrationValidation,
+): Promise<IntegrationResult> {
+  if (!sameEvaluationIdentity(plan.identity, validation.identity)) {
+    throw new Error("Integration validation evidence does not match the prepared evaluation identity.");
+  }
+
+  const snapshot = await captureEvaluation(github, plan.identity.prNumber);
+  if (!sameEvaluationIdentity(plan.identity, snapshot.identity)) {
+    throw new Error("Integration snapshot changed before finalization; rerun Integration from a fresh plan.");
+  }
+
+  const prerequisites = await verifyPrerequisites(github, snapshot);
+  const ci = await verifyRequiredCi(github, snapshot.identity.headSha, plan.required_ci);
+  await verifyMergeability(github, snapshot.pr.number);
+
+  const finalSnapshot = await captureEvaluation(github, snapshot.pr.number);
+  if (!sameEvaluationIdentity(plan.identity, finalSnapshot.identity)) {
+    throw new Error("Integration snapshot changed before success could be published; rerun Integration.");
+  }
+
+  const attestation = integrationAttestationSchema.parse({
+    version: 1,
+    kind: "integration",
+    attestation_id: createAttestationId("integration"),
+    identity: snapshot.identity,
+    fugue_version: FUGUE_CLI_VERSION,
+    qa: {
+      code: qaGate(snapshot, prerequisites.qa, "code"),
+      security: qaGate(snapshot, prerequisites.qa, "security"),
+      visual: qaGate(snapshot, prerequisites.qa, "visual"),
+    },
+    dependencies: { passed: true },
+    agents_md: {
+      impact_reviewed: true,
+      update_required: prerequisites.codeAttestation.agents_md?.update_required ?? false,
+      update_present: prerequisites.codeAttestation.agents_md?.update_present ?? false,
+    },
+    control_plane: plan.control_plane,
+    validation_control: plan.validation_control,
+    validation: {
+      clean_worktree: true,
+      passed: validation.passed,
+      commands: validation.commands,
+    },
+    ci: {
+      passed: ci.passed,
+      checks: ci.checks,
+    },
+    base_current: { passed: true },
+    conflicts: { none: true },
+    verdict: "approved",
+    created_at: new Date().toISOString(),
+  });
+
+  const { owner, repo } = github.repository;
+  const comment = await github.octokit.rest.issues.createComment({
+    owner,
+    repo,
+    issue_number: snapshot.pr.number,
+    body: `INTEGRATION — PASS\n\nHead: \`${snapshot.identity.headSha}\`\nBase: \`${snapshot.identity.baseBranch}@${snapshot.identity.baseSha}\`\nPolicy: \`${snapshot.identity.policyDigest}\`\nWork spec: \`${snapshot.identity.workSpecDigest}\`\n\n${serializeAttestation(attestation)}`,
+  });
+
+  await github.octokit.rest.repos.createCommitStatus({
+    owner,
+    repo,
+    sha: snapshot.identity.headSha,
+    state: "success",
+    context: "fugue/integration",
+    description: "Fugue Integration passed",
+    target_url: comment.data.html_url,
+  });
+
+  return { snapshot, attestation, url: comment.data.html_url };
+}
+
+export async function publishIntegrationFailure(
+  github: FugueGitHub,
+  identity: IntegrationPlan["identity"],
+  error: unknown,
+): Promise<void> {
+  const gateFailure = error instanceof IntegrationGateFailure;
+  const state = gateFailure ? "failure" : "error";
+  const label = gateFailure ? "FAILED" : "ERROR";
+  const detail = message(error);
+  const { owner, repo } = github.repository;
+
+  let targetUrl: string | undefined;
+  try {
     const comment = await github.octokit.rest.issues.createComment({
       owner,
       repo,
-      issue_number: prNumber,
-      body: `INTEGRATION — PASS\n\nHead: \`${snapshot.identity.headSha}\`\nBase: \`${snapshot.identity.baseBranch}@${snapshot.identity.baseSha}\`\nPolicy: \`${snapshot.identity.policyDigest}\`\nWork spec: \`${snapshot.identity.workSpecDigest}\`\n\n${serializeAttestation(attestation)}`,
+      issue_number: identity.prNumber,
+      body: `INTEGRATION — ${label}\n\nHead: \`${identity.headSha}\`\nBase: \`${identity.baseBranch}@${identity.baseSha}\`\n\n${detail}`,
     });
+    targetUrl = comment.data.html_url;
+  } catch {
+    // Preserve the original Integration failure even if evidence posting also fails.
+  }
 
-    await github.octokit.rest.repos.createCommitStatus({
-      owner,
-      repo,
-      sha: snapshot.identity.headSha,
-      state: "success",
-      context: "fugue/integration",
-      description: "Fugue Integration passed",
-      target_url: comment.data.html_url,
+  await github.octokit.rest.repos.createCommitStatus({
+    owner,
+    repo,
+    sha: identity.headSha,
+    state,
+    context: "fugue/integration",
+    description: truncate(`Fugue Integration ${label.toLowerCase()}: ${detail}`, 140),
+    ...(targetUrl ? { target_url: targetUrl } : {}),
+  });
+}
+
+export async function integrate(github: FugueGitHub, prNumber: number): Promise<IntegrationResult> {
+  let prepared: PreparedIntegration | null = null;
+  try {
+    prepared = await prepareIntegration(github, prNumber);
+    const rawValidation = await withCleanWorktree(prepared.plan.identity.headSha, (worktree) =>
+      runValidation(
+        worktree,
+        prepared.plan.validation.install,
+        prepared.plan.validation.checks,
+      ),
+    );
+    const validation = integrationValidationSchema.parse({
+      version: 1,
+      identity: prepared.plan.identity,
+      passed: true,
+      commands: rawValidation.commands,
+      created_at: new Date().toISOString(),
     });
-
-    return { snapshot, attestation, url: comment.data.html_url };
+    return await finalizeIntegration(github, prepared.plan, validation);
   } catch (error) {
-    const gateFailure = error instanceof IntegrationGateFailure;
-    const state = gateFailure ? "failure" : "error";
-    const label = gateFailure ? "FAILED" : "ERROR";
-    const detail = message(error);
-
-    let targetUrl: string | undefined;
-    try {
-      const comment = await github.octokit.rest.issues.createComment({
-        owner,
-        repo,
-        issue_number: prNumber,
-        body: `INTEGRATION — ${label}\n\nHead: \`${snapshot.identity.headSha}\`\nBase: \`${snapshot.identity.baseBranch}@${snapshot.identity.baseSha}\`\n\n${detail}`,
-      });
-      targetUrl = comment.data.html_url;
-    } catch {
-      // Preserve the original Integration failure even if evidence posting also fails.
-    }
-
-    await github.octokit.rest.repos.createCommitStatus({
-      owner,
-      repo,
-      sha: snapshot.identity.headSha,
-      state,
-      context: "fugue/integration",
-      description: truncate(`Fugue Integration ${label.toLowerCase()}: ${detail}`, 140),
-      ...(targetUrl ? { target_url: targetUrl } : {}),
-    });
-
+    if (prepared) await publishIntegrationFailure(github, prepared.plan.identity, error);
     throw error;
   }
+}
+
+async function verifyPrerequisites(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+): Promise<Prerequisites> {
+  await verifyBaseCurrent(github, snapshot.identity.baseSha, snapshot.identity.headSha);
+  assertOwnership(snapshot.changedFiles, snapshot.workMetadata.spec.ownership);
+
+  const qa = await currentQaAttestations(github, snapshot);
+  verifyQa(snapshot, qa);
+  await verifyDependenciesSatisfied(github, snapshot.workMetadata.spec.dependencies);
+
+  const codeAttestation = qa.get("code");
+  if (!codeAttestation?.agents_md?.reviewed) {
+    throw new IntegrationGateFailure("agents", "Current Code QA lacks AGENTS.md impact attestation.");
+  }
+  if (codeAttestation.agents_md.update_required && !codeAttestation.agents_md.update_present) {
+    throw new IntegrationGateFailure("agents", "AGENTS.md update is required but not present.");
+  }
+
+  if (snapshot.qa.validationControlChanged) {
+    const validationControl = codeAttestation.validation_control;
+    if (!validationControl?.reviewed || !validationControl.acceptable) {
+      throw new IntegrationGateFailure(
+        "validation-control",
+        "Validation-control changes have not received an acceptable current Code QA attestation.",
+      );
+    }
+  }
+
+  let humanAcknowledgement: HumanControlPlaneAttestation | null = null;
+  if (snapshot.qa.controlPlaneChanged) {
+    humanAcknowledgement = await findCurrentHumanAcknowledgement(github, snapshot);
+    if (!humanAcknowledgement) {
+      throw new IntegrationGateFailure(
+        "control-plane",
+        "Control-plane changes require a current head-bound Human acknowledgement.",
+      );
+    }
+  }
+
+  return { qa, codeAttestation, humanAcknowledgement };
 }
 
 function verifyQa(snapshot: EvaluationSnapshot, attestations: Map<QaRole, QaAttestation>): void {

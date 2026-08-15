@@ -1,34 +1,56 @@
 # Fugue
 
-Fugue is a GitHub-backed coordination protocol and CLI for running multiple engineering agent sessions as a recoverable software team.
+Fugue is a GitHub-backed coordination protocol for running a software-engineering team across replaceable ChatGPT sessions without making the Human act as the message bus.
 
-The core idea is simple:
+> **GitHub is durable operational state. ChatGPT sessions are replaceable execution contexts.**
 
-> Agent sessions are disposable. Durable engineering state lives in GitHub and protected repository policy.
+The normal product is chat-first: one persistent Leader conversation coordinates work; disposable Worker and QA chats perform engineering; protected-base GitHub Actions reconcile workflow state and run Integration.
 
-A fresh Coordinator, Worker, QA, or Integration execution should be able to reconstruct what it needs from the repository and GitHub instead of depending on another session's hidden memory.
-
-## Roles
+## Normal experience
 
 ```text
-User
-  ↓
-Coordinator
-  ├─ Implementation Worker × N
-  ↓
-Independent QA
-  ├─ Code QA
-  ├─ Security QA
-  └─ Visual / UX QA
-  ↓
-Integration
-  ↓
-Human merge
+Human ↔ Leader chat
+          │
+          ├─ creates/specs GitHub work
+          ├─ tracks Worker claims/branches/PRs
+          ├─ decides when independent QA is required
+          ├─ reads current CI/QA/Integration evidence
+          └─ asks for a new disposable chat only when needed
+
+Worker chat ──────┐
+Code QA chat ─────┼──> GitHub durable state
+Security QA chat ─┤
+Visual QA chat ───┘
+                       │
+                       ▼
+              protected Fugue automation
+                       │
+                       ▼
+                 MERGE READY
+                       │
+                       ▼
+                  Human decision
 ```
+
+During normal work the Human should not need to run `fugue handoff`, `fugue review`, `fugue integrate`, copy SHAs/Worker IDs, manage branches, or relay verdicts between chats.
+
+A typical cycle is:
+
+1. Tell the Leader what to build.
+2. The Leader prepares bounded GitHub work.
+3. When required, the Leader gives one short Worker prompt to paste into a fresh ChatGPT chat.
+4. The Worker reconstructs from GitHub, implements on the assigned branch, and opens/updates the PR.
+5. Protected Fugue automation waits for exact-head CI, starts the required QA session, and updates the durable state comment.
+6. The Leader gives one short QA prompt when you check in.
+7. QA submits its verdict directly to GitHub; Fugue canonicalizes it against the current review session/identity.
+8. Fugue automatically runs Integration when prerequisites are current.
+9. The Leader asks for the final Human merge decision.
+
+See [`docs/leader-chat.md`](docs/leader-chat.md) for the role contract and copy/paste prompts.
 
 ## Durable model
 
-A Fugue-governed repository keeps its current policy on the protected base branch:
+A governed repository keeps current policy on the protected base branch:
 
 ```text
 AGENTS.md
@@ -38,147 +60,148 @@ AGENTS.md
     validation, QA, allocation, and Integration policy
 
 .fugue/VERSION
-    protocol / CLI compatibility
+    protocol / runtime compatibility
 
-GitHub issues + machine metadata
+GitHub issues + fugue-work metadata
     work specifications, dependencies, ownership, Worker claims
 
-GitHub PRs + machine metadata
+GitHub PRs + fugue-pr metadata
     implementation association
 
-commit statuses + structured PR attestations
-    QA and Integration evidence
+PR comments + canonical Fugue attestations
+    review sessions, QA verdicts, Human acknowledgement, Integration evidence
+
+commit statuses
+    fugue/code-qa
+    fugue/security-qa
+    fugue/visual-qa
+    fugue/integration
 ```
 
-Candidate control-plane changes are proposed future policy; they do not weaken the rules used to review their own PR.
+Candidate control-plane changes are proposed future policy. They do not weaken the protected-base rules or workflow code used to evaluate their own PR.
 
-## Repository bootstrap and enforcement
+## Protected GitHub control plane
 
-Once a repository already contains its protected-base `AGENTS.md` and `.fugue/**` policy, initialize the GitHub-side protocol state with:
+`.github/workflows/fugue-control-plane.yml` is the always-available reconciliation runtime. It reacts to issue/PR/comment/CI events and also runs periodically as recovery. Each invocation reconstructs GitHub state and performs idempotent deterministic transitions; it has no workflow database.
 
-```bash
-fugue init
-```
+It automatically handles:
 
-`fugue init` is idempotent. It creates any missing Fugue protocol labels and configures protection for the policy's default branch. The hard gate requires the configured CI contexts plus `fugue/integration`, requires an up-to-date branch when policy says so, enforces the gate for administrators, requires linear history, and blocks force-push/deletion bypass.
+- ready-work allocation and Worker branch creation;
+- Worker PR adoption/canonical metadata;
+- central changed-file ownership enforcement;
+- exact-head CI gating before QA;
+- code-first QA sequencing;
+- current review-session creation;
+- QA/Human submission ingestion;
+- stale evidence after head/base/spec changes;
+- draft promotion;
+- GitHub-hosted Integration dispatch;
+- one durable issue state comment containing the current next action and copy/paste prompt.
 
-Applying branch protection requires repository-owner/admin GitHub authentication with Administration write permission. If branch protection must be managed separately, `fugue init --no-protection` creates the protocol labels only.
+The PR event uses `pull_request_target` so control-plane code and write authority come from the protected base instead of the candidate PR.
 
-## Normal workflow
+## Worker chats
 
-`fugue run` is the foreground orchestrator. Start it in a governed repository and leave it running while work advances. It polls GitHub, performs deterministic transitions automatically, promotes reviewed draft PRs, runs Integration, and reports merge readiness.
-
-```bash
-fugue status
-fugue run
-fugue run --issue 123
-fugue run --pr 456
-fugue run --issue 123 --interval 10
-```
-
-`Ctrl-C` is safe. The process keeps no durable workflow database; restarting it reconstructs state from GitHub.
-
-Typical progression:
+The Leader normally gives a prompt equivalent to:
 
 ```text
-ready work
-  -> allocate Worker
-  -> execute Worker
-  -> create/link draft PR
-  -> start required QA
-  -> execute QA
-  -> mark reviewed draft PR ready
-  -> run Integration
-  -> ready for human merge
+Fugue Worker for OWNER/REPO work-123.
+Reconstruct the current assignment, Worker claim, assigned branch,
+repository contract, and scope from GitHub. Implement only that work
+on the assigned branch, use GitHub CI as authoritative remote validation,
+and open or update the implementation PR. Do not merge or self-approve.
+Do not ask the Human to operate Fugue from the terminal.
 ```
 
-If QA requests changes, the planner routes work back to the existing Worker identity. Control-plane acknowledgement, state drift, QA errors, Visual QA, and failed Integration remain explicit intervention boundaries where required.
+Fugue adopts the PR from the assigned branch and writes/repairs canonical `fugue-pr` metadata. The Worker does not need to relay its result back to the Leader; GitHub is the handoff.
 
-If a Codex Worker pushed its assigned branch but the process died before PR publication completed, Fugue recovers the existing committed result, revalidates its ownership and protected-base checks, and publishes/links the PR instead of blindly rerunning the Worker.
+## QA chats
 
-## Executors
-
-Fugue separates workflow planning from the runtime used to execute engineering roles.
-
-### Manual ChatGPT sessions
-
-The default remains `manual-chat`:
-
-```bash
-fugue run --executor manual-chat
-```
-
-Fugue emits compact reconstruction prompts for fresh Worker or QA chats and keeps watching GitHub for durable results.
-
-### Codex CLI
-
-For substantially less human orchestration, use the Codex CLI executor:
-
-```bash
-npm install -g @openai/codex
-codex --login
-
-fugue run --executor codex
-```
-
-Optional model override:
-
-```bash
-fugue run --executor codex --model <model>
-```
-
-The Codex executor currently launches:
+A QA chat receives a compact prompt such as:
 
 ```text
-Worker       autonomous
-Code QA      autonomous
-Security QA  autonomous
-Visual QA    manual/runtime boundary
-Integration  Fugue-owned
-Final merge  Human-owned
+Fugue Code QA for OWNER/REPO PR #456.
+Reconstruct the current pending Fugue review session from GitHub,
+review the exact committed evaluation identity independently,
+and submit the verdict as a fugue-review-submit PR comment for that session.
+Do not implement fixes. Do not ask the Human to run fugue review or relay the verdict.
 ```
 
-Fugue does not give Codex GitHub publication authority. Worker agents run in isolated temporary worktrees with workspace-write access; Fugue verifies changed paths against issue ownership, runs protected-base validation, commits, pushes the assigned branch, and creates the draft PR itself. Code/Security QA run as fresh processes on clean exact-head worktrees with structured output; Fugue records the resulting identity-bound attestation.
+The QA chat submits a request, for example:
 
-Visual QA remains manual until a runtime/browser executor can prove exact-head rendering evidence rather than reducing visual review to source inspection.
-
-For one-shot coordination, use the same planner through:
-
-```bash
-fugue advance
-fugue advance --issue 123
-fugue advance --pr 456
-fugue advance --issue 123 --dry-run
+```yaml
+<!-- fugue-review-submit
+version: 1
+session_id: rev-code-12345678
+role: code
+verdict: approved
+agents_update: not-required
+validation_control: acceptable
+summary: Exact-head review passed.
+-->
 ```
 
-## Low-level recovery commands
+Visual QA can add:
 
-The original commands remain available for debugging, explicit role handoff, and recovery:
-
-```bash
-fugue handoff coordinator
-fugue handoff worker --issue 123
-fugue handoff worker --issue 123 --resume
-fugue handoff code-qa --pr 456
-fugue handoff security-qa --pr 456
-fugue handoff visual-qa --pr 456
-fugue handoff integration --pr 456
-
-fugue link-pr 456 --issue 123
-
-fugue review 456 --role code --approve --agents-update not-required --validation-control acceptable
-fugue review 456 --role security --approve
-fugue review 456 --role visual --approve --runtime-tested --viewports 1440x900,390x844
-
-fugue acknowledge 456 --control-plane
-fugue integrate 456
+```yaml
+runtime_tested: true
+viewports:
+  - 1440x900
+  - 390x844
 ```
 
-`doctor` and `sync` remain intentionally deferred. The state protocol, repository bootstrap, and autonomous coordination layer are implemented first.
+The submission does **not** carry canonical head/base/policy identity. Protected Fugue automation finds the current review session, reconstructs the exact evaluation identity, validates role-specific evidence, and writes the canonical attestation/status. Stale or conflicting submissions cannot approve a new head.
 
-## Local installation
+## Changes requested
 
-Fugue currently runs from a local checkout.
+A current QA `changes_requested` verdict moves the work back to **NEEDS WORKER CHAT**. A replacement Worker chat reconstructs the same Worker claim/branch/PR plus current QA findings. When the Worker pushes a new head, historical QA naturally becomes stale and the next current QA session is created after exact-head CI passes.
+
+## Human control-plane acknowledgement
+
+Control-plane changes remain an explicit Human boundary. The Leader asks for approval of the exact current PR head. After approval the Leader posts a request such as:
+
+```yaml
+<!-- fugue-human-submit
+version: 1
+kind: control_plane_ack
+pr: 456
+-->
+```
+
+Protected Fugue code binds that request to the current exact evaluation identity and writes the canonical Human acknowledgement. No terminal command is required in normal operation.
+
+## GitHub-hosted Integration
+
+`.github/workflows/fugue-integration.yml` runs Integration from protected-base code after current required QA and Human acknowledgement are satisfied.
+
+The workflow separates authority:
+
+```text
+PREPARE (write-capable trusted Fugue)
+    capture exact identity
+    verify base / ownership / QA / dependencies / policy evidence
+    publish integration pending
+    write immutable validation plan
+
+VALIDATE (candidate checkout, read-only GitHub permission)
+    checkout exact prepared head
+    run protected-base install/check commands
+    produce validation evidence
+
+FINALIZE (write-capable trusted Fugue)
+    re-fetch exact identity
+    re-check prerequisites / CI / mergeability
+    reject drift
+    publish canonical Integration attestation + fugue/integration
+```
+
+The candidate is never used as the source of the workflow code that judges it, and validation does not receive Fugue publication authority.
+
+`fugue/integration` remains the composite hard merge gate.
+
+## Repository bootstrap
+
+Fugue CLI is still used for one-time repository setup and advanced recovery.
 
 ```bash
 git clone https://github.com/JohnnyZLi/Fugue.git
@@ -187,10 +210,13 @@ npm ci
 npm run build
 npm link
 
-fugue --help
+fugue init
+fugue status
 ```
 
-Writing GitHub state requires authentication. Fugue checks, in order:
+`fugue init` provisions protocol labels and branch protection. Normal work after bootstrap is coordinated through the Leader/GitHub control plane.
+
+GitHub authentication lookup order remains:
 
 ```text
 GITHUB_TOKEN
@@ -198,64 +224,46 @@ GH_TOKEN
 gh auth token
 ```
 
-For normal local use, authenticating the GitHub CLI is sufficient:
+## Advanced / recovery commands
+
+These remain useful for protocol development or recovery, but are not the normal Human workflow:
 
 ```bash
-gh auth login
-```
-
-## Working on Fugue with Fugue
-
-Fugue is itself a governed repository. After updating the local checkout and linking the current CLI, bootstrap GitHub enforcement once and then use the normal orchestrator:
-
-```bash
-git switch main
-git pull --ff-only origin main
-npm ci
-npm run build
-npm link
-
-fugue init
 fugue status
-fugue run --executor codex
+fugue reconcile
+fugue reconcile --issue 123
+fugue reconcile --pr 456
+fugue advance --dry-run
+fugue run                    # local recovery watcher only
+
+fugue handoff ...
+fugue link-pr ...
+fugue review ...
+fugue acknowledge ...
+fugue integrate ...
 ```
 
-After `fugue init`, normal Fugue issues use the same `state:*`, `agent:*`, ownership metadata, independent QA, and `fugue/integration` gate as any other governed repository. Final merge remains Human-controlled.
-
-## Using Fugue on another repository
-
-Clone a Fugue-governed repository and let the planner handle subsequent deterministic transitions:
-
-```bash
-git clone https://github.com/JohnnyZLi/Path.git
-cd Path
-fugue init
-fugue status
-fugue run --executor codex
-```
-
-Read-only repository discovery can also use:
-
-```bash
-FUGUE_REPOSITORY=JohnnyZLi/Path fugue status
-```
-
-Integration and launchable local executors deliberately require a local Git checkout because trusted validation and agent execution use temporary worktrees at specific repository identities.
-
-## Replacement sessions
-
-A Worker execution does **not** create another Worker claim when the same work identity already exists. QA handoffs are idempotent for the same role and exact evaluation identity. Older orphaned sessions are superseded chronologically when a newer session is completed.
-
-A Coordinator process can be replaced and reconstruct state again. Integration that dies mid-run is restarted from a fresh snapshot rather than trusting partial terminal output.
+Restarting any of them is safe because GitHub remains durable truth.
 
 ## Review identity
 
-QA evidence is tied to the exact evaluated state, including the PR head and authoritative work specification. Integration additionally binds the base and protected policy.
+QA and Integration evidence is tied to the exact evaluated state, including:
 
-A changed head, changed work specification, changed base, or changed active policy causes old evidence to become historical rather than silently approving the new state. `fugue status` surfaces the current Integration verdict and the planner's derived next action.
+```text
+PR number
+head SHA
+base branch + base SHA
+protected policy digest
+protocol version
+issue number
+work ID
+work-spec digest
+```
 
-## First proving ground
+A changed head, changed base, changed policy, or changed work specification makes older evidence historical rather than silently carrying approval forward.
 
-[Path](https://github.com/JohnnyZLi/Path) is the first external project used to prove Fugue. It is a visual algorithm playground whose implementation naturally exercises parallel Workers, Code QA, Visual QA, strict Integration, and replacement-session recovery.
+## First proving grounds
 
-See [`docs/protocol-v0.1.md`](docs/protocol-v0.1.md), [`docs/chatgpt-project.md`](docs/chatgpt-project.md), and [`docs/autonomous-coordination.md`](docs/autonomous-coordination.md).
+Fugue now governs its own repository. [Path](https://github.com/JohnnyZLi/Path) remains the visual-product dogfood target for parallel work and artifact-backed Visual QA.
+
+See [`docs/protocol-v0.1.md`](docs/protocol-v0.1.md), [`docs/chatgpt-project.md`](docs/chatgpt-project.md), and [`docs/leader-chat.md`](docs/leader-chat.md).

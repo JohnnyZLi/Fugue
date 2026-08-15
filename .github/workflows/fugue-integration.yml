@@ -1,0 +1,146 @@
+name: Fugue Integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to integrate
+        required: true
+        type: string
+
+concurrency:
+  group: fugue-integration-${{ github.repository }}-${{ inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: write
+    outputs:
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - id: prepare
+        name: Prepare immutable Integration plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node dist/cli.js integration-runtime prepare "${{ inputs.pr }}"
+          --out "$RUNNER_TEMP/fugue-plan.json"
+          --github-output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fugue-plan
+          path: ${{ runner.temp }}/fugue-plan.json
+          if-no-files-found: error
+
+  validate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted Fugue runtime
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: _fugue
+          persist-credentials: false
+      - name: Checkout exact candidate head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+          path: _candidate
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: _fugue/package-lock.json
+      - working-directory: _fugue
+        run: npm ci
+      - working-directory: _fugue
+        run: npm run build
+      - uses: actions/download-artifact@v4
+        with:
+          name: fugue-plan
+          path: _plan
+      - name: Run protected-base validation commands against exact head
+        run: >-
+          node _fugue/dist/cli.js integration-runtime validate
+          --plan _plan/fugue-plan.json
+          --cwd _candidate
+          --out "$RUNNER_TEMP/fugue-validation.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fugue-validation
+          path: ${{ runner.temp }}/fugue-validation.json
+          if-no-files-found: error
+
+  finalize:
+    if: always() && needs.prepare.result == 'success'
+    needs: [prepare, validate]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      checks: read
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/download-artifact@v4
+        with:
+          name: fugue-plan
+          path: _plan
+      - if: needs.validate.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: fugue-validation
+          path: _validation
+      - name: Finalize successful Integration
+        if: needs.validate.result == 'success'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node dist/cli.js integration-runtime finalize
+          --plan _plan/fugue-plan.json
+          --validation-result success
+          --validation _validation/fugue-validation.json
+      - name: Publish failed candidate validation
+        if: needs.validate.result != 'success'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node dist/cli.js integration-runtime finalize
+          --plan _plan/fugue-plan.json
+          --validation-result "${{ needs.validate.result }}"
+      - name: Refresh durable Fugue state comment
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node dist/cli.js reconcile --pr "${{ inputs.pr }}"

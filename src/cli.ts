@@ -6,7 +6,13 @@ import { runAdvance } from "./commands/advance.js";
 import { runHandoff } from "./commands/handoff.js";
 import { runInit } from "./commands/init.js";
 import { runIntegrate } from "./commands/integrate.js";
+import {
+  runIntegrationFinalize,
+  runIntegrationPrepare,
+  runIntegrationValidate,
+} from "./commands/integration-runtime.js";
 import { runLinkPr } from "./commands/link-pr.js";
+import { runReconcile } from "./commands/reconcile.js";
 import { runReview } from "./commands/review.js";
 import { runOrchestrator } from "./commands/run.js";
 import { runStatus } from "./commands/status.js";
@@ -31,6 +37,13 @@ program
   .action(runStatus);
 
 program
+  .command("reconcile")
+  .description("Run one idempotent protected-state reconciliation pass")
+  .option("--issue <number>", "Reconcile only one Fugue work issue")
+  .option("--pr <number>", "Reconcile only the work item linked to one PR")
+  .action(runReconcile);
+
+program
   .command("advance")
   .description("Perform the next deterministic workflow transition for current Fugue work")
   .option("--issue <number>", "Advance only one Fugue work issue")
@@ -40,17 +53,15 @@ program
 
 program
   .command("run")
-  .description("Continuously watch GitHub and advance Fugue work until external or Human action changes")
+  .description("Local recovery watcher; normal coordination runs in GitHub Actions")
   .option("--issue <number>", "Watch only one Fugue work issue")
   .option("--pr <number>", "Watch only the work item linked to one PR")
   .option("--interval <seconds>", "GitHub polling interval in seconds", "30")
-  .option("--executor <mode>", "Execution backend: manual-chat or codex", "manual-chat")
-  .option("--model <model>", "Optional Codex model override")
   .action(runOrchestrator);
 
 program
   .command("handoff")
-  .description("Generate a deterministic role handoff")
+  .description("Generate a deterministic role handoff (advanced/recovery)")
   .argument("<role>", "coordinator, worker, code-qa, security-qa, visual-qa, or integration")
   .option("--issue <number>", "GitHub issue number")
   .option("--pr <number>", "GitHub pull request number")
@@ -59,14 +70,14 @@ program
 
 program
   .command("link-pr")
-  .description("Attach Fugue work metadata to an implementation PR")
+  .description("Attach Fugue work metadata to an implementation PR (advanced/recovery)")
   .argument("<pr>", "GitHub pull request number")
   .requiredOption("--issue <number>", "Fugue work issue number")
   .action(runLinkPr);
 
 program
   .command("review")
-  .description("Record a structured, identity-bound QA verdict")
+  .description("Record a structured QA verdict (advanced/recovery)")
   .argument("<pr>", "GitHub pull request number")
   .requiredOption("--role <role>", "code, security, or visual")
   .option("--approve", "Approve the current review session")
@@ -81,16 +92,41 @@ program
 
 program
   .command("acknowledge")
-  .description("Record a head-bound Human acknowledgement")
+  .description("Record a head-bound Human acknowledgement (advanced/recovery)")
   .argument("<pr>", "GitHub pull request number")
   .option("--control-plane", "Acknowledge the current control-plane change")
   .action(runAcknowledge);
 
 program
   .command("integrate")
-  .description("Run the composite Integration gate against an exact PR snapshot")
+  .description("Run the composite Integration gate locally (advanced/recovery)")
   .argument("<pr>", "GitHub pull request number")
   .action(runIntegrate);
+
+const integrationRuntime = program
+  .command("integration-runtime")
+  .description("Internal GitHub-hosted Integration runtime");
+
+integrationRuntime
+  .command("prepare")
+  .argument("<pr>", "GitHub pull request number")
+  .requiredOption("--out <path>", "Write the immutable Integration plan JSON")
+  .option("--github-output <path>", "Append GitHub Actions job outputs")
+  .action(runIntegrationPrepare);
+
+integrationRuntime
+  .command("validate")
+  .requiredOption("--plan <path>", "Prepared Integration plan JSON")
+  .requiredOption("--cwd <path>", "Exact-head candidate checkout")
+  .requiredOption("--out <path>", "Write validation evidence JSON")
+  .action(runIntegrationValidate);
+
+integrationRuntime
+  .command("finalize")
+  .requiredOption("--plan <path>", "Prepared Integration plan JSON")
+  .requiredOption("--validation-result <state>", "GitHub Actions validation job result")
+  .option("--validation <path>", "Validation evidence JSON when validation succeeded")
+  .action(runIntegrationFinalize);
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);

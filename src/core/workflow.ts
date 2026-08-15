@@ -1,11 +1,15 @@
 import { parseAttestation, type QaRole } from "./attestations.js";
+import { currentRequiredCiState, type RequiredCiState } from "./ci.js";
 import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
+import { IntegrationGateFailure, verifyBaseCurrent } from "./gates.js";
 import type { FugueGitHub } from "./github.js";
 import { currentIntegrationState, type IntegrationState } from "./integration-status.js";
+import { resolveOwnership } from "./ownership.js";
 import { currentReviewActivities } from "./reviews.js";
 import type { WorkState } from "./state.js";
 
 export type QaWorkflowState = "none" | "pending" | "approved" | "changes_requested" | "error";
+export type OwnershipWorkflowState = "not_applicable" | "passed" | "failed";
 
 export interface QaWorkflowObservation {
   role: QaRole;
@@ -22,6 +26,10 @@ export interface WorkflowObservation {
   prNumber?: number;
   prDraft: boolean;
   drift: string[];
+  ownership: OwnershipWorkflowState;
+  ownershipDetail?: string;
+  ci: RequiredCiState | "not_applicable";
+  baseCurrent: boolean;
   qa: QaWorkflowObservation[];
   controlPlaneChanged: boolean;
   humanControlPlaneAcknowledged: boolean;
@@ -31,9 +39,11 @@ export interface WorkflowObservation {
 export type WorkflowAction =
   | { kind: "allocate_worker" }
   | { kind: "wait_worker" }
+  | { kind: "wait_ci"; state: RequiredCiState }
+  | { kind: "update_base" }
   | { kind: "start_qa"; roles: QaRole[] }
   | { kind: "wait_qa"; roles: QaRole[] }
-  | { kind: "resume_worker"; roles: QaRole[] }
+  | { kind: "resume_worker"; roles: QaRole[]; reason?: string }
   | { kind: "human_control_plane_ack" }
   | { kind: "mark_pr_ready" }
   | { kind: "integrate" }
@@ -55,6 +65,19 @@ export function planWork(observation: WorkflowObservation): WorkflowAction {
   }
   if (!observation.hasPr) return { kind: "wait_worker" };
 
+  if (observation.ownership === "failed") {
+    return { kind: "blocked", reason: `Ownership violation: ${observation.ownershipDetail ?? "changed files exceed assigned scope"}` };
+  }
+
+  if (!observation.baseCurrent) return { kind: "update_base" };
+
+  if (observation.ci === "failure" || observation.ci === "error") {
+    return { kind: "resume_worker", roles: [], reason: `Required CI is ${observation.ci}.` };
+  }
+  if (observation.ci === "pending" || observation.ci === "missing") {
+    return { kind: "wait_ci", state: observation.ci };
+  }
+
   const changesRequested = observation.qa
     .filter((item) => item.state === "changes_requested")
     .map((item) => item.role);
@@ -65,10 +88,15 @@ export function planWork(observation: WorkflowObservation): WorkflowAction {
     return { kind: "blocked", reason: `QA error requires intervention: ${qaErrors.join(", ")}` };
   }
 
-  const notStarted = observation.qa.filter((item) => item.state === "none").map((item) => item.role);
+  const code = observation.qa.find((item) => item.role === "code");
+  if (code?.state === "none") return { kind: "start_qa", roles: ["code"] };
+  if (code?.state === "pending") return { kind: "wait_qa", roles: ["code"] };
+
+  const remaining = observation.qa.filter((item) => item.role !== "code");
+  const notStarted = remaining.filter((item) => item.state === "none").map((item) => item.role);
   if (notStarted.length) return { kind: "start_qa", roles: notStarted };
 
-  const pending = observation.qa.filter((item) => item.state === "pending").map((item) => item.role);
+  const pending = remaining.filter((item) => item.state === "pending").map((item) => item.role);
   if (pending.length) return { kind: "wait_qa", roles: pending };
 
   if (observation.controlPlaneChanged && !observation.humanControlPlaneAcknowledged) {
@@ -95,6 +123,9 @@ export async function observeWork(github: FugueGitHub, work: WorkState): Promise
     hasPr: Boolean(work.pr),
     prDraft: work.pr?.draft ?? false,
     drift: [...work.drift],
+    ownership: "not_applicable",
+    ci: "not_applicable",
+    baseCurrent: true,
     qa: [],
     controlPlaneChanged: false,
     humanControlPlaneAcknowledged: false,
@@ -121,9 +152,26 @@ export async function observeWork(github: FugueGitHub, work: WorkState): Promise
     });
   }
 
+  const ownership = resolveOwnership(snapshot.changedFiles, snapshot.workMetadata.spec.ownership);
+  let baseCurrent = true;
+  if (snapshot.policy.config.branches.require_up_to_date) {
+    try {
+      await verifyBaseCurrent(github, snapshot.identity.baseSha, snapshot.identity.headSha);
+    } catch (error) {
+      if (error instanceof IntegrationGateFailure && error.gate === "base-current") baseCurrent = false;
+      else throw error;
+    }
+  }
+
   return {
     ...base,
     prNumber: work.pr.number,
+    ownership: ownership.passed ? "passed" : "failed",
+    ...(ownership.passed
+      ? {}
+      : { ownershipDetail: ownership.violations.map((item) => `${item.path} (${item.kind})`).join(", ") }),
+    ci: await currentRequiredCiState(github, snapshot.identity.headSha, snapshot.policy.config.validation.required_ci),
+    baseCurrent,
     qa,
     controlPlaneChanged: snapshot.qa.controlPlaneChanged,
     humanControlPlaneAcknowledged: snapshot.qa.controlPlaneChanged
@@ -136,13 +184,17 @@ export async function observeWork(github: FugueGitHub, work: WorkState): Promise
 export function actionLabel(action: WorkflowAction): string {
   switch (action.kind) {
     case "allocate_worker": return "allocate Worker";
-    case "wait_worker": return "wait for Worker PR";
+    case "wait_worker": return "needs Worker chat";
+    case "wait_ci": return `wait for required CI (${action.state})`;
+    case "update_base": return "update Worker branch from current base";
     case "start_qa": return `start ${action.roles.map(roleLabel).join(" + ")}`;
-    case "wait_qa": return `wait for ${action.roles.map(roleLabel).join(" + ")}`;
-    case "resume_worker": return `resume Worker after ${action.roles.map(roleLabel).join(" + ")} changes requested`;
+    case "wait_qa": return `needs ${action.roles.map(roleLabel).join(" + ")} chat`;
+    case "resume_worker": return action.reason
+      ? `resume Worker — ${action.reason}`
+      : `resume Worker after ${action.roles.map(roleLabel).join(" + ")} changes requested`;
     case "human_control_plane_ack": return "human control-plane acknowledgement";
     case "mark_pr_ready": return "mark PR ready for review";
-    case "integrate": return "run Integration";
+    case "integrate": return "dispatch Integration";
     case "wait_integration": return "wait for Integration";
     case "ready_to_merge": return "ready for human merge";
     case "blocked": return `blocked — ${action.reason}`;

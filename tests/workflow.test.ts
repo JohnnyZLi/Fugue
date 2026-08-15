@@ -12,6 +12,9 @@ function observation(overrides: Partial<WorkflowObservation> = {}): WorkflowObse
     prNumber: 11,
     prDraft: false,
     drift: [],
+    ownership: "passed",
+    ci: "success",
+    baseCurrent: true,
     qa: [{ role: "code", state: "approved", supersededSessions: 0 }],
     controlPlaneChanged: false,
     humanControlPlaneAcknowledged: false,
@@ -28,24 +31,60 @@ describe("workflow planner", () => {
       hasPr: false,
       prNumber: undefined,
       prDraft: false,
+      ownership: "not_applicable",
+      ci: "not_applicable",
       qa: [],
     }))).toEqual({ kind: "allocate_worker" });
   });
 
   it("waits for a claimed Worker to publish a PR", () => {
-    expect(planWork(observation({ hasPr: false, prNumber: undefined, prDraft: false, qa: [] }))).toEqual({ kind: "wait_worker" });
+    expect(planWork(observation({
+      hasPr: false,
+      prNumber: undefined,
+      prDraft: false,
+      ownership: "not_applicable",
+      ci: "not_applicable",
+      qa: [],
+    }))).toEqual({ kind: "wait_worker" });
   });
 
-  it("starts all required QA that has no active evidence", () => {
+  it("updates a stale branch before CI or QA", () => {
+    expect(planWork(observation({ baseCurrent: false }))).toEqual({ kind: "update_base" });
+  });
+
+  it("waits for exact-head required CI before QA", () => {
+    expect(planWork(observation({ ci: "missing" }))).toEqual({ kind: "wait_ci", state: "missing" });
+    expect(planWork(observation({ ci: "pending" }))).toEqual({ kind: "wait_ci", state: "pending" });
+  });
+
+  it("routes failed required CI back to the Worker", () => {
+    expect(planWork(observation({ ci: "failure" }))).toEqual({
+      kind: "resume_worker",
+      roles: [],
+      reason: "Required CI is failure.",
+    });
+  });
+
+  it("starts Code QA before conditional later roles", () => {
     expect(planWork(observation({
       qa: [
         { role: "code", state: "none", supersededSessions: 0 },
         { role: "visual", state: "none", supersededSessions: 0 },
       ],
-    }))).toEqual({ kind: "start_qa", roles: ["code", "visual"] });
+    }))).toEqual({ kind: "start_qa", roles: ["code"] });
   });
 
-  it("waits when QA sessions are already active", () => {
+  it("starts remaining QA only after Code QA approves", () => {
+    expect(planWork(observation({
+      qa: [
+        { role: "code", state: "approved", supersededSessions: 0 },
+        { role: "security", state: "none", supersededSessions: 0 },
+        { role: "visual", state: "none", supersededSessions: 0 },
+      ],
+    }))).toEqual({ kind: "start_qa", roles: ["security", "visual"] });
+  });
+
+  it("waits when Code QA is already active", () => {
     expect(planWork(observation({
       qa: [{ role: "code", state: "pending", supersededSessions: 0 }],
     }))).toEqual({ kind: "wait_qa", roles: ["code"] });
@@ -55,6 +94,11 @@ describe("workflow planner", () => {
     expect(planWork(observation({
       qa: [{ role: "code", state: "changes_requested", supersededSessions: 0 }],
     }))).toEqual({ kind: "resume_worker", roles: ["code"] });
+  });
+
+  it("blocks ownership violations before QA", () => {
+    const result = planWork(observation({ ownership: "failed", ownershipDetail: "README.md (unassigned)" }));
+    expect(result).toEqual({ kind: "blocked", reason: "Ownership violation: README.md (unassigned)" });
   });
 
   it("requires human acknowledgement for control-plane changes", () => {
@@ -68,7 +112,7 @@ describe("workflow planner", () => {
     expect(planWork(observation({ prDraft: true }))).toEqual({ kind: "mark_pr_ready" });
   });
 
-  it("runs Integration after all current QA is approved and the PR is ready", () => {
+  it("dispatches Integration after all current QA is approved and the PR is ready", () => {
     expect(planWork(observation())).toEqual({ kind: "integrate" });
   });
 
@@ -87,7 +131,7 @@ describe("workflow planner", () => {
 });
 
 describe("manual-chat executor", () => {
-  it("produces a self-contained Worker reconstruction prompt", () => {
+  it("produces a self-contained Worker reconstruction prompt without terminal relay", () => {
     const instruction = new ManualChatExecutor().instruction({
       repository: "JohnnyZLi/Path",
       role: "worker",
@@ -95,10 +139,11 @@ describe("manual-chat executor", () => {
       workId: "work-7",
     });
     expect(instruction.prompt).toContain("JohnnyZLi/Path work-7");
-    expect(instruction.prompt).toContain("Reconstruct your assignment from GitHub");
+    expect(instruction.prompt).toContain("Reconstruct the current assignment");
+    expect(instruction.prompt).not.toContain("fugue handoff");
   });
 
-  it("produces an independent QA reconstruction prompt", () => {
+  it("produces an independent QA reconstruction/submission prompt", () => {
     const instruction = new ManualChatExecutor().instruction({
       repository: "JohnnyZLi/Path",
       role: "visual-qa",
@@ -106,6 +151,7 @@ describe("manual-chat executor", () => {
     });
     expect(instruction.prompt).toContain("Visual QA");
     expect(instruction.prompt).toContain("exact committed evaluation identity");
+    expect(instruction.prompt).toContain("fugue-review-submit");
     expect(instruction.prompt).toContain("Do not implement fixes");
   });
 });

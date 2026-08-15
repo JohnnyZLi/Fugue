@@ -31,6 +31,9 @@ validation:
     - "scripts/**"
     - "src/core/validation.ts"
     - "src/core/ci.ts"
+    - "src/core/integration.ts"
+    - "src/core/integration-plan.ts"
+    - "src/commands/integration-runtime.ts"
 
 reviews:
   code:
@@ -44,14 +47,19 @@ reviews:
       - "package.json"
       - "package-lock.json"
       - "src/core/github.ts"
-      - "src/core/codex-executor.ts"
       - "src/core/integration.ts"
+      - "src/core/integration-plan.ts"
+      - "src/core/reconcile.ts"
+      - "src/core/submissions.ts"
+      - "src/core/ownership.ts"
       - "src/core/reviews.ts"
       - "src/core/attestations.ts"
       - "src/core/policy.ts"
       - "src/core/protocol.ts"
       - "src/core/repository-init.ts"
       - "src/commands/init.ts"
+      - "src/commands/reconcile.ts"
+      - "src/commands/integration-runtime.ts"
 
   visual:
     required: conditional
