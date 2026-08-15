@@ -5,7 +5,12 @@ import {
   buildCodexExecArgs,
   parseCodexQaResult,
 } from "../src/core/codex-executor.js";
-import { parseExecutorMode } from "../src/commands/run.js";
+import {
+  codexQaAttemptFingerprint,
+  codexWorkerAttemptFingerprint,
+  parseExecutorMode,
+} from "../src/commands/run.js";
+import type { WorkState } from "../src/core/state.js";
 
 describe("Codex executor selection", () => {
   it("preserves manual-chat as the default", () => {
@@ -63,10 +68,20 @@ describe("Codex QA output", () => {
     const result = parseCodexQaResult("code", JSON.stringify({
       verdict: "approved",
       agents_update: "not-required",
+      validation_control: "acceptable",
       summary: "Exact-head review passed.",
       findings: [],
     }));
     expect(result.verdict).toBe("approved");
+  });
+
+  it("requires an explicit validation-control assessment", () => {
+    expect(() => parseCodexQaResult("code", JSON.stringify({
+      verdict: "approved",
+      agents_update: "not-required",
+      summary: "Missing validation control.",
+      findings: [],
+    }))).toThrow();
   });
 
   it("rejects free-form or malformed QA output", () => {
@@ -100,5 +115,63 @@ describe("Codex Worker ownership enforcement", () => {
     expect(() => assertWorkerChangesWithinOwnership([
       "README.md",
     ], ownership)).toThrow(/outside assigned ownership/);
+  });
+});
+
+describe("Codex execution attempt identity", () => {
+  function work(headSha: string | null, workSpecDigest = "sha256:spec-a"): WorkState {
+    return {
+      issueNumber: 4,
+      title: "Add Merge Sort",
+      url: "https://github.com/JohnnyZLi/Path/issues/4",
+      stateLabel: "state:working",
+      metadata: {
+        version: 1,
+        work_id: "work-4",
+        spec: {
+          dependencies: [],
+          ownership: { owned: [], coordinate: [], forbidden: [] },
+          qa: { force: ["code"] },
+          authorized_changes: { agents_invariants: [] },
+        },
+        execution: {
+          worker_id: "wkr-12345678",
+          branch: "agent/4-merge-sort",
+        },
+      },
+      workSpecDigest,
+      pr: headSha ? {
+        number: 10,
+        url: "https://github.com/JohnnyZLi/Path/pull/10",
+        headSha,
+        headBranch: "agent/4-merge-sort",
+        draft: true,
+        metadata: {
+          version: 1,
+          work_id: "work-4",
+          issue: 4,
+          worker_id: "wkr-12345678",
+          branch: "agent/4-merge-sort",
+        },
+      } : null,
+      drift: [],
+    };
+  }
+
+  it("keeps the same Worker attempt stable for an unchanged evaluation identity", () => {
+    expect(codexWorkerAttemptFingerprint(work(null))).toBe(codexWorkerAttemptFingerprint(work(null)));
+  });
+
+  it("changes the Worker retry identity when the PR head changes", () => {
+    expect(codexWorkerAttemptFingerprint(work("aaa"))).not.toBe(codexWorkerAttemptFingerprint(work("bbb")));
+  });
+
+  it("binds QA attempts to both role and exact PR head", () => {
+    expect(codexQaAttemptFingerprint(work("aaa"), "code")).not.toBe(
+      codexQaAttemptFingerprint(work("aaa"), "security"),
+    );
+    expect(codexQaAttemptFingerprint(work("aaa"), "code")).not.toBe(
+      codexQaAttemptFingerprint(work("bbb"), "code"),
+    );
   });
 });
