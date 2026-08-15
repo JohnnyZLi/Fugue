@@ -36,7 +36,7 @@ program
   .description("Continuously watch GitHub and advance Fugue work until external or Human action changes")
   .option("--issue <number>", "Watch only one Fugue work issue")
   .option("--pr <number>", "Watch only the work item linked to one PR")
-  .option("--interval <seconds>", "GitHub polling interval in seconds", "15")
+  .option("--interval <seconds>", "GitHub polling interval in seconds", "30")
   .action(runOrchestrator);
 
 program
