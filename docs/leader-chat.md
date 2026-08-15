@@ -71,7 +71,8 @@ Fugue Code QA for OWNER/REPO PR #456.
 Reconstruct the current pending Fugue review session from GitHub, review
 the exact committed evaluation identity independently, and submit the
 verdict as a fugue-review-submit PR comment for that session.
-Do not implement fixes. Do not ask the Human to run fugue review or relay the verdict.
+Do not implement fixes. Submit the result directly to GitHub; do not ask
+the Human to use a terminal or relay the verdict.
 ```
 
 ### Security QA
@@ -81,7 +82,8 @@ Fugue Security QA for OWNER/REPO PR #456.
 Reconstruct the current pending Fugue review session from GitHub, review
 the exact committed evaluation identity independently for security/trust
 boundary regressions, and submit the verdict as a fugue-review-submit PR
-comment for that session. Do not implement fixes.
+comment for that session. Do not implement fixes. Submit the result directly
+to GitHub; do not ask the Human to relay it.
 ```
 
 ### Visual QA
@@ -110,7 +112,7 @@ summary: Exact-head review passed.
 -->
 ```
 
-This is an input request, not canonical protocol evidence. Protected Fugue automation reconstructs the exact current evaluation identity and writes the canonical QA attestation/status.
+This is an input request, not canonical protocol evidence. Protected Fugue automation reconstructs the exact current evaluation identity and writes the canonical QA attestation/status. The submitting GitHub actor must have repository write, maintain, or admin permission. Malformed, stale, unauthorized, or conflicting submissions are durably rejected rather than silently reused.
 
 ## Changes requested
 
@@ -118,17 +120,30 @@ Do not ask the Human to diagnose stale-review state. If QA requests changes, the
 
 ## Control-plane acknowledgement
 
-When protected paths change, explain the material policy/workflow change to the Human and request an explicit acknowledgement of the current PR. After the Human agrees, the Leader posts this PR comment through GitHub:
+When protected paths change, explain the material policy/workflow change to the Human and request an explicit acknowledgement of the **current exact evaluation identity**. The Human only says whether they acknowledge it; they do not copy or type the identity fields.
+
+After the Human agrees, the Leader re-fetches the current PR evaluation identity from GitHub and posts a request like this through GitHub:
 
 ```yaml
 <!-- fugue-human-submit
 version: 1
 kind: control_plane_ack
-pr: 456
+identity:
+  prNumber: 456
+  headSha: <current exact PR head>
+  baseBranch: main
+  baseSha: <current protected-base SHA>
+  policyDigest: <current protected policy digest>
+  protocolVersion: 1
+  issueNumber: 123
+  workId: work-123
+  workSpecDigest: <current work-spec digest>
 -->
 ```
 
-Fugue binds it to the current exact evaluation identity. The Human does not run `fugue acknowledge` during normal work.
+The submission itself is not canonical acknowledgement evidence. Protected Fugue automation verifies the GitHub actor has repository write/maintain/admin permission, verifies that the submitted identity still exactly matches the current PR evaluation, and only then writes the canonical Human acknowledgement attestation. If the head, base, policy, protocol, issue/work identity, or work specification changes, the old request cannot acknowledge the new state.
+
+The Human does not run `fugue acknowledge` or carry these identity fields during normal work.
 
 ## Final merge
 
