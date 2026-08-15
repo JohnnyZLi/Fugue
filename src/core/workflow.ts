@@ -2,7 +2,7 @@ import { parseAttestation, type QaRole } from "./attestations.js";
 import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
 import type { FugueGitHub } from "./github.js";
 import { currentIntegrationState, type IntegrationState } from "./integration-status.js";
-import { currentQaAttestations, currentReviewActivity } from "./reviews.js";
+import { currentReviewActivities } from "./reviews.js";
 import type { WorkState } from "./state.js";
 
 export type QaWorkflowState = "none" | "pending" | "approved" | "changes_requested" | "error";
@@ -104,21 +104,20 @@ export async function observeWork(github: FugueGitHub, work: WorkState): Promise
   if (!work.pr) return base;
 
   const snapshot = await captureEvaluation(github, work.pr.number);
-  const attestations = await currentQaAttestations(github, snapshot);
+  const activities = await currentReviewActivities(github, snapshot);
   const qa: QaWorkflowObservation[] = [];
 
   for (const requirement of snapshot.qa.required) {
-    const attestation = attestations.get(requirement.role);
-    const activity = await currentReviewActivity(github, snapshot, requirement.role);
-    const state: QaWorkflowState = attestation
-      ? attestation.verdict
-      : activity.active
-        ? "pending"
+    const activity = activities.get(requirement.role);
+    const state: QaWorkflowState = activity?.active
+      ? "pending"
+      : activity?.completed
+        ? activity.completed.verdict
         : "none";
     qa.push({
       role: requirement.role,
       state,
-      supersededSessions: activity.superseded.length,
+      supersededSessions: activity?.superseded.length ?? 0,
     });
   }
 
