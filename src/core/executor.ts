@@ -50,7 +50,7 @@ export class ManualChatExecutor implements Executor {
       executor: "manual-chat",
       role: request.role,
       label: `${readableRole} — ${request.repository} PR #${request.prNumber}`,
-      prompt: `Fugue ${readableRole} for ${request.repository} PR #${request.prNumber}. Reconstruct the current pending Fugue review session from GitHub, review the exact committed evaluation identity independently, and submit the verdict as a fugue-review-submit PR comment for that session. Do not implement fixes. Do not ask the Human to run fugue review or relay the verdict.`,
+      prompt: `Fugue ${readableRole} for ${request.repository} PR #${request.prNumber}. Reconstruct the current pending Fugue review session from GitHub, review the exact committed evaluation identity independently, and submit the verdict as a fugue-review-submit PR comment for that session. Do not implement fixes. Submit the result directly to GitHub; do not ask the Human to use a terminal or relay the verdict.`,
     };
   }
 }
