@@ -17,8 +17,8 @@ interface RunMemory {
   notifications: Map<number, string>;
 }
 
-const DEFAULT_INTERVAL_SECONDS = 15;
-const MIN_INTERVAL_SECONDS = 2;
+const DEFAULT_INTERVAL_SECONDS = 30;
+const MIN_INTERVAL_SECONDS = 10;
 
 export async function runOrchestrator(options: RunOptions): Promise<void> {
   const repository = await discoverRepository();
