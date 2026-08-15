@@ -17,6 +17,7 @@ import { runValidation } from "../core/validation.js";
 
 export interface IntegrationPrepareOptions {
   out: string;
+  runtimeSha: string;
   githubOutput?: string;
 }
 
@@ -40,6 +41,16 @@ export async function runIntegrationPrepare(
   const repository = await discoverRepository();
   const github = await requireWritableGitHub(repository);
   const prepared = await prepareIntegration(github, prNumber);
+
+  if (prepared.plan.identity.baseSha !== options.runtimeSha) {
+    const error = new IntegrationGateFailure(
+      "runtime-base",
+      `Trusted Integration runtime ${options.runtimeSha.slice(0, 8)} does not match current protected base ${prepared.plan.identity.baseSha.slice(0, 8)}.`,
+    );
+    await publishIntegrationFailure(github, prepared.plan.identity, error);
+    throw error;
+  }
+
   await writeFile(resolve(options.out), `${JSON.stringify(prepared.plan, null, 2)}\n`, "utf8");
 
   if (options.githubOutput) {
