@@ -32,13 +32,13 @@ export async function beginReview(
   assertRoleRequired(snapshot, role);
 
   const activity = await currentReviewActivity(github, snapshot, role);
+  if (activity.active) {
+    return { snapshot, session: activity.active, created: false };
+  }
   if (activity.completed) {
     throw new Error(
       `${roleHeading(role)} already has a current ${activity.completed.verdict.replace("_", " ")} verdict for PR #${prNumber}.`,
     );
-  }
-  if (activity.active) {
-    return { snapshot, session: activity.active, created: false };
   }
 
   const session = reviewStartSchema.parse({
@@ -83,13 +83,13 @@ export async function completeReview(
   const { owner, repo } = github.repository;
 
   const activity = await currentReviewActivity(github, snapshot, role);
-  if (activity.completed) {
-    throw new Error(
-      `${roleHeading(role)} already has a current verdict in session ${activity.completed.session_id}; start a fresh QA handoff only after the evaluation identity changes.`,
-    );
-  }
   const session = activity.active;
   if (!session) {
+    if (activity.completed) {
+      throw new Error(
+        `${roleHeading(role)} already has a current verdict in session ${activity.completed.session_id}; start a fresh QA handoff only after the evaluation identity changes.`,
+      );
+    }
     throw new Error(
       `No current ${role} review session exists for PR #${prNumber}. Run fugue handoff ${role}-qa --pr ${prNumber} first.`,
     );
