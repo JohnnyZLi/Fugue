@@ -3,7 +3,11 @@ import { z } from "zod";
 import { parseConfig, type FugueConfig } from "./config.js";
 import { digestCanonical } from "./hash.js";
 import { readRepositoryFile, type FugueGitHub } from "./github.js";
-import { assertSupportedProtocol, type PolicyIdentity } from "./protocol.js";
+import {
+  assertCompatibleCliVersion,
+  assertSupportedProtocol,
+  type PolicyIdentity,
+} from "./protocol.js";
 
 const versionSchema = z.object({
   protocol: z.number().int().positive(),
@@ -31,6 +35,7 @@ export async function resolveActivePolicy(github: FugueGitHub): Promise<ActivePo
   const versionRaw = await readRepositoryFile(github, ".fugue/VERSION", baseSha);
   const version = versionSchema.parse(parseYaml(versionRaw));
   assertSupportedProtocol(version.protocol);
+  assertCompatibleCliVersion(version.fugue_min_version, version.fugue_max_compatible_version);
 
   if (config.repository.default_branch !== baseBranch) {
     throw new Error(
