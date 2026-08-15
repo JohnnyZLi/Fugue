@@ -37,6 +37,14 @@ export interface CodexExecutorOptions {
   model?: string;
 }
 
+export interface CodexExecArgsOptions {
+  sandbox: "workspace-write" | "read-only";
+  prompt: string;
+  lastMessagePath: string;
+  outputSchemaPath?: string;
+  model?: string;
+}
+
 export class CodexCliExecutor {
   readonly kind = "codex";
 
@@ -83,7 +91,11 @@ export class CodexCliExecutor {
       await runValidation(worktree, active.config.validation.install, active.config.validation.checks);
 
       await git(["add", "--all"], worktree);
-      await git(["commit", "-m", `${work.pr ? "Address review for" : "Implement"} #${work.issueNumber}: ${title}`], worktree);
+      await git([
+        "-c", "user.name=Fugue",
+        "-c", "user.email=fugue@users.noreply.github.com",
+        "commit", "-m", `${work.pr ? "Address review for" : "Implement"} #${work.issueNumber}: ${title}`,
+      ], worktree);
       const headSha = await git(["rev-parse", "HEAD"], worktree);
       await git(["push", "origin", `HEAD:refs/heads/${branch}`], worktree);
 
@@ -122,6 +134,7 @@ export class CodexCliExecutor {
     await this.assertAvailable();
 
     return withCleanWorktree(snapshot.identity.headSha, async (worktree) => {
+      await git(["fetch", "--no-tags", "origin", snapshot.identity.baseSha], worktree);
       await runValidation(
         worktree,
         snapshot.policy.config.validation.install,
@@ -131,8 +144,7 @@ export class CodexCliExecutor {
       const schema = role === "code" ? codeQaJsonSchema() : genericQaJsonSchema();
       const prompt = qaPrompt(snapshot, role);
       const output = await this.runCodex(worktree, prompt, "read-only", schema);
-      const parsed: unknown = JSON.parse(output);
-      const result = role === "code" ? codeQaResultSchema.parse(parsed) : genericQaResultSchema.parse(parsed);
+      const result = parseCodexQaResult(role, output);
 
       const dirty = await git(["status", "--porcelain"], worktree);
       if (dirty) throw new Error(`Codex ${role} QA modified the exact-head review worktree; verdict rejected.`);
@@ -166,20 +178,46 @@ export class CodexCliExecutor {
     const temp = await mkdtemp(join(tmpdir(), "fugue-codex-"));
     try {
       const lastMessagePath = join(temp, "last-message.txt");
-      const args = ["exec", "--sandbox", sandbox, "--output-last-message", lastMessagePath];
-      if (this.options.model) args.push("--model", this.options.model);
+      let outputSchemaPath: string | undefined;
       if (outputSchema) {
-        const schemaPath = join(temp, "output-schema.json");
-        await writeFile(schemaPath, JSON.stringify(outputSchema), "utf8");
-        args.push("--output-schema", schemaPath);
+        outputSchemaPath = join(temp, "output-schema.json");
+        await writeFile(outputSchemaPath, JSON.stringify(outputSchema), "utf8");
       }
-      args.push(prompt);
+      const args = buildCodexExecArgs({
+        sandbox,
+        prompt,
+        lastMessagePath,
+        ...(outputSchemaPath ? { outputSchemaPath } : {}),
+        ...(this.options.model ? { model: this.options.model } : {}),
+      });
       await spawnInherited("codex", args, cwd);
       return await readFile(lastMessagePath, "utf8");
     } finally {
       await rm(temp, { recursive: true, force: true });
     }
   }
+}
+
+export function buildCodexExecArgs(options: CodexExecArgsOptions): string[] {
+  const args = [
+    "exec",
+    "--sandbox", options.sandbox,
+    "--output-last-message", options.lastMessagePath,
+  ];
+  if (options.model) args.push("--model", options.model);
+  if (options.outputSchemaPath) args.push("--output-schema", options.outputSchemaPath);
+  args.push(options.prompt);
+  return args;
+}
+
+export function parseCodexQaResult(role: Exclude<QaRole, "visual">, output: string): CodexQaResult {
+  let value: unknown;
+  try {
+    value = JSON.parse(output);
+  } catch {
+    throw new Error(`Codex ${role} QA did not return valid JSON.`);
+  }
+  return role === "code" ? codeQaResultSchema.parse(value) : genericQaResultSchema.parse(value);
 }
 
 export function assertWorkerChangesWithinOwnership(
@@ -231,7 +269,8 @@ function qaPrompt(snapshot: EvaluationSnapshot, role: Exclude<QaRole, "visual">)
   const roleName = role === "code" ? "Code QA" : "Security QA";
   return [
     `You are independent Fugue ${roleName} for PR #${snapshot.pr.number}.`,
-    `Review exact committed head ${snapshot.identity.headSha}. Do not implement fixes or modify files.`,
+    `Review exact committed head ${snapshot.identity.headSha} against base ${snapshot.identity.baseSha}.`,
+    `Use git diff ${snapshot.identity.baseSha}...HEAD when inspecting candidate changes. Do not implement fixes or modify files.`,
     `Issue #${snapshot.identity.issueNumber}; work ${snapshot.identity.workId}.`,
     `Required because: ${snapshot.qa.required.find((item) => item.role === role)?.reasons.join("; ") ?? "base policy"}.`,
     "Inspect the repository, diff, architecture contract, and relevant tests. Return only JSON conforming to the supplied schema.",
