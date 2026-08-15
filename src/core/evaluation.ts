@@ -1,5 +1,10 @@
 import type { FugueGitHub } from "./github.js";
-import { parseWorkMetadata, workSpecDigest, type WorkMetadata } from "./metadata.js";
+import {
+  assertWorkMetadataForIssue,
+  parseWorkMetadata,
+  workSpecDigest,
+  type WorkMetadata,
+} from "./metadata.js";
 import { parsePrMetadata, type PrMetadata } from "./pr-metadata.js";
 import { resolveActivePolicy, type ActivePolicy } from "./policy.js";
 import { resolveQaRequirements, type QaResolution } from "./qa.js";
@@ -50,12 +55,16 @@ export async function captureEvaluation(
   const issueBody = issueResponse.data.body ?? "";
   const workMetadata = parseWorkMetadata(issueBody);
   if (!workMetadata) throw new Error(`Issue #${prMetadata.issue} is missing fugue-work metadata.`);
+  assertWorkMetadataForIssue(workMetadata, prMetadata.issue);
 
   if (workMetadata.work_id !== prMetadata.work_id) {
     throw new Error(`PR #${prNumber} work_id does not match Issue #${prMetadata.issue}.`);
   }
   if (workMetadata.execution.worker_id !== prMetadata.worker_id) {
     throw new Error(`PR #${prNumber} Worker ID does not match Issue #${prMetadata.issue}.`);
+  }
+  if (workMetadata.execution.branch !== prMetadata.branch || pr.head.ref !== prMetadata.branch) {
+    throw new Error(`PR #${prNumber} branch identity does not match Issue #${prMetadata.issue}.`);
   }
 
   const files = await github.octokit.paginate(github.octokit.rest.pulls.listFiles, {
