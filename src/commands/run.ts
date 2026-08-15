@@ -21,6 +21,7 @@ export interface RunOptions {
 
 interface RunMemory {
   notifications: Map<number, string>;
+  attempts: Set<string>;
 }
 
 const DEFAULT_INTERVAL_SECONDS = 30;
@@ -30,7 +31,7 @@ export async function runOrchestrator(options: RunOptions): Promise<void> {
   const repository = await discoverRepository();
   const github = await requireWritableGitHub(repository);
   const intervalSeconds = parseInterval(options.interval);
-  const memory: RunMemory = { notifications: new Map() };
+  const memory: RunMemory = { notifications: new Map(), attempts: new Set() };
   const manual = new ManualChatExecutor();
   const executorMode = parseExecutorMode(options.executor);
   const codex = executorMode === "codex" ? new CodexCliExecutor(options.model ? { model: options.model } : {}) : null;
@@ -65,7 +66,6 @@ export async function runOrchestrator(options: RunOptions): Promise<void> {
             action,
             manual,
             codex,
-            executorMode,
             memory,
           });
           immediate = immediate || result.immediate;
@@ -93,10 +93,9 @@ async function runAction(input: {
   action: WorkflowAction;
   manual: ManualChatExecutor;
   codex: CodexCliExecutor | null;
-  executorMode: ExecutorMode;
   memory: RunMemory;
 }): Promise<{ immediate: boolean }> {
-  const { repository, github, work, observation, action, manual, codex, executorMode, memory } = input;
+  const { repository, github, work, observation, action, manual, codex, memory } = input;
   const notification = notificationFingerprint(work, observation, action);
 
   switch (action.kind) {
@@ -117,6 +116,11 @@ async function runAction(input: {
     case "wait_worker":
     case "resume_worker": {
       if (codex) {
+        const attempt = codexWorkerAttemptFingerprint(work);
+        if (!claimAttempt(memory, attempt)) {
+          emitAttemptSuppressed(memory, work, attempt, "Codex Worker");
+          return { immediate: false };
+        }
         printState(work, action);
         const result = await codex.executeWorker(github, work);
         console.log(`CODEX WORKER COMPLETE — PR #${result.prNumber} @ ${result.headSha.slice(0, 8)}`);
@@ -146,6 +150,11 @@ async function runAction(input: {
         await runHandoff(`${role}-qa`, { pr: String(prNumber) });
         const executionRoleValue = executionRole(role);
         if (codex?.supports(executionRoleValue)) {
+          const attempt = codexQaAttemptFingerprint(work, role);
+          if (!claimAttempt(memory, attempt)) {
+            emitAttemptSuppressed(memory, work, attempt, `Codex ${role.toUpperCase()} QA`);
+            continue;
+          }
           const snapshot = await captureEvaluation(github, prNumber);
           await codex.executeQa(github, snapshot, role as Exclude<QaRole, "visual">);
           console.log(`CODEX ${role.toUpperCase()} QA COMPLETE — PR #${prNumber}`);
@@ -166,7 +175,7 @@ async function runAction(input: {
           for (const instruction of instructions) printInstruction(instruction);
         });
       }
-      return { immediate: launchedCodex || !instructions.length };
+      return { immediate: launchedCodex || (!codex && !instructions.length) };
     }
 
     case "wait_qa": {
@@ -177,6 +186,11 @@ async function runAction(input: {
       for (const role of action.roles) {
         const executionRoleValue = executionRole(role);
         if (codex?.supports(executionRoleValue)) {
+          const attempt = codexQaAttemptFingerprint(work, role);
+          if (!claimAttempt(memory, attempt)) {
+            emitAttemptSuppressed(memory, work, attempt, `Codex ${role.toUpperCase()} QA`);
+            continue;
+          }
           const snapshot = await captureEvaluation(github, prNumber);
           await codex.executeQa(github, snapshot, role as Exclude<QaRole, "visual">);
           console.log(`CODEX ${role.toUpperCase()} QA COMPLETE — PR #${prNumber}`);
@@ -267,6 +281,26 @@ export function workerExecutionFingerprint(work: WorkState): string {
 
 export function qaExecutionFingerprint(work: WorkState, roles: QaRole[]): string {
   return ["qa", work.metadata.work_id, work.pr?.headSha ?? "no-pr", [...roles].sort().join(",")].join("|");
+}
+
+export function codexWorkerAttemptFingerprint(work: WorkState): string {
+  return ["codex-worker", work.metadata.work_id, work.workSpecDigest, work.pr?.headSha ?? "no-pr"].join("|");
+}
+
+export function codexQaAttemptFingerprint(work: WorkState, role: QaRole): string {
+  return ["codex-qa", role, work.metadata.work_id, work.workSpecDigest, work.pr?.headSha ?? "no-pr"].join("|");
+}
+
+function claimAttempt(memory: RunMemory, fingerprint: string): boolean {
+  if (memory.attempts.has(fingerprint)) return false;
+  memory.attempts.add(fingerprint);
+  return true;
+}
+
+function emitAttemptSuppressed(memory: RunMemory, work: WorkState, attempt: string, label: string): void {
+  emitOnce(memory, work.issueNumber, `attempt-suppressed:${attempt}`, () => {
+    console.log(`${label} already ran for the current evaluation identity. Fugue will not retry it every poll; restart fugue run to retry explicitly.`);
+  });
 }
 
 function emitOnce(memory: RunMemory, issueNumber: number, fingerprint: string, emit: () => void): void {
