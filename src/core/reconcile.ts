@@ -225,11 +225,13 @@ async function markPrReady(github: FugueGitHub, prNumber: number): Promise<void>
 async function updatePrBranch(github: FugueGitHub, work: WorkState): Promise<void> {
   const { owner, repo } = github.repository;
   const prNumber = requirePr(work);
+  const headSha = work.pr?.headSha;
+  if (!headSha) throw new Error(`Work #${work.issueNumber} has no PR head to update.`);
   await github.octokit.rest.pulls.updateBranch({
     owner,
     repo,
     pull_number: prNumber,
-    expected_head_sha: work.pr?.headSha,
+    expected_head_sha: headSha,
   });
 }
 
