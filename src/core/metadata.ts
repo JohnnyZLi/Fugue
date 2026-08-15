@@ -44,6 +44,16 @@ export function parseWorkMetadata(issueBody: string): WorkMetadata | null {
   return workMetadataSchema.parse(parseYaml(yaml));
 }
 
+export function stripWorkMetadata(issueBody: string): string {
+  const start = issueBody.indexOf(START);
+  if (start < 0) return normalizeRequirements(issueBody);
+
+  const end = issueBody.indexOf(END, start + START.length);
+  if (end < 0) throw new Error("Unterminated fugue-work metadata block.");
+
+  return normalizeRequirements(`${issueBody.slice(0, start)}${issueBody.slice(end + END.length)}`);
+}
+
 export function upsertWorkMetadata(issueBody: string, metadata: WorkMetadata): string {
   const block = `${START}\n${stringifyYaml(metadata).trim()}\n${END}`;
   const start = issueBody.indexOf(START);
@@ -58,8 +68,11 @@ export function upsertWorkMetadata(issueBody: string, metadata: WorkMetadata): s
   return `${issueBody.slice(0, start)}${block}${issueBody.slice(end + END.length)}`;
 }
 
-export function workSpecDigest(metadata: WorkMetadata): string {
-  return digestCanonical(metadata.spec);
+export function workSpecDigest(issueBody: string, metadata: WorkMetadata): string {
+  return digestCanonical({
+    requirements: stripWorkMetadata(issueBody),
+    spec: metadata.spec,
+  });
 }
 
 export function createWorkId(issueNumber: number): string {
@@ -67,4 +80,13 @@ export function createWorkId(issueNumber: number): string {
     throw new Error(`Invalid issue number: ${issueNumber}`);
   }
   return `work-${issueNumber}`;
+}
+
+function normalizeRequirements(value: string): string {
+  return value
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/g, ""))
+    .join("\n")
+    .trim();
 }
