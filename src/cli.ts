@@ -37,6 +37,8 @@ program
   .option("--issue <number>", "Watch only one Fugue work issue")
   .option("--pr <number>", "Watch only the work item linked to one PR")
   .option("--interval <seconds>", "GitHub polling interval in seconds", "30")
+  .option("--executor <mode>", "Execution backend: manual-chat or codex", "manual-chat")
+  .option("--model <model>", "Optional Codex model override")
   .action(runOrchestrator);
 
 program
