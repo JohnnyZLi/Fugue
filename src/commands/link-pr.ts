@@ -1,6 +1,7 @@
 import { discoverRepository } from "../core/git.js";
 import { requireWritableGitHub } from "../core/github.js";
-import { parseWorkMetadata } from "../core/metadata.js";
+import { assertWorkMetadataForIssue, parseWorkMetadata } from "../core/metadata.js";
+import { resolveActivePolicy } from "../core/policy.js";
 import { upsertPrMetadata } from "../core/pr-metadata.js";
 
 export interface LinkPrOptions {
@@ -12,6 +13,7 @@ export async function runLinkPr(prValue: string, options: LinkPrOptions): Promis
   const issueNumber = parsePositiveInteger(options.issue, "issue");
   const repository = await discoverRepository();
   const github = await requireWritableGitHub(repository);
+  const policy = await resolveActivePolicy(github);
   const { owner, repo } = repository;
 
   const [prResponse, issueResponse] = await Promise.all([
@@ -19,8 +21,16 @@ export async function runLinkPr(prValue: string, options: LinkPrOptions): Promis
     github.octokit.rest.issues.get({ owner, repo, issue_number: issueNumber }),
   ]);
 
+  if (prResponse.data.base.ref !== policy.identity.baseBranch) {
+    throw new Error(
+      `PR #${prNumber} targets ${prResponse.data.base.ref}; Fugue currently governs ${policy.identity.baseBranch}.`,
+    );
+  }
+
   const work = parseWorkMetadata(issueResponse.data.body ?? "");
   if (!work) throw new Error(`Issue #${issueNumber} is missing fugue-work metadata.`);
+  assertWorkMetadataForIssue(work, issueNumber);
+
   const workerId = work.execution.worker_id;
   const branch = work.execution.branch;
   if (!workerId || !branch) throw new Error(`Issue #${issueNumber} does not have an active Worker claim.`);
@@ -52,6 +62,7 @@ export async function runLinkPr(prValue: string, options: LinkPrOptions): Promis
   console.log(`Work ID    ${work.work_id}`);
   console.log(`Worker ID  ${workerId}`);
   console.log(`Branch     ${branch}`);
+  console.log(`Base       ${policy.identity.baseBranch}`);
 }
 
 function parsePositiveInteger(value: string, name: string): number {
