@@ -12,6 +12,7 @@ import {
 } from "./attestations.js";
 import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
 import { FUGUE_CLI_VERSION } from "./protocol.js";
+import { resolveReviewActivity, type ReviewActivity } from "./review-activity.js";
 
 export interface CompleteReviewOptions {
   verdict: "approved" | "changes_requested" | "error";
@@ -22,13 +23,25 @@ export interface CompleteReviewOptions {
   summary?: string;
 }
 
+const QA_ROLES: readonly QaRole[] = ["code", "security", "visual"];
+
 export async function beginReview(
   github: FugueGitHub,
   prNumber: number,
   role: QaRole,
-): Promise<{ snapshot: EvaluationSnapshot; session: ReviewStart }> {
+): Promise<{ snapshot: EvaluationSnapshot; session: ReviewStart; created: boolean }> {
   const snapshot = await captureEvaluation(github, prNumber);
   assertRoleRequired(snapshot, role);
+
+  const activity = await currentReviewActivity(github, snapshot, role);
+  if (activity.active) {
+    return { snapshot, session: activity.active, created: false };
+  }
+  if (activity.completed) {
+    throw new Error(
+      `${roleHeading(role)} already has a current ${activity.completed.verdict.replace("_", " ")} verdict for PR #${prNumber}.`,
+    );
+  }
 
   const session = reviewStartSchema.parse({
     version: 1,
@@ -58,7 +71,7 @@ export async function beginReview(
     target_url: comment.data.html_url,
   });
 
-  return { snapshot, session };
+  return { snapshot, session, created: true };
 }
 
 export async function completeReview(
@@ -71,40 +84,17 @@ export async function completeReview(
   assertRoleRequired(snapshot, role);
   const { owner, repo } = github.repository;
 
-  const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
-    owner,
-    repo,
-    issue_number: prNumber,
-    per_page: 100,
-  });
-
-  const parsed = comments
-    .map((comment) => {
-      try {
-        return { value: parseAttestation(comment.body ?? ""), url: comment.html_url, id: comment.id };
-      } catch {
-        return { value: null, url: comment.html_url, id: comment.id };
-      }
-    })
-    .filter((entry) => entry.value !== null);
-
-  const sessions = parsed
-    .map((entry) => entry.value)
-    .filter((value): value is ReviewStart => value?.kind === "review_start")
-    .filter((value) => value.role === role && sameEvaluationIdentity(value.identity, snapshot.identity));
-
-  const session = sessions.at(-1);
+  const activity = await currentReviewActivity(github, snapshot, role);
+  const session = activity.active;
   if (!session) {
+    if (activity.completed) {
+      throw new Error(
+        `${roleHeading(role)} already has a current verdict in session ${activity.completed.session_id}; start a fresh QA handoff only after the evaluation identity changes.`,
+      );
+    }
     throw new Error(
       `No current ${role} review session exists for PR #${prNumber}. Run fugue handoff ${role}-qa --pr ${prNumber} first.`,
     );
-  }
-
-  const alreadyCompleted = parsed
-    .map((entry) => entry.value)
-    .some((value) => value?.kind === "qa" && value.session_id === session.session_id);
-  if (alreadyCompleted) {
-    throw new Error(`Review session ${session.session_id} is already completed; start a fresh QA handoff.`);
   }
 
   const roleEvidence = buildRoleEvidence(snapshot, role, options);
@@ -148,10 +138,19 @@ export async function completeReview(
   return { snapshot, attestation, url: comment.data.html_url };
 }
 
-export async function currentQaAttestations(
+export async function currentReviewActivity(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
-): Promise<Map<QaRole, QaAttestation>> {
+  role: QaRole,
+): Promise<ReviewActivity> {
+  const activities = await currentReviewActivities(github, snapshot);
+  return activities.get(role) ?? resolveReviewActivity([], []);
+}
+
+export async function currentReviewActivities(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+): Promise<Map<QaRole, ReviewActivity>> {
   const { owner, repo } = github.repository;
   const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
     owner,
@@ -160,7 +159,13 @@ export async function currentQaAttestations(
     per_page: 100,
   });
 
-  const current = new Map<QaRole, QaAttestation>();
+  const sessions = new Map<QaRole, ReviewStart[]>();
+  const attestations = new Map<QaRole, QaAttestation[]>();
+  for (const role of QA_ROLES) {
+    sessions.set(role, []);
+    attestations.set(role, []);
+  }
+
   for (const comment of comments) {
     let value: ReturnType<typeof parseAttestation>;
     try {
@@ -168,9 +173,27 @@ export async function currentQaAttestations(
     } catch {
       continue;
     }
-    if (value?.kind !== "qa") continue;
-    if (!sameEvaluationIdentity(value.identity, snapshot.identity)) continue;
-    current.set(value.role, value);
+    if (!value || !sameEvaluationIdentity(value.identity, snapshot.identity)) continue;
+    if (value.kind === "review_start") sessions.get(value.role)?.push(value);
+    if (value.kind === "qa") attestations.get(value.role)?.push(value);
+  }
+
+  const activities = new Map<QaRole, ReviewActivity>();
+  for (const role of QA_ROLES) {
+    activities.set(role, resolveReviewActivity(sessions.get(role) ?? [], attestations.get(role) ?? []));
+  }
+  return activities;
+}
+
+export async function currentQaAttestations(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+): Promise<Map<QaRole, QaAttestation>> {
+  const activities = await currentReviewActivities(github, snapshot);
+  const current = new Map<QaRole, QaAttestation>();
+
+  for (const [role, activity] of activities) {
+    if (!activity.active && activity.completed) current.set(role, activity.completed);
   }
   return current;
 }

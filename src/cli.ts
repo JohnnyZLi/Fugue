@@ -2,10 +2,12 @@
 
 import { Command } from "commander";
 import { runAcknowledge } from "./commands/acknowledge.js";
+import { runAdvance } from "./commands/advance.js";
 import { runHandoff } from "./commands/handoff.js";
 import { runIntegrate } from "./commands/integrate.js";
 import { runLinkPr } from "./commands/link-pr.js";
 import { runReview } from "./commands/review.js";
+import { runOrchestrator } from "./commands/run.js";
 import { runStatus } from "./commands/status.js";
 import { FUGUE_CLI_VERSION } from "./core/protocol.js";
 
@@ -20,6 +22,22 @@ program
   .command("status")
   .description("Reconstruct durable Fugue engineering state for the current repository")
   .action(runStatus);
+
+program
+  .command("advance")
+  .description("Perform the next deterministic workflow transition for current Fugue work")
+  .option("--issue <number>", "Advance only one Fugue work issue")
+  .option("--pr <number>", "Advance only the work item linked to one PR")
+  .option("--dry-run", "Plan the next transition without mutating GitHub")
+  .action(runAdvance);
+
+program
+  .command("run")
+  .description("Continuously watch GitHub and advance Fugue work until external or Human action changes")
+  .option("--issue <number>", "Watch only one Fugue work issue")
+  .option("--pr <number>", "Watch only the work item linked to one PR")
+  .option("--interval <seconds>", "GitHub polling interval in seconds", "30")
+  .action(runOrchestrator);
 
 program
   .command("handoff")
