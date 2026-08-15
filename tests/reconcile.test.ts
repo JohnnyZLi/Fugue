@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { canonicalizePrMetadata, parsePrMetadata } from "../src/core/pr-metadata.js";
 import { externalInstruction, renderStateComment } from "../src/core/state-comment.js";
 import type { WorkState } from "../src/core/state.js";
 import { planWork, type WorkflowObservation } from "../src/core/workflow.js";
@@ -89,6 +90,29 @@ describe("chat-first reconciliation planning", () => {
   it("blocks before QA on ownership violations", () => {
     const action = planWork(observation({ ownership: "failed", ownershipDetail: "package.json (unassigned)" }));
     expect(action).toEqual({ kind: "blocked", reason: "Ownership violation: package.json (unassigned)" });
+  });
+});
+
+describe("assigned PR adoption metadata", () => {
+  const expected = {
+    version: 1 as const,
+    work_id: "work-18",
+    issue: 18,
+    worker_id: "wkr-12345678",
+    branch: "agent/18-chat-first",
+  };
+
+  it("repairs malformed assigned-branch metadata and becomes idempotent", () => {
+    const malformed = "Summary\n\n<!-- fugue-pr\nversion: nope\n";
+    const repaired = canonicalizePrMetadata(malformed, expected);
+    expect(parsePrMetadata(repaired)).toEqual(expected);
+    expect(canonicalizePrMetadata(repaired, expected)).toBe(repaired);
+  });
+
+  it("replaces mismatched metadata with the durable Worker claim", () => {
+    const mismatched = canonicalizePrMetadata("Summary", { ...expected, worker_id: "wkr-wrong" });
+    const repaired = canonicalizePrMetadata(mismatched, expected);
+    expect(parsePrMetadata(repaired)).toEqual(expected);
   });
 });
 
