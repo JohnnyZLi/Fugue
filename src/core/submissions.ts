@@ -1,10 +1,12 @@
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { z } from "zod";
 import {
   createAttestationId,
+  evaluationIdentitySchema,
   humanControlPlaneAttestationSchema,
   parseAttestation,
   serializeAttestation,
+  type EvaluationIdentity,
   type QaRole,
 } from "./attestations.js";
 import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
@@ -14,6 +16,7 @@ import { completeReview, currentReviewActivities, type CompleteReviewOptions } f
 
 const REVIEW_START = "<!-- fugue-review-submit";
 const HUMAN_START = "<!-- fugue-human-submit";
+const REJECTION_START = "<!-- fugue-submission-rejection";
 const END = "-->";
 
 const qaSubmissionSchema = z.object({
@@ -31,11 +34,22 @@ const qaSubmissionSchema = z.object({
 const humanSubmissionSchema = z.object({
   version: z.literal(1),
   kind: z.literal("control_plane_ack"),
-  pr: z.number().int().positive(),
+  identity: evaluationIdentitySchema,
+});
+
+const submissionRejectionSchema = z.object({
+  version: z.literal(1),
+  comment_ids: z.array(z.number().int().positive()).min(1),
 });
 
 export type QaSubmission = z.infer<typeof qaSubmissionSchema>;
 export type HumanSubmission = z.infer<typeof humanSubmissionSchema>;
+
+interface SubmissionInput<T> {
+  submission: T;
+  actor: string;
+  commentId: number;
+}
 
 export interface SubmissionProcessingResult {
   accepted: number;
@@ -72,34 +86,53 @@ export async function processCurrentSubmissions(
     per_page: 100,
   });
 
-  const qaInputs: Array<{ submission: QaSubmission; commentId: number }> = [];
-  const humanInputs: Array<{ submission: HumanSubmission; actor: string; commentId: number }> = [];
+  const rejectedIds = rejectedSubmissionIds(comments.map((comment) => comment.body ?? ""));
+  const qaInputs: Array<SubmissionInput<QaSubmission>> = [];
+  const humanInputs: Array<SubmissionInput<HumanSubmission>> = [];
 
   for (const comment of comments) {
+    if (rejectedIds.has(comment.id)) continue;
     const body = comment.body ?? "";
+    if (!body.includes(REVIEW_START) && !body.includes(HUMAN_START)) continue;
+
+    const actor = comment.user?.login;
+    if (!actor) {
+      await rejectSubmissions(github, snapshot.pr.number, [comment.id], "Submission has no attributable GitHub actor.");
+      return { accepted: 1 };
+    }
+
     try {
       const qa = parseQaSubmission(body);
-      if (qa) qaInputs.push({ submission: qa, commentId: comment.id });
+      if (qa) qaInputs.push({ submission: qa, actor, commentId: comment.id });
       const human = parseHumanSubmission(body);
-      if (human) {
-        const actor = comment.user?.login;
-        if (!actor) {
-          return { accepted: 0, blockedReason: `Human acknowledgement submission comment ${comment.id} has no actor.` };
-        }
-        humanInputs.push({ submission: human, actor, commentId: comment.id });
-      }
+      if (human) humanInputs.push({ submission: human, actor, commentId: comment.id });
     } catch (error) {
-      if (body.includes(REVIEW_START) || body.includes(HUMAN_START)) {
-        return {
-          accepted: 0,
-          blockedReason: `Malformed Fugue submission in comment ${comment.id}: ${message(error)}`,
-        };
-      }
+      await rejectSubmissions(
+        github,
+        snapshot.pr.number,
+        [comment.id],
+        `Malformed Fugue submission: ${message(error)}`,
+      );
+      return { accepted: 1 };
     }
   }
 
   let accepted = 0;
   const activities = await currentReviewActivities(github, snapshot);
+
+  for (const input of qaInputs) {
+    const activity = activities.get(input.submission.role);
+    if (activity?.completed?.session_id === input.submission.session_id) continue;
+    if (activity?.active?.session_id === input.submission.session_id) continue;
+
+    await rejectSubmissions(
+      github,
+      snapshot.pr.number,
+      [input.commentId],
+      `QA session ${input.submission.session_id} is not current for the exact PR evaluation identity.`,
+    );
+    return { accepted: accepted + 1 };
+  }
 
   for (const requirement of snapshot.qa.required) {
     const activity = activities.get(requirement.role);
@@ -110,13 +143,28 @@ export async function processCurrentSubmissions(
     );
     if (!matches.length) continue;
 
+    for (const match of matches) {
+      if (!(await canSubmitProtocolEvidence(github, match.actor))) {
+        await rejectSubmissions(
+          github,
+          snapshot.pr.number,
+          [match.commentId],
+          `@${match.actor} does not have repository write permission required to submit Fugue protocol evidence.`,
+        );
+        return { accepted: accepted + 1 };
+      }
+    }
+
     const unique = new Map<string, typeof matches[number]>();
     for (const match of matches) unique.set(JSON.stringify(match.submission), match);
     if (unique.size > 1) {
-      return {
-        accepted,
-        blockedReason: `Conflicting ${roleHeading(requirement.role)} submissions exist for session ${activity.active.session_id}.`,
-      };
+      await rejectSubmissions(
+        github,
+        snapshot.pr.number,
+        matches.map((match) => match.commentId),
+        `Conflicting ${roleHeading(requirement.role)} submissions exist for session ${activity.active.session_id}; submit one fresh verdict.`,
+      );
+      return { accepted: accepted + 1 };
     }
 
     const selected = [...unique.values()][0];
@@ -131,12 +179,38 @@ export async function processCurrentSubmissions(
   }
 
   if (snapshot.qa.controlPlaneChanged && !(await hasCurrentHumanAcknowledgement(github, snapshot))) {
+    for (const input of humanInputs) {
+      if (!sameEvaluationIdentity(input.submission.identity, snapshot.identity)) {
+        await rejectSubmissions(
+          github,
+          snapshot.pr.number,
+          [input.commentId],
+          "Human control-plane acknowledgement is bound to a stale PR evaluation identity.",
+        );
+        return { accepted: accepted + 1 };
+      }
+    }
+
     const matches = humanInputs
-      .filter((input) => input.submission.pr === snapshot.pr.number)
+      .filter((input) => sameEvaluationIdentity(input.submission.identity, snapshot.identity))
       .sort((a, b) => a.commentId - b.commentId);
     const selected = matches.at(-1);
     if (selected) {
-      await recordHumanControlPlaneAcknowledgement(github, snapshot.pr.number, selected.actor);
+      if (!(await canSubmitProtocolEvidence(github, selected.actor))) {
+        await rejectSubmissions(
+          github,
+          snapshot.pr.number,
+          [selected.commentId],
+          `@${selected.actor} does not have repository write permission required for control-plane acknowledgement.`,
+        );
+        return { accepted: accepted + 1 };
+      }
+      await recordHumanControlPlaneAcknowledgement(
+        github,
+        snapshot.pr.number,
+        selected.actor,
+        selected.submission.identity,
+      );
       accepted += 1;
     }
   }
@@ -148,8 +222,12 @@ export async function recordHumanControlPlaneAcknowledgement(
   github: FugueGitHub,
   prNumber: number,
   actor: string,
+  expectedIdentity?: EvaluationIdentity,
 ): Promise<void> {
   const snapshot = await captureEvaluation(github, prNumber);
+  if (expectedIdentity && !sameEvaluationIdentity(expectedIdentity, snapshot.identity)) {
+    throw new Error("Human acknowledgement request is stale for the current PR evaluation identity.");
+  }
   if (!snapshot.qa.controlPlaneChanged) {
     throw new Error(`PR #${prNumber} does not modify the active control-plane path set.`);
   }
@@ -202,6 +280,54 @@ export async function hasCurrentHumanAcknowledgement(
     }
   }
   return false;
+}
+
+function rejectedSubmissionIds(bodies: string[]): Set<number> {
+  const ids = new Set<number>();
+  for (const body of bodies) {
+    try {
+      const rejection = parseMarked(body, REJECTION_START, submissionRejectionSchema);
+      for (const id of rejection?.comment_ids ?? []) ids.add(id);
+    } catch {
+      // Invalid rejection-looking text is not protocol state.
+    }
+  }
+  return ids;
+}
+
+async function rejectSubmissions(
+  github: FugueGitHub,
+  prNumber: number,
+  commentIds: number[],
+  reason: string,
+): Promise<void> {
+  const { owner, repo } = github.repository;
+  const marker = `${REJECTION_START}\n${stringifyYaml({ version: 1, comment_ids: commentIds }).trim()}\n${END}`;
+  await github.octokit.rest.issues.createComment({
+    owner,
+    repo,
+    issue_number: prNumber,
+    body: `FUGUE SUBMISSION — REJECTED\n\n${reason}\n\n${marker}`,
+  });
+}
+
+async function canSubmitProtocolEvidence(github: FugueGitHub, actor: string): Promise<boolean> {
+  const { owner, repo } = github.repository;
+  try {
+    const response = await github.octokit.rest.repos.getCollaboratorPermissionLevel({
+      owner,
+      repo,
+      username: actor,
+    });
+    return response.data.user.permissions.admin ||
+      response.data.user.permissions.maintain ||
+      response.data.user.permissions.push ||
+      response.data.permission === "write" ||
+      response.data.permission === "maintain" ||
+      response.data.permission === "admin";
+  } catch {
+    return false;
+  }
 }
 
 function parseMarked<T>(body: string, startMarker: string, schema: z.ZodType<T>): T | null {
