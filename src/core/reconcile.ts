@@ -1,11 +1,11 @@
 import { parseWorkMetadata, upsertWorkMetadata } from "./metadata.js";
-import { upsertPrMetadata, parsePrMetadata } from "./pr-metadata.js";
+import { canonicalizePrMetadata, parsePrMetadata, samePrMetadata } from "./pr-metadata.js";
 import { beginReview } from "./reviews.js";
 import { resolveActivePolicy, type ActivePolicy } from "./policy.js";
 import { reconstructState, type WorkState } from "./state.js";
 import { processCurrentSubmissions } from "./submissions.js";
 import { upsertStateComment } from "./state-comment.js";
-import { observeWork, planWork, type WorkflowAction } from "./workflow.js";
+import { actionLabel, observeWork, planWork, type WorkflowAction } from "./workflow.js";
 import { claimWorker } from "./worker.js";
 import type { FugueGitHub } from "./github.js";
 
@@ -57,7 +57,17 @@ export async function reconcileWork(github: FugueGitHub, issueNumber: number): P
 
     const observation = await observeWork(github, work);
     const action = planWork(observation);
-    const changed = await applyAction(github, state.policy, work, action);
+    let changed: boolean;
+    try {
+      changed = await applyAction(github, state.policy, work, action);
+    } catch (error) {
+      const detail = message(error);
+      await upsertStateComment(github, work, {
+        kind: "blocked",
+        reason: `Control-plane error while trying to ${actionLabel(action)}: ${detail}`,
+      });
+      throw error;
+    }
     if (changed) continue;
 
     await upsertStateComment(github, work, action);
@@ -188,19 +198,19 @@ export async function adoptAssignedPullRequests(github: FugueGitHub): Promise<nu
       branch: metadata.execution.branch,
     };
 
-    let existing;
+    let existing = null;
     try {
       existing = parsePrMetadata(pull.body);
     } catch {
-      continue;
+      // Assigned-branch ownership lets protected Fugue repair malformed metadata below.
     }
-    if (existing) continue;
+    if (existing && samePrMetadata(existing, expected)) continue;
 
     let body = pull.body ?? "";
     if (!new RegExp(`\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#${issue.number}\\b`, "i").test(body)) {
       body = `${body.trimEnd()}\n\nCloses #${issue.number}\n`;
     }
-    body = upsertPrMetadata(body, expected);
+    body = canonicalizePrMetadata(body, expected);
     await github.octokit.rest.pulls.update({ owner, repo, pull_number: pull.number, body });
     adopted.push(pull.number);
   }
@@ -288,4 +298,8 @@ function requirePr(work: WorkState): number {
 
 function labelName(label: string | { name?: string | null }): string {
   return typeof label === "string" ? label : label.name ?? "";
+}
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
