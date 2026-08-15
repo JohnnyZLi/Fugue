@@ -3,6 +3,7 @@
 import { Command } from "commander";
 import { runAcknowledge } from "./commands/acknowledge.js";
 import { runAdvance } from "./commands/advance.js";
+import { runDoctor } from "./commands/doctor.js";
 import { runHandoff } from "./commands/handoff.js";
 import { runInit } from "./commands/init.js";
 import { runIntegrate } from "./commands/integrate.js";
@@ -29,6 +30,12 @@ program
   .command("status")
   .description("Reconstruct durable Fugue engineering state for the current repository")
   .action(runStatus);
+
+program
+  .command("doctor")
+  .description("Diagnose read-only Fugue repository governance and local prerequisites")
+  .option("--executor <mode>", "Runtime to validate: manual-chat or codex", "manual-chat")
+  .action(runDoctor);
 
 program
   .command("advance")

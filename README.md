@@ -64,6 +64,15 @@ fugue init
 
 Applying branch protection requires repository-owner/admin GitHub authentication with Administration write permission. If branch protection must be managed separately, `fugue init --no-protection` creates the protocol labels only.
 
+Before starting governed work, run the read-only repository health check:
+
+```bash
+fugue doctor
+fugue doctor --executor codex
+```
+
+`fugue doctor` resolves the active protected-base policy, verifies branch protection and required status contexts, checks Fugue protocol labels, and reports local Git and GitHub authentication readiness. Codex availability is only a warning for the default `manual-chat` executor; selecting `--executor codex` makes it a required prerequisite. The command prints concise `PASS`, `WARN`, and `FAIL` diagnostics, exits non-zero for hard failures, and never changes repository or GitHub state.
+
 ## Normal workflow
 
 `fugue run` is the foreground orchestrator. Start it in a governed repository and leave it running while work advances. It polls GitHub, performs deterministic transitions automatically, promotes reviewed draft PRs, runs Integration, and reports merge readiness.
@@ -174,7 +183,7 @@ fugue acknowledge 456 --control-plane
 fugue integrate 456
 ```
 
-`doctor` and `sync` remain intentionally deferred. The state protocol, repository bootstrap, and autonomous coordination layer are implemented first.
+`sync` remains intentionally deferred. The state protocol, repository bootstrap, diagnostics, and autonomous coordination layer are implemented first.
 
 ## Local installation
 
