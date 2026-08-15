@@ -20,6 +20,7 @@ export interface WorkflowObservation {
   workerClaimed: boolean;
   hasPr: boolean;
   prNumber?: number;
+  prDraft: boolean;
   drift: string[];
   qa: QaWorkflowObservation[];
   controlPlaneChanged: boolean;
@@ -34,6 +35,7 @@ export type WorkflowAction =
   | { kind: "wait_qa"; roles: QaRole[] }
   | { kind: "resume_worker"; roles: QaRole[] }
   | { kind: "human_control_plane_ack" }
+  | { kind: "mark_pr_ready" }
   | { kind: "integrate" }
   | { kind: "wait_integration" }
   | { kind: "ready_to_merge" }
@@ -79,6 +81,7 @@ export function planWork(observation: WorkflowObservation): WorkflowAction {
     return { kind: "blocked", reason: `Integration is ${observation.integration}; inspect durable evidence before retrying.` };
   }
 
+  if (observation.prDraft) return { kind: "mark_pr_ready" };
   return { kind: "integrate" };
 }
 
@@ -90,6 +93,7 @@ export async function observeWork(github: FugueGitHub, work: WorkState): Promise
     stateLabel: work.stateLabel,
     workerClaimed,
     hasPr: Boolean(work.pr),
+    prDraft: work.pr?.draft ?? false,
     drift: [...work.drift],
     qa: [],
     controlPlaneChanged: false,
@@ -138,6 +142,7 @@ export function actionLabel(action: WorkflowAction): string {
     case "wait_qa": return `wait for ${action.roles.map(roleLabel).join(" + ")}`;
     case "resume_worker": return `resume Worker after ${action.roles.map(roleLabel).join(" + ")} changes requested`;
     case "human_control_plane_ack": return "human control-plane acknowledgement";
+    case "mark_pr_ready": return "mark PR ready for review";
     case "integrate": return "run Integration";
     case "wait_integration": return "wait for Integration";
     case "ready_to_merge": return "ready for human merge";
