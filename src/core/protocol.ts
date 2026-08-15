@@ -1,4 +1,5 @@
 export const FUGUE_PROTOCOL_VERSION = 1 as const;
+export const FUGUE_CLI_VERSION = "0.1.0-alpha.0" as const;
 
 export type FugueProtocolVersion = typeof FUGUE_PROTOCOL_VERSION;
 
