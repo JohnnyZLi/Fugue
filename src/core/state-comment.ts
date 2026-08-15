@@ -103,7 +103,7 @@ export function externalInstruction(
     const readable = role === "code" ? "Code QA" : role === "security" ? "Security QA" : "Visual QA";
     return {
       heading: `**NEEDS ${readable.toUpperCase()} CHAT**`,
-      prompt: `Fugue ${readable} for ${repository} PR #${work.pr.number}. Reconstruct the current pending Fugue review session from GitHub, review the exact committed evaluation identity independently, and submit the verdict as a fugue-review-submit PR comment for that session. Do not implement fixes. Do not ask the Human to run fugue review or relay the verdict.`,
+      prompt: `Fugue ${readable} for ${repository} PR #${work.pr.number}. Reconstruct the current pending Fugue review session from GitHub, review the exact committed evaluation identity independently, and submit the verdict as a fugue-review-submit PR comment for that session. Do not implement fixes. Submit the result directly to GitHub; do not ask the Human to use a terminal or relay the verdict.`,
     };
   }
 
