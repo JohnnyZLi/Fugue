@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
-import { FUGUE_PROTOCOL_VERSION } from "./core/protocol.js";
+import { runHandoff } from "./commands/handoff.js";
+import { runStatus } from "./commands/status.js";
 
 const program = new Command();
 
@@ -13,10 +14,7 @@ program
 program
   .command("status")
   .description("Reconstruct durable Fugue engineering state for the current repository")
-  .action(() => {
-    console.log(`Fugue protocol ${FUGUE_PROTOCOL_VERSION}`);
-    console.log("status: bootstrap command surface only");
-  });
+  .action(runStatus);
 
 program
   .command("handoff")
@@ -25,9 +23,7 @@ program
   .option("--issue <number>", "GitHub issue number")
   .option("--pr <number>", "GitHub pull request number")
   .option("--resume", "Resume an existing Worker claim instead of creating a new claim")
-  .action((role, options) => {
-    console.log(JSON.stringify({ role, ...options, protocol: FUGUE_PROTOCOL_VERSION }, null, 2));
-  });
+  .action(runHandoff);
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
