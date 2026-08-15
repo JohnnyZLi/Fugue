@@ -41,6 +41,7 @@ jobs:
         run: >-
           node dist/cli.js integration-runtime prepare "${{ inputs.pr }}"
           --out "$RUNNER_TEMP/fugue-plan.json"
+          --runtime-sha "${{ github.sha }}"
           --github-output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
@@ -80,6 +81,9 @@ jobs:
           name: fugue-plan
           path: _plan
       - name: Run protected-base validation commands against exact head
+        env:
+          GITHUB_TOKEN: ""
+          GH_TOKEN: ""
         run: >-
           node _fugue/dist/cli.js integration-runtime validate
           --plan _plan/fugue-plan.json
