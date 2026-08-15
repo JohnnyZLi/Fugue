@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
+import { runAcknowledge } from "./commands/acknowledge.js";
 import { runHandoff } from "./commands/handoff.js";
+import { runIntegrate } from "./commands/integrate.js";
 import { runReview } from "./commands/review.js";
 import { runStatus } from "./commands/status.js";
 import { FUGUE_CLI_VERSION } from "./core/protocol.js";
@@ -41,6 +43,19 @@ program
   .option("--viewports <list>", "Visual QA: comma-separated viewports")
   .option("--summary <text>", "Human-readable verdict summary")
   .action(runReview);
+
+program
+  .command("acknowledge")
+  .description("Record a head-bound Human acknowledgement")
+  .argument("<pr>", "GitHub pull request number")
+  .option("--control-plane", "Acknowledge the current control-plane change")
+  .action(runAcknowledge);
+
+program
+  .command("integrate")
+  .description("Run the composite Integration gate against an exact PR snapshot")
+  .argument("<pr>", "GitHub pull request number")
+  .action(runIntegrate);
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
