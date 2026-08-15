@@ -4,6 +4,7 @@ import { Command } from "commander";
 import { runAcknowledge } from "./commands/acknowledge.js";
 import { runHandoff } from "./commands/handoff.js";
 import { runIntegrate } from "./commands/integrate.js";
+import { runLinkPr } from "./commands/link-pr.js";
 import { runReview } from "./commands/review.js";
 import { runStatus } from "./commands/status.js";
 import { FUGUE_CLI_VERSION } from "./core/protocol.js";
@@ -28,6 +29,13 @@ program
   .option("--pr <number>", "GitHub pull request number")
   .option("--resume", "Resume an existing Worker claim instead of creating a new claim")
   .action(runHandoff);
+
+program
+  .command("link-pr")
+  .description("Attach Fugue work metadata to an implementation PR")
+  .argument("<pr>", "GitHub pull request number")
+  .requiredOption("--issue <number>", "Fugue work issue number")
+  .action(runLinkPr);
 
 program
   .command("review")
