@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { IntegrationGateFailure } from "./gates.js";
 
 export interface ValidationResult {
   passed: true;
@@ -33,7 +34,7 @@ async function runCommand(command: string, cwd: string): Promise<void> {
         return;
       }
       const detail = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
-      reject(new Error(`Validation command failed (${detail}): ${command}`));
+      reject(new IntegrationGateFailure("validation", `Validation command failed (${detail}): ${command}`));
     });
   });
 }
