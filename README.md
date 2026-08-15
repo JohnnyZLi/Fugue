@@ -1,12 +1,12 @@
 # Fugue
 
-Fugue is a GitHub-backed coordination protocol and CLI for running multiple ChatGPT engineering sessions as a recoverable software team.
+Fugue is a GitHub-backed coordination protocol and CLI for running multiple engineering agent sessions as a recoverable software team.
 
 The core idea is simple:
 
-> ChatGPT sessions are disposable. Durable engineering state lives in GitHub and protected repository policy.
+> Agent sessions are disposable. Durable engineering state lives in GitHub and protected repository policy.
 
-A fresh Coordinator, Worker, QA, or Integration chat should be able to reconstruct what it needs from the repository and GitHub instead of depending on another chat's hidden memory.
+A fresh Coordinator, Worker, QA, or Integration execution should be able to reconstruct what it needs from the repository and GitHub instead of depending on another session's hidden memory.
 
 ## Roles
 
@@ -54,7 +54,7 @@ Candidate control-plane changes are proposed future policy; they do not weaken t
 
 ## Normal workflow
 
-`fugue run` is the foreground orchestrator. Start it in a governed repository and leave it running while Workers and QA sessions operate. It polls GitHub, performs deterministic transitions automatically, suppresses duplicate prompts, promotes reviewed draft PRs, runs Integration, and reports merge readiness.
+`fugue run` is the foreground orchestrator. Start it in a governed repository and leave it running while work advances. It polls GitHub, performs deterministic transitions automatically, promotes reviewed draft PRs, runs Integration, and reports merge readiness.
 
 ```bash
 fugue status
@@ -71,17 +71,62 @@ Typical progression:
 ```text
 ready work
   -> allocate Worker
-  -> wait for Worker PR
-  -> create missing QA sessions
-  -> wait for QA
+  -> execute Worker
+  -> create/link draft PR
+  -> start required QA
+  -> execute QA
   -> mark reviewed draft PR ready
   -> run Integration
   -> ready for human merge
 ```
 
-If QA requests changes, the planner routes work back to the existing Worker identity. Control-plane acknowledgement, state drift, QA errors, and failed Integration remain explicit intervention boundaries.
+If QA requests changes, the planner routes work back to the existing Worker identity. Control-plane acknowledgement, state drift, QA errors, Visual QA, and failed Integration remain explicit intervention boundaries where required.
 
-The current executor is `manual-chat`: Fugue emits one compact prompt for a fresh ChatGPT Worker or QA session to reconstruct everything else from GitHub, then the same `fugue run` process keeps watching for its durable result. Future Codex/API executors can remove the manual tab-creation boundary without changing workflow planning semantics.
+## Executors
+
+Fugue separates workflow planning from the runtime used to execute engineering roles.
+
+### Manual ChatGPT sessions
+
+The default remains `manual-chat`:
+
+```bash
+fugue run --executor manual-chat
+```
+
+Fugue emits compact reconstruction prompts for fresh Worker or QA chats and keeps watching GitHub for durable results.
+
+### Codex CLI
+
+For substantially less human orchestration, use the Codex CLI executor:
+
+```bash
+npm install -g @openai/codex
+codex --login
+
+fugue run --executor codex
+```
+
+Optional model override:
+
+```bash
+fugue run --executor codex --model <model>
+```
+
+The Codex executor currently launches:
+
+```text
+Worker       autonomous
+Code QA      autonomous
+Security QA  autonomous
+Visual QA    manual/runtime boundary
+Integration  Fugue-owned
+Final merge  Human-owned
+```
+
+Fugue does not give Codex GitHub publication authority. Worker agents run in isolated temporary worktrees with workspace-write access; Fugue verifies changed paths against issue ownership, runs protected-base validation, commits, pushes the assigned branch, and creates the draft PR itself. Code/Security QA run as fresh processes on clean exact-head worktrees with structured output; Fugue records the resulting identity-bound attestation.
+
+Visual QA remains manual until a runtime/browser executor can prove exact-head rendering evidence rather than reducing visual review to source inspection.
 
 For one-shot coordination, use the same planner through:
 
@@ -153,7 +198,7 @@ Clone a Fugue-governed repository and let the planner handle subsequent determin
 git clone https://github.com/JohnnyZLi/Path.git
 cd Path
 fugue status
-fugue run
+fugue run --executor codex
 ```
 
 Read-only repository discovery can also use:
@@ -162,29 +207,13 @@ Read-only repository discovery can also use:
 FUGUE_REPOSITORY=JohnnyZLi/Path fugue status
 ```
 
-Integration deliberately requires a local Git checkout because trusted validation runs in a temporary clean worktree at the exact PR head SHA.
+Integration and launchable local executors deliberately require a local Git checkout because trusted validation and agent execution use temporary worktrees at specific repository identities.
 
-## Replacement chats
+## Replacement sessions
 
-If a Worker chat hits its context limit, do **not** create another Worker claim. `fugue run` continues to identify the existing Worker as the execution target, and the low-level recovery form remains:
+A Worker execution does **not** create another Worker claim when the same work identity already exists. QA handoffs are idempotent for the same role and exact evaluation identity. Older orphaned sessions are superseded chronologically when a newer session is completed.
 
-```bash
-fugue handoff worker --issue 123 --resume
-```
-
-That reconstructs the existing:
-
-```text
-work ID
-Worker ID
-branch
-issue specification
-base policy identity
-```
-
-QA handoffs are idempotent for the same role and exact evaluation identity. Re-running the same handoff reuses the current pending session instead of creating another ambiguous active session. Older orphaned sessions are superseded chronologically when a newer session is completed.
-
-A Coordinator process or chat can be replaced and reconstruct state again. Integration that dies mid-run is restarted from a fresh snapshot rather than trusting partial terminal output.
+A Coordinator process can be replaced and reconstruct state again. Integration that dies mid-run is restarted from a fresh snapshot rather than trusting partial terminal output.
 
 ## Review identity
 

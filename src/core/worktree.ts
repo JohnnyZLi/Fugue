@@ -10,17 +10,42 @@ export async function withCleanWorktree<T>(
   const root = await repositoryRoot();
   await git(["fetch", "--no-tags", "origin", headSha], root);
 
-  const directory = await mkdtemp(join(tmpdir(), "fugue-integration-"));
+  return withTemporaryWorktree(root, headSha, "fugue-integration-", operation, true);
+}
+
+export async function withBranchWorktree<T>(
+  branch: string,
+  operation: (worktree: string) => Promise<T>,
+): Promise<T> {
+  const root = await repositoryRoot();
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  await git(["fetch", "--no-tags", "origin", `refs/heads/${branch}:${remoteRef}`], root);
+
+  return withTemporaryWorktree(root, remoteRef, "fugue-worker-", operation, false);
+}
+
+async function withTemporaryWorktree<T>(
+  root: string,
+  ref: string,
+  prefix: string,
+  operation: (worktree: string) => Promise<T>,
+  requireExactRef: boolean,
+): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
   let added = false;
   try {
-    await git(["worktree", "add", "--detach", "--force", directory, headSha], root);
+    await git(["worktree", "add", "--detach", "--force", directory, ref], root);
     added = true;
-    const checkedOut = await git(["rev-parse", "HEAD"], directory);
-    if (checkedOut !== headSha) {
-      throw new Error(`Clean worktree resolved ${checkedOut}, expected ${headSha}.`);
+
+    if (requireExactRef) {
+      const checkedOut = await git(["rev-parse", "HEAD"], directory);
+      if (checkedOut !== ref) {
+        throw new Error(`Clean worktree resolved ${checkedOut}, expected ${ref}.`);
+      }
     }
+
     const dirty = await git(["status", "--porcelain"], directory);
-    if (dirty) throw new Error("Integration worktree is unexpectedly dirty before validation.");
+    if (dirty) throw new Error("Temporary Fugue worktree is unexpectedly dirty before execution.");
     return await operation(directory);
   } finally {
     if (added) {
