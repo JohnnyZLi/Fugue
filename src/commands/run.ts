@@ -45,18 +45,25 @@ export async function runOrchestrator(options: RunOptions): Promise<void> {
       }
 
       for (const work of works) {
-        const observation = await observeWork(github, work);
-        const action = planWork(observation);
-        const result = await runAction({
-          repository: repository.fullName,
-          github,
-          work,
-          observation,
-          action,
-          executor,
-          memory,
-        });
-        immediate = immediate || result.immediate;
+        try {
+          const observation = await observeWork(github, work);
+          const action = planWork(observation);
+          const result = await runAction({
+            repository: repository.fullName,
+            github,
+            work,
+            observation,
+            action,
+            executor,
+            memory,
+          });
+          immediate = immediate || result.immediate;
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          emitOnce(memory, work.issueNumber, `work-error:${work.workSpecDigest}:${work.pr?.headSha ?? "no-pr"}:${detail}`, () => {
+            console.error(`WORK #${work.issueNumber} ERROR — ${detail}`);
+          });
+        }
       }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
