@@ -18,8 +18,8 @@ export async function withBranchWorktree<T>(
   operation: (worktree: string) => Promise<T>,
 ): Promise<T> {
   const root = await repositoryRoot();
-  await git(["fetch", "--no-tags", "origin", branch], root);
-  const remoteRef = `origin/${branch}`;
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  await git(["fetch", "--no-tags", "origin", `refs/heads/${branch}:${remoteRef}`], root);
 
   return withTemporaryWorktree(root, remoteRef, "fugue-worker-", operation, false);
 }
