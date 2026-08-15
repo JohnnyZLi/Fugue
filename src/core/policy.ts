@@ -15,12 +15,18 @@ const versionSchema = z.object({
   fugue_max_compatible_version: z.string().min(1),
 });
 
+export type FugueVersionFile = z.infer<typeof versionSchema>;
+
 export interface ActivePolicy {
   identity: PolicyIdentity;
   config: FugueConfig;
   configRaw: string;
   agentsRaw: string;
   versionRaw: string;
+}
+
+export function parseVersionFile(raw: string): FugueVersionFile {
+  return versionSchema.parse(parseYaml(raw));
 }
 
 export async function resolveActivePolicy(github: FugueGitHub): Promise<ActivePolicy> {
@@ -33,7 +39,7 @@ export async function resolveActivePolicy(github: FugueGitHub): Promise<ActivePo
   const configRaw = await readRepositoryFile(github, ".fugue/config.yml", baseSha);
   const config = parseConfig(configRaw);
   const versionRaw = await readRepositoryFile(github, ".fugue/VERSION", baseSha);
-  const version = versionSchema.parse(parseYaml(versionRaw));
+  const version = parseVersionFile(versionRaw);
   assertSupportedProtocol(version.protocol);
   assertCompatibleCliVersion(version.fugue_min_version, version.fugue_max_compatible_version);
 
