@@ -1,3 +1,5 @@
+import { beginReview } from "../core/reviews.js";
+import type { QaRole } from "../core/attestations.js";
 import { createWorkId, parseWorkMetadata, upsertWorkMetadata, workMetadataSchema, workSpecDigest } from "../core/metadata.js";
 import { discoverRepository } from "../core/git.js";
 import { requireWritableGitHub } from "../core/github.js";
@@ -11,9 +13,53 @@ export interface HandoffOptions {
 }
 
 export async function runHandoff(role: string, options: HandoffOptions): Promise<void> {
-  if (role !== "worker") {
-    throw new Error(`Role ${role} is not implemented yet; Worker handoff is the first vertical slice.`);
+  if (role === "worker") {
+    await runWorkerHandoff(options);
+    return;
   }
+
+  const qaRole = qaRoleFromHandoff(role);
+  if (qaRole) {
+    await runQaHandoff(qaRole, options);
+    return;
+  }
+
+  throw new Error(`Role ${role} is not implemented yet.`);
+}
+
+async function runQaHandoff(role: QaRole, options: HandoffOptions): Promise<void> {
+  if (!options.pr) throw new Error(`${role}-qa handoff requires --pr <number>.`);
+  const prNumber = parsePositiveInteger(options.pr, "PR");
+  const repository = await discoverRepository();
+  const github = await requireWritableGitHub(repository);
+  const { snapshot, session } = await beginReview(github, prNumber, role);
+  const requirement = snapshot.qa.required.find((entry) => entry.role === role);
+
+  console.log(`${roleHeading(role)} HANDOFF`);
+  console.log("");
+  console.log(`Repository   ${repository.fullName}`);
+  console.log(`PR           #${prNumber} — ${snapshot.pr.title}`);
+  console.log(`Session      ${session.session_id}`);
+  console.log(`Head         ${snapshot.identity.headSha}`);
+  console.log(`Base         ${snapshot.identity.baseBranch} @ ${snapshot.identity.baseSha.slice(0, 8)}`);
+  console.log(`Policy       ${snapshot.identity.policyDigest.slice(0, 19)}`);
+  console.log(`Work spec    ${snapshot.identity.workSpecDigest.slice(0, 19)}`);
+  console.log("");
+  console.log("WHY REQUIRED");
+  for (const reason of requirement?.reasons ?? []) console.log(`- ${reason}`);
+  console.log("");
+  console.log("READ");
+  console.log(`- protected-base ${snapshot.policy.config.repository.agents_file}`);
+  console.log("- protected-base .fugue/config.yml");
+  console.log(`- Issue #${snapshot.identity.issueNumber}`);
+  console.log(`- PR #${prNumber} and exact head ${snapshot.identity.headSha}`);
+  console.log("- relevant tests/runtime evidence");
+  console.log("");
+  console.log("FINISH");
+  console.log(`Record the verdict with fugue review ${prNumber} --role ${role} ...`);
+}
+
+async function runWorkerHandoff(options: HandoffOptions): Promise<void> {
   if (!options.issue) throw new Error("Worker handoff requires --issue <number>.");
 
   const issueNumber = parsePositiveInteger(options.issue, "issue");
@@ -148,6 +194,19 @@ function printWorkerHandoff(input: {
   console.log("- Do not merge or self-approve.");
   console.log("- Record durable findings in GitHub.");
   console.log("- Candidate policy changes do not change the current rules.");
+}
+
+function qaRoleFromHandoff(role: string): QaRole | null {
+  if (role === "code-qa") return "code";
+  if (role === "security-qa") return "security";
+  if (role === "visual-qa") return "visual";
+  return null;
+}
+
+function roleHeading(role: QaRole): string {
+  if (role === "code") return "CODE QA";
+  if (role === "security") return "SECURITY QA";
+  return "VISUAL / UX QA";
 }
 
 function labelName(label: string | { name?: string | null }): string {
