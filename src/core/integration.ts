@@ -212,22 +212,23 @@ export async function publishIntegrationFailure(
 export async function integrate(github: FugueGitHub, prNumber: number): Promise<IntegrationResult> {
   let prepared: PreparedIntegration | null = null;
   try {
-    prepared = await prepareIntegration(github, prNumber);
-    const rawValidation = await withCleanWorktree(prepared.plan.identity.headSha, (worktree) =>
+    const current = await prepareIntegration(github, prNumber);
+    prepared = current;
+    const rawValidation = await withCleanWorktree(current.plan.identity.headSha, (worktree) =>
       runValidation(
         worktree,
-        prepared.plan.validation.install,
-        prepared.plan.validation.checks,
+        current.plan.validation.install,
+        current.plan.validation.checks,
       ),
     );
     const validation = integrationValidationSchema.parse({
       version: 1,
-      identity: prepared.plan.identity,
+      identity: current.plan.identity,
       passed: true,
       commands: rawValidation.commands,
       created_at: new Date().toISOString(),
     });
-    return await finalizeIntegration(github, prepared.plan, validation);
+    return await finalizeIntegration(github, current.plan, validation);
   } catch (error) {
     if (prepared) await publishIntegrationFailure(github, prepared.plan.identity, error);
     throw error;
