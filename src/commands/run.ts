@@ -1,4 +1,6 @@
 import type { QaRole } from "../core/attestations.js";
+import { CodexCliExecutor } from "../core/codex-executor.js";
+import { captureEvaluation } from "../core/evaluation.js";
 import { ManualChatExecutor, type ExecutionRole, type ExecutorInstruction } from "../core/executor.js";
 import { requireWritableGitHub, type FugueGitHub } from "../core/github.js";
 import { discoverRepository } from "../core/git.js";
@@ -7,10 +9,14 @@ import { actionLabel, observeWork, planWork, type WorkflowAction, type WorkflowO
 import { runHandoff } from "./handoff.js";
 import { runIntegrate } from "./integrate.js";
 
+export type ExecutorMode = "manual-chat" | "codex";
+
 export interface RunOptions {
   issue?: string;
   pr?: string;
   interval?: string;
+  executor?: string;
+  model?: string;
 }
 
 interface RunMemory {
@@ -25,10 +31,13 @@ export async function runOrchestrator(options: RunOptions): Promise<void> {
   const github = await requireWritableGitHub(repository);
   const intervalSeconds = parseInterval(options.interval);
   const memory: RunMemory = { notifications: new Map() };
-  const executor = new ManualChatExecutor();
+  const manual = new ManualChatExecutor();
+  const executorMode = parseExecutorMode(options.executor);
+  const codex = executorMode === "codex" ? new CodexCliExecutor(options.model ? { model: options.model } : {}) : null;
+  if (codex) await codex.assertAvailable();
 
   console.log(`FUGUE RUN — ${repository.fullName}`);
-  console.log(`Polling every ${intervalSeconds}s. Durable state remains in GitHub; Ctrl-C is safe.`);
+  console.log(`Executor ${executorMode}. Polling every ${intervalSeconds}s. Durable state remains in GitHub; Ctrl-C is safe.`);
   console.log("");
 
   while (true) {
@@ -54,7 +63,9 @@ export async function runOrchestrator(options: RunOptions): Promise<void> {
             work,
             observation,
             action,
-            executor,
+            manual,
+            codex,
+            executorMode,
             memory,
           });
           immediate = immediate || result.immediate;
@@ -80,16 +91,20 @@ async function runAction(input: {
   work: WorkState;
   observation: WorkflowObservation;
   action: WorkflowAction;
-  executor: ManualChatExecutor;
+  manual: ManualChatExecutor;
+  codex: CodexCliExecutor | null;
+  executorMode: ExecutorMode;
   memory: RunMemory;
 }): Promise<{ immediate: boolean }> {
-  const { repository, github, work, observation, action, executor, memory } = input;
+  const { repository, github, work, observation, action, manual, codex, executorMode, memory } = input;
   const notification = notificationFingerprint(work, observation, action);
 
   switch (action.kind) {
     case "allocate_worker": {
       await runHandoff("worker", { issue: String(work.issueNumber) });
-      const instruction = executor.instruction({
+      if (codex) return { immediate: true };
+
+      const instruction = manual.instruction({
         repository,
         role: "worker",
         issueNumber: work.issueNumber,
@@ -99,28 +114,23 @@ async function runAction(input: {
       return { immediate: true };
     }
 
-    case "wait_worker": {
-      const instruction = executor.instruction({
-        repository,
-        role: "worker",
-        issueNumber: work.issueNumber,
-        workId: work.metadata.work_id,
-      });
-      emitOnce(memory, work.issueNumber, workerExecutionFingerprint(work), () => {
-        printState(work, action);
-        printInstruction(instruction);
-      });
-      return { immediate: false };
-    }
-
+    case "wait_worker":
     case "resume_worker": {
-      const instruction = executor.instruction({
+      if (codex) {
+        printState(work, action);
+        const result = await codex.executeWorker(github, work);
+        console.log(`CODEX WORKER COMPLETE — PR #${result.prNumber} @ ${result.headSha.slice(0, 8)}`);
+        memory.notifications.delete(work.issueNumber);
+        return { immediate: true };
+      }
+
+      const instruction = manual.instruction({
         repository,
         role: "worker",
         issueNumber: work.issueNumber,
         workId: work.metadata.work_id,
       });
-      emitOnce(memory, work.issueNumber, notification, () => {
+      emitOnce(memory, work.issueNumber, action.kind === "wait_worker" ? workerExecutionFingerprint(work) : notification, () => {
         printState(work, action);
         printInstruction(instruction);
       });
@@ -130,35 +140,64 @@ async function runAction(input: {
     case "start_qa": {
       const prNumber = requirePr(work);
       const instructions: ExecutorInstruction[] = [];
+      let launchedCodex = false;
+
       for (const role of action.roles) {
         await runHandoff(`${role}-qa`, { pr: String(prNumber) });
-        instructions.push(executor.instruction({
-          repository,
-          role: executionRole(role),
-          prNumber,
-          workId: work.metadata.work_id,
-        }));
+        const executionRoleValue = executionRole(role);
+        if (codex?.supports(executionRoleValue)) {
+          const snapshot = await captureEvaluation(github, prNumber);
+          await codex.executeQa(github, snapshot, role as Exclude<QaRole, "visual">);
+          console.log(`CODEX ${role.toUpperCase()} QA COMPLETE — PR #${prNumber}`);
+          launchedCodex = true;
+        } else {
+          instructions.push(manual.instruction({
+            repository,
+            role: executionRoleValue,
+            prNumber,
+            workId: work.metadata.work_id,
+          }));
+        }
       }
-      emitOnce(memory, work.issueNumber, qaExecutionFingerprint(work, action.roles), () => {
-        printState(work, action);
-        for (const instruction of instructions) printInstruction(instruction);
-      });
-      return { immediate: true };
+
+      if (instructions.length) {
+        emitOnce(memory, work.issueNumber, qaExecutionFingerprint(work, action.roles), () => {
+          printState(work, action);
+          for (const instruction of instructions) printInstruction(instruction);
+        });
+      }
+      return { immediate: launchedCodex || !instructions.length };
     }
 
     case "wait_qa": {
       const prNumber = requirePr(work);
-      const instructions = action.roles.map((role) => executor.instruction({
-        repository,
-        role: executionRole(role),
-        prNumber,
-        workId: work.metadata.work_id,
-      }));
-      emitOnce(memory, work.issueNumber, qaExecutionFingerprint(work, action.roles), () => {
-        printState(work, action);
-        for (const instruction of instructions) printInstruction(instruction);
-      });
-      return { immediate: false };
+      const instructions: ExecutorInstruction[] = [];
+      let launchedCodex = false;
+
+      for (const role of action.roles) {
+        const executionRoleValue = executionRole(role);
+        if (codex?.supports(executionRoleValue)) {
+          const snapshot = await captureEvaluation(github, prNumber);
+          await codex.executeQa(github, snapshot, role as Exclude<QaRole, "visual">);
+          console.log(`CODEX ${role.toUpperCase()} QA COMPLETE — PR #${prNumber}`);
+          launchedCodex = true;
+        } else {
+          instructions.push(manual.instruction({
+            repository,
+            role: executionRoleValue,
+            prNumber,
+            workId: work.metadata.work_id,
+          }));
+        }
+      }
+
+      if (instructions.length) {
+        emitOnce(memory, work.issueNumber, qaExecutionFingerprint(work, action.roles), () => {
+          printState(work, action);
+          for (const instruction of instructions) printInstruction(instruction);
+        });
+      }
+      return { immediate: launchedCodex };
     }
 
     case "mark_pr_ready": {
@@ -285,6 +324,12 @@ function selectWorks(works: WorkState[], options: RunOptions): WorkState[] {
     return works.filter((work) => work.pr?.number === pr);
   }
   return works;
+}
+
+export function parseExecutorMode(value?: string): ExecutorMode {
+  const normalized = value ?? "manual-chat";
+  if (normalized === "manual-chat" || normalized === "codex") return normalized;
+  throw new Error(`Unknown executor ${normalized}; expected manual-chat or codex.`);
 }
 
 function parseInterval(value?: string): number {
