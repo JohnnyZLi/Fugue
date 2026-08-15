@@ -54,15 +54,17 @@ Candidate control-plane changes are proposed future policy; they do not weaken t
 
 ## Normal workflow
 
-`fugue advance` is the high-level one-shot orchestrator. It reconstructs current GitHub state, derives the next valid action, performs deterministic transitions, and stops only when an external agent or Human decision is required.
+`fugue run` is the foreground orchestrator. Start it in a governed repository and leave it running while Workers and QA sessions operate. It polls GitHub, performs deterministic transitions automatically, suppresses duplicate prompts, promotes reviewed draft PRs, runs Integration, and reports merge readiness.
 
 ```bash
 fugue status
-fugue advance
-fugue advance --issue 123
-fugue advance --pr 456
-fugue advance --issue 123 --dry-run
+fugue run
+fugue run --issue 123
+fugue run --pr 456
+fugue run --issue 123 --interval 10
 ```
+
+`Ctrl-C` is safe. The process keeps no durable workflow database; restarting it reconstructs state from GitHub.
 
 Typical progression:
 
@@ -72,13 +74,23 @@ ready work
   -> wait for Worker PR
   -> create missing QA sessions
   -> wait for QA
+  -> mark reviewed draft PR ready
   -> run Integration
   -> ready for human merge
 ```
 
 If QA requests changes, the planner routes work back to the existing Worker identity. Control-plane acknowledgement, state drift, QA errors, and failed Integration remain explicit intervention boundaries.
 
-The current executor is `manual-chat`: Fugue emits a compact prompt for a fresh ChatGPT Worker or QA session to reconstruct everything else from GitHub. Future Codex/API executors can replace that without changing workflow planning semantics.
+The current executor is `manual-chat`: Fugue emits one compact prompt for a fresh ChatGPT Worker or QA session to reconstruct everything else from GitHub, then the same `fugue run` process keeps watching for its durable result. Future Codex/API executors can remove the manual tab-creation boundary without changing workflow planning semantics.
+
+For one-shot coordination, use the same planner through:
+
+```bash
+fugue advance
+fugue advance --issue 123
+fugue advance --pr 456
+fugue advance --issue 123 --dry-run
+```
 
 ## Low-level recovery commands
 
@@ -135,13 +147,13 @@ gh auth login
 
 ## Using Fugue on a repository
 
-Clone a Fugue-governed repository and let the planner reconstruct what comes next:
+Clone a Fugue-governed repository and let the planner handle subsequent deterministic transitions:
 
 ```bash
 git clone https://github.com/JohnnyZLi/Path.git
 cd Path
 fugue status
-fugue advance
+fugue run
 ```
 
 Read-only repository discovery can also use:
@@ -154,7 +166,7 @@ Integration deliberately requires a local Git checkout because trusted validatio
 
 ## Replacement chats
 
-If a Worker chat hits its context limit, do **not** create another Worker claim. `fugue advance` will continue to identify the existing Worker as the execution target, and the low-level recovery form remains:
+If a Worker chat hits its context limit, do **not** create another Worker claim. `fugue run` continues to identify the existing Worker as the execution target, and the low-level recovery form remains:
 
 ```bash
 fugue handoff worker --issue 123 --resume
@@ -170,9 +182,9 @@ issue specification
 base policy identity
 ```
 
-QA handoffs are idempotent for the same role and exact evaluation identity. Re-running the same handoff reuses the current pending session instead of creating another ambiguous active session. A completed current verdict also prevents an unnecessary same-identity handoff.
+QA handoffs are idempotent for the same role and exact evaluation identity. Re-running the same handoff reuses the current pending session instead of creating another ambiguous active session. Older orphaned sessions are superseded chronologically when a newer session is completed.
 
-A Coordinator chat can simply be replaced and reconstruct state again. Integration that dies mid-run is restarted from a fresh snapshot rather than trusting partial terminal output.
+A Coordinator process or chat can be replaced and reconstruct state again. Integration that dies mid-run is restarted from a fresh snapshot rather than trusting partial terminal output.
 
 ## Review identity
 
