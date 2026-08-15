@@ -4,7 +4,7 @@ import { z } from "zod";
 
 const qaRoleSchema = z.enum(["code", "security", "visual"]);
 
-const identitySchema = z.object({
+export const evaluationIdentitySchema = z.object({
   prNumber: z.number().int().positive(),
   headSha: z.string().min(7),
   baseBranch: z.string().min(1),
@@ -21,7 +21,7 @@ export const reviewStartSchema = z.object({
   kind: z.literal("review_start"),
   session_id: z.string().min(1),
   role: qaRoleSchema,
-  identity: identitySchema,
+  identity: evaluationIdentitySchema,
   fugue_version: z.string().min(1),
   created_at: z.string().min(1),
 });
@@ -32,7 +32,7 @@ export const qaAttestationSchema = z.object({
   attestation_id: z.string().min(1),
   session_id: z.string().min(1),
   role: qaRoleSchema,
-  identity: identitySchema,
+  identity: evaluationIdentitySchema,
   fugue_version: z.string().min(1),
   verdict: z.enum(["approved", "changes_requested", "error"]),
   agents_md: z.object({
@@ -54,9 +54,66 @@ export const qaAttestationSchema = z.object({
   created_at: z.string().min(1),
 });
 
+export const humanControlPlaneAttestationSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("human_control_plane"),
+  attestation_id: z.string().min(1),
+  identity: evaluationIdentitySchema,
+  fugue_version: z.string().min(1),
+  actor: z.string().min(1),
+  verdict: z.literal("acknowledged"),
+  created_at: z.string().min(1),
+});
+
+const qaGateSchema = z.enum(["passed", "not_required"]);
+
+export const integrationAttestationSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("integration"),
+  attestation_id: z.string().min(1),
+  identity: evaluationIdentitySchema,
+  fugue_version: z.string().min(1),
+  qa: z.object({
+    code: qaGateSchema,
+    security: qaGateSchema,
+    visual: qaGateSchema,
+  }),
+  dependencies: z.object({ passed: z.boolean() }),
+  agents_md: z.object({
+    impact_reviewed: z.boolean(),
+    update_required: z.boolean(),
+    update_present: z.boolean(),
+  }),
+  control_plane: z.object({
+    changed: z.boolean(),
+    human_acknowledgement: z.enum(["passed", "not_required"]),
+  }),
+  validation_control: z.object({
+    changed: z.boolean(),
+    reviewed: z.boolean(),
+    acceptable: z.boolean(),
+  }),
+  validation: z.object({
+    clean_worktree: z.boolean(),
+    passed: z.boolean(),
+    commands: z.array(z.string()),
+  }),
+  ci: z.object({
+    passed: z.boolean(),
+    checks: z.array(z.string()),
+  }),
+  base_current: z.object({ passed: z.boolean() }),
+  conflicts: z.object({ none: z.boolean() }),
+  verdict: z.literal("approved"),
+  created_at: z.string().min(1),
+});
+
 export type ReviewStart = z.infer<typeof reviewStartSchema>;
 export type QaAttestation = z.infer<typeof qaAttestationSchema>;
+export type HumanControlPlaneAttestation = z.infer<typeof humanControlPlaneAttestationSchema>;
+export type IntegrationAttestation = z.infer<typeof integrationAttestationSchema>;
 export type QaRole = z.infer<typeof qaRoleSchema>;
+export type FugueAttestation = ReviewStart | QaAttestation | HumanControlPlaneAttestation | IntegrationAttestation;
 
 const START = "<!-- fugue-attestation";
 const END = "-->";
@@ -65,15 +122,15 @@ export function createReviewSessionId(role: QaRole): string {
   return `rev-${role}-${randomBytes(4).toString("hex")}`;
 }
 
-export function createAttestationId(role: QaRole): string {
-  return `att-${role}-${randomBytes(4).toString("hex")}`;
+export function createAttestationId(kind: string): string {
+  return `att-${kind}-${randomBytes(4).toString("hex")}`;
 }
 
-export function serializeAttestation(value: ReviewStart | QaAttestation): string {
+export function serializeAttestation(value: FugueAttestation): string {
   return `${START}\n${stringifyYaml(value).trim()}\n${END}`;
 }
 
-export function parseAttestation(body: string): ReviewStart | QaAttestation | null {
+export function parseAttestation(body: string): FugueAttestation | null {
   const start = body.indexOf(START);
   if (start < 0) return null;
   const end = body.indexOf(END, start + START.length);
@@ -83,5 +140,7 @@ export function parseAttestation(body: string): ReviewStart | QaAttestation | nu
   const kind = z.object({ kind: z.string() }).parse(raw).kind;
   if (kind === "review_start") return reviewStartSchema.parse(raw);
   if (kind === "qa") return qaAttestationSchema.parse(raw);
+  if (kind === "human_control_plane") return humanControlPlaneAttestationSchema.parse(raw);
+  if (kind === "integration") return integrationAttestationSchema.parse(raw);
   return null;
 }
