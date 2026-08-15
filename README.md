@@ -124,7 +124,8 @@ Fugue Code QA for OWNER/REPO PR #456.
 Reconstruct the current pending Fugue review session from GitHub,
 review the exact committed evaluation identity independently,
 and submit the verdict as a fugue-review-submit PR comment for that session.
-Do not implement fixes. Do not ask the Human to run fugue review or relay the verdict.
+Do not implement fixes. Submit the result directly to GitHub; do not ask
+the Human to use a terminal or relay the verdict.
 ```
 
 The QA chat submits a request, for example:
@@ -150,7 +151,7 @@ viewports:
   - 390x844
 ```
 
-The submission does **not** carry canonical head/base/policy identity. Protected Fugue automation finds the current review session, reconstructs the exact evaluation identity, validates role-specific evidence, and writes the canonical attestation/status. Stale or conflicting submissions cannot approve a new head.
+The submission does **not** carry canonical head/base/policy identity. Protected Fugue automation finds the current review session, reconstructs the exact evaluation identity, validates role-specific evidence, verifies the submitting actor has repository write/maintain/admin permission, and writes the canonical attestation/status. Malformed, stale, unauthorized, or conflicting submissions are durably rejected rather than silently reused.
 
 ## Changes requested
 
@@ -158,17 +159,30 @@ A current QA `changes_requested` verdict moves the work back to **NEEDS WORKER C
 
 ## Human control-plane acknowledgement
 
-Control-plane changes remain an explicit Human boundary. The Leader asks for approval of the exact current PR head. After approval the Leader posts a request such as:
+Control-plane changes remain an explicit Human boundary. The Leader explains the material protected-policy/workflow change and asks the Human whether they acknowledge the **current exact evaluation identity**. The Human only answers the decision; they do not copy SHAs, digests, or protocol fields.
+
+After approval, the Leader re-fetches the current evaluation from GitHub and posts an identity-bound request such as:
 
 ```yaml
 <!-- fugue-human-submit
 version: 1
 kind: control_plane_ack
-pr: 456
+identity:
+  prNumber: 456
+  headSha: <current exact PR head>
+  baseBranch: main
+  baseSha: <current protected-base SHA>
+  policyDigest: <current protected policy digest>
+  protocolVersion: 1
+  issueNumber: 123
+  workId: work-123
+  workSpecDigest: <current work-spec digest>
 -->
 ```
 
-Protected Fugue code binds that request to the current exact evaluation identity and writes the canonical Human acknowledgement. No terminal command is required in normal operation.
+The request itself is not canonical acknowledgement evidence. Protected Fugue automation verifies the GitHub actor has repository write/maintain/admin permission and that every evaluation-identity field still matches the current PR. It then writes the canonical Human acknowledgement. A changed head, base, policy, protocol, issue/work identity, or work specification makes the old request stale rather than carrying approval forward.
+
+No terminal command is required in normal operation.
 
 ## GitHub-hosted Integration
 
@@ -180,22 +194,25 @@ The workflow separates authority:
 PREPARE (write-capable trusted Fugue)
     capture exact identity
     verify base / ownership / QA / dependencies / policy evidence
+    verify trusted workflow/runtime SHA matches current protected base
     publish integration pending
     write immutable validation plan
 
 VALIDATE (candidate checkout, read-only GitHub permission)
     checkout exact prepared head
     run protected-base install/check commands
+    blank GitHub publication tokens for candidate commands
     produce validation evidence
 
 FINALIZE (write-capable trusted Fugue)
+    verify validation evidence matches the protected command plan
     re-fetch exact identity
     re-check prerequisites / CI / mergeability
     reject drift
     publish canonical Integration attestation + fugue/integration
 ```
 
-The candidate is never used as the source of the workflow code that judges it, and validation does not receive Fugue publication authority.
+The candidate is never used as the source of the workflow code that judges it, and candidate validation does not receive Fugue publication authority.
 
 `fugue/integration` remains the composite hard merge gate.
 
