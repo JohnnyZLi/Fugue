@@ -40,6 +40,8 @@ export async function runOrchestrator(options: RunOptions): Promise<void> {
 
       if (!works.length) {
         emitOnce(memory, 0, "no-work", () => console.log("No matching open Fugue work items. Waiting for GitHub state to change."));
+      } else {
+        memory.notifications.delete(0);
       }
 
       for (const work of works) {
@@ -90,7 +92,20 @@ async function runAction(input: {
       return { immediate: true };
     }
 
-    case "wait_worker":
+    case "wait_worker": {
+      const instruction = executor.instruction({
+        repository,
+        role: "worker",
+        issueNumber: work.issueNumber,
+        workId: work.metadata.work_id,
+      });
+      emitOnce(memory, work.issueNumber, workerExecutionFingerprint(work), () => {
+        printState(work, action);
+        printInstruction(instruction);
+      });
+      return { immediate: false };
+    }
+
     case "resume_worker": {
       const instruction = executor.instruction({
         repository,
@@ -132,7 +147,7 @@ async function runAction(input: {
         prNumber,
         workId: work.metadata.work_id,
       }));
-      emitOnce(memory, work.issueNumber, notification, () => {
+      emitOnce(memory, work.issueNumber, qaExecutionFingerprint(work, action.roles), () => {
         printState(work, action);
         for (const instruction of instructions) printInstruction(instruction);
       });
@@ -200,11 +215,11 @@ export function notificationFingerprint(
   ].join("|");
 }
 
-function workerExecutionFingerprint(work: WorkState): string {
+export function workerExecutionFingerprint(work: WorkState): string {
   return ["worker", work.metadata.work_id, work.workSpecDigest, work.pr?.headSha ?? "no-pr"].join("|");
 }
 
-function qaExecutionFingerprint(work: WorkState, roles: QaRole[]): string {
+export function qaExecutionFingerprint(work: WorkState, roles: QaRole[]): string {
   return ["qa", work.metadata.work_id, work.pr?.headSha ?? "no-pr", [...roles].sort().join(",")].join("|");
 }
 
