@@ -4,6 +4,7 @@ import { Command } from "commander";
 import { runAcknowledge } from "./commands/acknowledge.js";
 import { runAdvance } from "./commands/advance.js";
 import { runHandoff } from "./commands/handoff.js";
+import { runInit } from "./commands/init.js";
 import { runIntegrate } from "./commands/integrate.js";
 import { runLinkPr } from "./commands/link-pr.js";
 import { runReview } from "./commands/review.js";
@@ -17,6 +18,12 @@ program
   .name("fugue")
   .description("GitHub-backed multi-session engineering orchestration for ChatGPT")
   .version(FUGUE_CLI_VERSION);
+
+program
+  .command("init")
+  .description("Provision Fugue protocol labels and protected-base GitHub enforcement")
+  .option("--no-protection", "Create protocol labels without changing branch protection")
+  .action(runInit);
 
 program
   .command("status")
