@@ -132,11 +132,30 @@ export async function reconstructState(github: FugueGitHub): Promise<RepositoryS
     })),
   );
 
-  const issueNumbers = new Set(works.map((work) => work.issueNumber));
+  const openManagedIssues = new Set(works.map((work) => work.issueNumber));
+  const dependencyCache = new Map<number, "open" | "closed" | "missing">();
+
   for (const work of works) {
     for (const dependency of work.metadata.spec.dependencies) {
-      if (!issueNumbers.has(dependency)) {
-        work.drift.push(`dependency #${dependency} is not an open Fugue work item; verify it exists and is satisfied`);
+      if (openManagedIssues.has(dependency)) continue;
+
+      let dependencyState = dependencyCache.get(dependency);
+      if (!dependencyState) {
+        try {
+          const response = await github.octokit.rest.issues.get({ owner, repo, issue_number: dependency });
+          dependencyState = response.data.state === "closed" ? "closed" : "open";
+        } catch (error) {
+          if (isNotFound(error)) dependencyState = "missing";
+          else throw error;
+        }
+        dependencyCache.set(dependency, dependencyState);
+      }
+
+      if (dependencyState === "open") {
+        work.drift.push(`dependency #${dependency} is open but is not a valid open Fugue work item`);
+      }
+      if (dependencyState === "missing") {
+        work.drift.push(`dependency #${dependency} does not exist`);
       }
     }
   }
@@ -152,6 +171,10 @@ export async function reconstructState(github: FugueGitHub): Promise<RepositoryS
 
 function labelName(label: string | { name?: string | null }): string {
   return typeof label === "string" ? label : label.name ?? "";
+}
+
+function isNotFound(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "status" in error && (error as { status?: number }).status === 404;
 }
 
 function message(error: unknown): string {
