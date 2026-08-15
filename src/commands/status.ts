@@ -1,8 +1,7 @@
-import { currentQaAttestations } from "../core/reviews.js";
-import { captureEvaluation } from "../core/evaluation.js";
 import { createGitHub } from "../core/github.js";
 import { discoverRepository } from "../core/git.js";
 import { reconstructState } from "../core/state.js";
+import { actionLabel, observeWork, planWork } from "../core/workflow.js";
 
 export async function runStatus(): Promise<void> {
   const repository = await discoverRepository();
@@ -31,24 +30,27 @@ export async function runStatus(): Promise<void> {
     console.log(`  Head         ${work.pr ? short(work.pr.headSha) : "—"}`);
     console.log(`  Dependencies ${work.metadata.spec.dependencies.length ? work.metadata.spec.dependencies.map((n) => `#${n}`).join(", ") : "none"}`);
 
-    if (work.pr) {
-      try {
-        const snapshot = await captureEvaluation(github, work.pr.number);
-        const attestations = await currentQaAttestations(github, snapshot);
-        for (const requirement of snapshot.qa.required) {
-          const attestation = attestations.get(requirement.role);
-          const value = !attestation
-            ? "waiting"
-            : attestation.verdict === "approved"
-              ? `approved @ ${short(snapshot.identity.headSha)}`
-              : attestation.verdict.replace("_", " ");
-          console.log(`  ${qaLabel(requirement.role).padEnd(12)} ${value}`);
+    try {
+      const observation = await observeWork(github, work);
+      for (const qa of observation.qa) {
+        const suffix = qa.state === "approved" && work.pr ? ` @ ${short(work.pr.headSha)}` : "";
+        console.log(`  ${qaLabel(qa.role).padEnd(12)} ${qa.state.replace("_", " ")}${suffix}`);
+        if (qa.supersededSessions) {
+          console.log(`  QA sessions  ${qa.supersededSessions} older active session(s) superseded by latest handoff`);
         }
-        if (snapshot.qa.controlPlaneChanged) console.log("  Control      control-plane review required");
-        if (snapshot.qa.validationControlChanged) console.log("  Validation   validation-control review required");
-      } catch (error) {
-        console.log(`  QA           unable to resolve: ${message(error)}`);
       }
+      if (work.pr) {
+        const integration = observation.integration === "success"
+          ? `passed @ ${short(work.pr.headSha)}`
+          : observation.integration;
+        console.log(`  Integration  ${integration}`);
+      }
+      if (observation.controlPlaneChanged && !observation.humanControlPlaneAcknowledged) {
+        console.log("  Control      human control-plane acknowledgement required");
+      }
+      console.log(`  Next         ${actionLabel(planWork(observation))}`);
+    } catch (error) {
+      console.log(`  Workflow     unable to resolve: ${message(error)}`);
     }
 
     if (work.drift.length) {
