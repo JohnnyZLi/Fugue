@@ -20,7 +20,7 @@ const execFileAsync = promisify(execFile);
 const codeQaResultSchema = z.object({
   verdict: z.enum(["approved", "changes_requested", "error"]),
   agents_update: z.enum(["not-required", "present", "missing"]),
-  validation_control: z.enum(["acceptable", "unacceptable"]).optional(),
+  validation_control: z.enum(["acceptable", "unacceptable"]),
   summary: z.string().min(1),
   findings: z.array(z.string()).default([]),
 });
@@ -154,7 +154,7 @@ export class CodexCliExecutor {
         await completeReview(github, snapshot.pr.number, "code", {
           verdict: code.verdict,
           agentsUpdate: code.agents_update,
-          ...(code.validation_control ? { validationControl: code.validation_control } : {}),
+          validationControl: code.validation_control,
           summary: formatQaSummary(code.summary, code.findings),
         });
       } else {
@@ -275,7 +275,7 @@ function qaPrompt(snapshot: EvaluationSnapshot, role: Exclude<QaRole, "visual">)
     `Required because: ${snapshot.qa.required.find((item) => item.role === role)?.reasons.join("; ") ?? "base policy"}.`,
     "Inspect the repository, diff, architecture contract, and relevant tests. Return only JSON conforming to the supplied schema.",
     role === "code"
-      ? "Set agents_update to not-required, present, or missing. Set validation_control when candidate validation machinery changed."
+      ? "Set agents_update to not-required, present, or missing. Set validation_control to acceptable unless changed validation machinery is unacceptable."
       : "Focus on security regressions, privilege/input boundaries, dependencies, CI/CD, and control-plane implications in scope.",
   ].join("\n\n");
 }
@@ -300,7 +300,7 @@ function codeQaJsonSchema(): Record<string, unknown> {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["verdict", "agents_update", "summary", "findings"],
+    required: ["verdict", "agents_update", "validation_control", "summary", "findings"],
     properties: {
       verdict: { enum: ["approved", "changes_requested", "error"] },
       agents_update: { enum: ["not-required", "present", "missing"] },
