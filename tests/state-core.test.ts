@@ -3,6 +3,7 @@ import { parseConfig } from "../src/core/config.js";
 import { findDependencyCycle } from "../src/core/dependencies.js";
 import { digestCanonical } from "../src/core/hash.js";
 import {
+  assertWorkMetadataForIssue,
   createWorkId,
   parseWorkMetadata,
   upsertWorkMetadata,
@@ -42,6 +43,12 @@ describe("work metadata", () => {
 
   it("creates stable work IDs from issue numbers", () => {
     expect(createWorkId(42)).toBe("work-42");
+  });
+
+  it("rejects work metadata attached to the wrong issue", () => {
+    const metadata = workMetadataSchema.parse({ version: 1, work_id: "work-12", spec: {}, execution: {} });
+    expect(() => assertWorkMetadataForIssue(metadata, 12)).not.toThrow();
+    expect(() => assertWorkMetadataForIssue(metadata, 13)).toThrow(/expected work-13/);
   });
 });
 
