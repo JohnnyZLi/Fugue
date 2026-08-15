@@ -109,7 +109,9 @@ async function applyAction(
 
     case "integrate":
       await dispatchIntegration(github, policy.identity.baseBranch, work);
-      return true;
+      // A workflow dispatch is an external asynchronous boundary. End this pass instead of
+      // immediately reconstructing and risking a second dispatch before the queued status lands.
+      return false;
 
     case "wait_worker":
     case "wait_ci":
@@ -123,7 +125,7 @@ async function applyAction(
   }
 }
 
-async function allocateWorker(github: FugueGitHub, policy: ActivePolicy, work: WorkState): Promise<void> {
+export async function allocateWorker(github: FugueGitHub, policy: ActivePolicy, work: WorkState): Promise<void> {
   const { owner, repo } = github.repository;
   const issue = await github.octokit.rest.issues.get({ owner, repo, issue_number: work.issueNumber });
   const labels = issue.data.labels.map(labelName);
@@ -142,12 +144,7 @@ async function allocateWorker(github: FugueGitHub, policy: ActivePolicy, work: W
     false,
   );
 
-  await github.octokit.rest.git.createRef({
-    owner,
-    repo,
-    ref: `refs/heads/${claim.branch}`,
-    sha: policy.identity.baseSha,
-  });
+  await ensureWorkerBranchAtBase(github, claim.branch, policy.identity.baseSha);
 
   const nextLabels = [
     ...labels.filter((label) => !label.startsWith("state:")),
@@ -160,6 +157,40 @@ async function allocateWorker(github: FugueGitHub, policy: ActivePolicy, work: W
     body: upsertWorkMetadata(body, claim.metadata),
     labels: [...new Set(nextLabels)],
   });
+}
+
+export async function ensureWorkerBranchAtBase(
+  github: FugueGitHub,
+  branch: string,
+  baseSha: string,
+): Promise<void> {
+  const { owner, repo } = github.repository;
+  let existing = await readBranchSha(github, branch);
+
+  if (!existing) {
+    try {
+      await github.octokit.rest.git.createRef({
+        owner,
+        repo,
+        ref: `refs/heads/${branch}`,
+        sha: baseSha,
+      });
+    } catch (error) {
+      // A concurrent/restarted allocation may have created the deterministic branch after
+      // our read. Only recover an already-existing ref; all other create failures are real.
+      if (httpStatus(error) !== 422) throw error;
+    }
+    existing = await readBranchSha(github, branch);
+  }
+
+  if (!existing) {
+    throw new Error(`Worker branch ${branch} was not present after allocation.`);
+  }
+  if (existing !== baseSha) {
+    throw new Error(
+      `Worker branch ${branch} already exists at ${existing.slice(0, 8)}, expected protected base ${baseSha.slice(0, 8)}.`,
+    );
+  }
 }
 
 export async function adoptAssignedPullRequests(github: FugueGitHub): Promise<number[]> {
@@ -245,7 +276,7 @@ async function updatePrBranch(github: FugueGitHub, work: WorkState): Promise<voi
   });
 }
 
-async function dispatchIntegration(
+export async function dispatchIntegration(
   github: FugueGitHub,
   baseBranch: string,
   work: WorkState,
@@ -255,32 +286,42 @@ async function dispatchIntegration(
   const headSha = work.pr?.headSha;
   if (!headSha) throw new Error(`Work #${work.issueNumber} has no PR head.`);
 
-  await github.octokit.rest.repos.createCommitStatus({
+  // Dispatch first. A crash before this call leaves no pending marker, so reconciliation can retry.
+  // A crash after it leaves a real Integration workflow that will publish its own in-progress status.
+  await github.octokit.rest.actions.createWorkflowDispatch({
     owner,
     repo,
-    sha: headSha,
-    state: "pending",
-    context: "fugue/integration",
-    description: "Fugue Integration queued",
+    workflow_id: "fugue-integration.yml",
+    ref: baseBranch,
+    inputs: { pr: String(prNumber) },
   });
 
   try {
-    await github.octokit.rest.actions.createWorkflowDispatch({
-      owner,
-      repo,
-      workflow_id: "fugue-integration.yml",
-      ref: baseBranch,
-      inputs: { pr: String(prNumber) },
-    });
-  } catch (error) {
     await github.octokit.rest.repos.createCommitStatus({
       owner,
       repo,
       sha: headSha,
-      state: "error",
+      state: "pending",
       context: "fugue/integration",
-      description: "Fugue Integration dispatch failed",
+      description: "Fugue Integration queued",
     });
+  } catch {
+    // The dispatch is authoritative. The trusted prepare job publishes "in progress" shortly;
+    // failing this convenience marker must not convert a successful dispatch into a retry loop.
+  }
+}
+
+async function readBranchSha(github: FugueGitHub, branch: string): Promise<string | null> {
+  const { owner, repo } = github.repository;
+  try {
+    const ref = await github.octokit.rest.git.getRef({
+      owner,
+      repo,
+      ref: `heads/${branch}`,
+    });
+    return ref.data.object.sha;
+  } catch (error) {
+    if (httpStatus(error) === 404) return null;
     throw error;
   }
 }
@@ -298,6 +339,12 @@ function requirePr(work: WorkState): number {
 
 function labelName(label: string | { name?: string | null }): string {
   return typeof label === "string" ? label : label.name ?? "";
+}
+
+function httpStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object" || !("status" in error)) return undefined;
+  const status = (error as { status?: unknown }).status;
+  return typeof status === "number" ? status : undefined;
 }
 
 function message(error: unknown): string {
