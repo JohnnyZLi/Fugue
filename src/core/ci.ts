@@ -9,7 +9,6 @@ export interface CiVerification {
 export type RequiredCiState = "success" | "pending" | "failure" | "error" | "missing";
 
 export const DEFAULT_REQUIRED_CI_WORKFLOW = ".github/workflows/ci.yml";
-export const REQUIRED_CI_RUN_PREFIX = "Fugue CI ";
 
 interface RequiredCiObservation {
   state: RequiredCiState;
@@ -19,11 +18,18 @@ interface RequiredCiObservation {
 export async function currentRequiredCiState(
   github: FugueGitHub,
   headSha: string,
+  baseSha: string,
   requiredNames: readonly string[],
   workflowId = DEFAULT_REQUIRED_CI_WORKFLOW,
 ): Promise<RequiredCiState> {
   if (!requiredNames.length) return "success";
-  const observations = await observeTrustedRequiredCi(github, headSha, requiredNames, workflowId);
+  const observations = await observeTrustedRequiredCi(
+    github,
+    headSha,
+    baseSha,
+    requiredNames,
+    workflowId,
+  );
   const states = [...observations.values()].map((item) => item.state);
   if (states.includes("error")) return "error";
   if (states.includes("failure")) return "failure";
@@ -35,11 +41,18 @@ export async function currentRequiredCiState(
 export async function verifyRequiredCi(
   github: FugueGitHub,
   headSha: string,
+  baseSha: string,
   requiredNames: readonly string[],
   workflowId = DEFAULT_REQUIRED_CI_WORKFLOW,
 ): Promise<CiVerification> {
   if (!requiredNames.length) return { passed: true, checks: [] };
-  const observations = await observeTrustedRequiredCi(github, headSha, requiredNames, workflowId);
+  const observations = await observeTrustedRequiredCi(
+    github,
+    headSha,
+    baseSha,
+    requiredNames,
+    workflowId,
+  );
 
   for (const name of requiredNames) {
     const observed = observations.get(name);
@@ -56,22 +69,30 @@ export async function verifyRequiredCi(
 async function observeTrustedRequiredCi(
   github: FugueGitHub,
   headSha: string,
+  baseSha: string,
   requiredNames: readonly string[],
   workflowId: string,
 ): Promise<Map<string, RequiredCiObservation>> {
   const { owner, repo } = github.repository;
+  const workflowMatchesBase = await sameRepositoryFileBlob(github, workflowId, headSha, baseSha);
+  if (!workflowMatchesBase) {
+    return observationsFor(
+      requiredNames,
+      "error",
+      `candidate ${workflowId} differs from protected base ${baseSha.slice(0, 8)}`,
+    );
+  }
+
   const runs = await github.octokit.rest.actions.listWorkflowRuns({
     owner,
     repo,
     workflow_id: workflowId,
-    event: "pull_request_target",
+    event: "pull_request",
+    head_sha: headSha,
     per_page: 100,
   });
-  const expectedTitle = `${REQUIRED_CI_RUN_PREFIX}${headSha}`;
   const run = runs.data.workflow_runs
-    .filter((candidate) =>
-      candidate.event === "pull_request_target" && candidate.display_title === expectedTitle,
-    )
+    .filter((candidate) => candidate.event === "pull_request" && candidate.head_sha === headSha)
     .sort((a, b) => b.id - a.id)[0];
 
   if (!run) {
@@ -115,6 +136,26 @@ async function observeTrustedRequiredCi(
     });
   }
   return result;
+}
+
+async function sameRepositoryFileBlob(
+  github: FugueGitHub,
+  path: string,
+  headSha: string,
+  baseSha: string,
+): Promise<boolean> {
+  const { owner, repo } = github.repository;
+  try {
+    const [head, base] = await Promise.all([
+      github.octokit.rest.repos.getContent({ owner, repo, path, ref: headSha }),
+      github.octokit.rest.repos.getContent({ owner, repo, path, ref: baseSha }),
+    ]);
+    if (Array.isArray(head.data) || Array.isArray(base.data)) return false;
+    if (head.data.type !== "file" || base.data.type !== "file") return false;
+    return head.data.sha === base.data.sha;
+  } catch {
+    return false;
+  }
 }
 
 function observationsFor(
