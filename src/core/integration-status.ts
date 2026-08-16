@@ -6,7 +6,12 @@ import {
   parseIntegrationRequest,
   type IntegrationRequest,
 } from "./integration-plan.js";
-import { isTrustedProtocolComment, isTrustedProtocolWorkflowRun, type GitHubCommentLike } from "./provenance.js";
+import {
+  isTrustedProtocolComment,
+  isTrustedProtocolCommitStatus,
+  isTrustedProtocolWorkflowRun,
+  type GitHubCommentLike,
+} from "./provenance.js";
 
 export type IntegrationState = "none" | "pending" | "success" | "failure" | "error" | "stale";
 
@@ -53,7 +58,9 @@ export async function currentIntegrationState(
   const trustedComments = comments.filter(isTrustedProtocolComment);
   const requests = integrationRequests(trustedComments);
   const request = latestCurrentRequest(requests, snapshot);
-  const latest = statuses.data.find((status) => status.context === "fugue/integration");
+  const latest = statuses.data.find((status) =>
+    status.context === "fugue/integration" && isTrustedProtocolCommitStatus(status),
+  );
 
   if (latest) {
     if (requests.length > 0 && !request) {
