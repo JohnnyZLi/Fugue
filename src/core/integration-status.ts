@@ -6,6 +6,7 @@ import {
   parseIntegrationRequest,
   type IntegrationRequest,
 } from "./integration-plan.js";
+import { isTrustedProtocolComment, isTrustedProtocolWorkflowRun, type GitHubCommentLike } from "./provenance.js";
 
 export type IntegrationState = "none" | "pending" | "success" | "failure" | "error" | "stale";
 
@@ -20,6 +21,10 @@ export interface IntegrationWorkflowRun {
   status: string | null;
   conclusion: string | null;
   htmlUrl: string;
+}
+
+interface IntegrationComment extends GitHubCommentLike {
+  body?: string | null;
 }
 
 export const INTEGRATION_REQUEST_RECOVERY_GRACE_MS = 10 * 60 * 1000;
@@ -45,7 +50,8 @@ export async function currentIntegrationState(
     }),
   ]);
 
-  const requests = integrationRequests(comments.map((comment) => comment.body ?? ""));
+  const trustedComments = comments.filter(isTrustedProtocolComment);
+  const requests = integrationRequests(trustedComments);
   const request = latestCurrentRequest(requests, snapshot);
   const latest = statuses.data.find((status) => status.context === "fugue/integration");
 
@@ -67,7 +73,7 @@ export async function currentIntegrationState(
     }
 
     let current: IntegrationAttestation | undefined;
-    for (const comment of comments) {
+    for (const comment of trustedComments) {
       try {
         const value = parseAttestation(comment.body ?? "");
         if (value?.kind !== "integration") continue;
@@ -114,8 +120,8 @@ export async function currentIntegrationState(
     return { state: "pending", request };
   }
 
-  // A durable request with no matching Actions run after the recovery grace period is
-  // eligible for redispatch. Returning none lets the deterministic planner retry it.
+  // A durable trusted request with no matching trusted Actions run after the recovery grace
+  // period is eligible for redispatch. Returning none lets the deterministic planner retry it.
   return { state: "none", request };
 }
 
@@ -131,7 +137,7 @@ export async function findCurrentIntegrationRequest(
     per_page: 100,
   });
   return latestCurrentRequest(
-    integrationRequests(comments.map((comment) => comment.body ?? "")),
+    integrationRequests(comments.filter(isTrustedProtocolComment)),
     snapshot,
   );
 }
@@ -148,7 +154,9 @@ export async function findIntegrationWorkflowRun(
     event: "workflow_dispatch",
     per_page: 100,
   });
-  const match = runs.data.workflow_runs.find((run) => run.display_title === integrationRunTitle(requestId));
+  const match = runs.data.workflow_runs.find((run) =>
+    isTrustedProtocolWorkflowRun(run) && run.display_title === integrationRunTitle(requestId),
+  );
   if (!match) return undefined;
   return {
     status: match.status,
@@ -157,11 +165,11 @@ export async function findIntegrationWorkflowRun(
   };
 }
 
-function integrationRequests(bodies: string[]): IntegrationRequest[] {
+function integrationRequests(comments: IntegrationComment[]): IntegrationRequest[] {
   const requests: IntegrationRequest[] = [];
-  for (const body of bodies) {
+  for (const comment of comments) {
     try {
-      const request = parseIntegrationRequest(body);
+      const request = parseIntegrationRequest(comment.body ?? "");
       if (request) requests.push(request);
     } catch {
       // Malformed historical requests are inert protocol evidence.
