@@ -12,7 +12,7 @@ import {
 } from "./attestations.js";
 import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
 import { FUGUE_CLI_VERSION } from "./protocol.js";
-import { isTrustedProtocolComment } from "./provenance.js";
+import { createProtocolComment, isTrustedProtocolComment } from "./provenance.js";
 import { resolveReviewActivity, type ReviewActivity } from "./review-activity.js";
 
 export interface CompleteReviewOptions {
@@ -54,14 +54,13 @@ export async function beginReview(
     created_at: new Date().toISOString(),
   });
 
-  const { owner, repo } = github.repository;
-  const comment = await github.octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number: prNumber,
-    body: `${roleHeading(role)} — REVIEW STARTED\n\nHead: \`${snapshot.identity.headSha}\`\nBase: \`${snapshot.identity.baseBranch}@${snapshot.identity.baseSha}\`\nWork spec: \`${snapshot.identity.workSpecDigest}\`\n\n${serializeAttestation(session)}`,
-  });
+  const comment = await createProtocolComment(
+    github,
+    prNumber,
+    `${roleHeading(role)} — REVIEW STARTED\n\nHead: \`${snapshot.identity.headSha}\`\nBase: \`${snapshot.identity.baseBranch}@${snapshot.identity.baseSha}\`\nWork spec: \`${snapshot.identity.workSpecDigest}\`\n\n${serializeAttestation(session)}`,
+  );
 
+  const { owner, repo } = github.repository;
   await github.octokit.rest.repos.createCommitStatus({
     owner,
     repo,
@@ -118,13 +117,16 @@ export async function completeReview(
   }
 
   const heading = `${roleHeading(role)} — ${verdictHeading(options.verdict)}`;
-  const summary = options.summary?.trim() ? `\n\n${options.summary.trim()}` : "";
-  const comment = await github.octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number: prNumber,
-    body: `${heading}\n\nHead: \`${snapshot.identity.headSha}\`\nWork spec: \`${snapshot.identity.workSpecDigest}\`${summary}\n\n${serializeAttestation(attestation)}`,
-  });
+  const summaryText = options.summary?.trim() ?? "";
+  if (summaryText.includes("<!-- fugue-")) {
+    throw new Error("QA summary contains a reserved Fugue protocol marker.");
+  }
+  const summary = summaryText ? `\n\n${summaryText}` : "";
+  const comment = await createProtocolComment(
+    github,
+    prNumber,
+    `${heading}\n\nHead: \`${snapshot.identity.headSha}\`\nWork spec: \`${snapshot.identity.workSpecDigest}\`${summary}\n\n${serializeAttestation(attestation)}`,
+  );
 
   await github.octokit.rest.repos.createCommitStatus({
     owner,
@@ -168,7 +170,7 @@ export async function currentReviewActivities(
   }
 
   for (const comment of comments) {
-    if (!isTrustedProtocolComment(comment)) continue;
+    if (!(await isTrustedProtocolComment(github, comment))) continue;
     let value: ReturnType<typeof parseAttestation>;
     try {
       value = parseAttestation(comment.body ?? "");
