@@ -36,6 +36,10 @@ export interface GitHubCommitStatusLike {
   creator?: GitHubActorLike | null;
 }
 
+export interface ProtocolCommentResponse {
+  data: { html_url: string };
+}
+
 interface OidcHeader {
   alg?: string;
   kid?: string;
@@ -120,30 +124,32 @@ export async function createProtocolComment(
   github: FugueGitHub,
   issueNumber: number,
   body: string,
-) {
+): Promise<ProtocolCommentResponse> {
   const signed = await attachPublisherProof(github.repository.fullName, body);
   const { owner, repo } = github.repository;
-  return github.octokit.rest.issues.createComment({
+  const response = await github.octokit.rest.issues.createComment({
     owner,
     repo,
     issue_number: issueNumber,
     body: signed,
   });
+  return { data: { html_url: response.data.html_url } };
 }
 
 export async function updateProtocolComment(
   github: FugueGitHub,
   commentId: number,
   body: string,
-) {
+): Promise<ProtocolCommentResponse> {
   const signed = await attachPublisherProof(github.repository.fullName, body);
   const { owner, repo } = github.repository;
-  return github.octokit.rest.issues.updateComment({
+  const response = await github.octokit.rest.issues.updateComment({
     owner,
     repo,
     comment_id: commentId,
     body: signed,
   });
+  return { data: { html_url: response.data.html_url } };
 }
 
 export function stripProtocolPublisherProof(body: string): string {
