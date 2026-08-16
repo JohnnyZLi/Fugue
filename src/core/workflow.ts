@@ -5,6 +5,7 @@ import { IntegrationGateFailure, verifyBaseCurrent } from "./gates.js";
 import type { FugueGitHub } from "./github.js";
 import { currentIntegrationState, type IntegrationState } from "./integration-status.js";
 import { resolveOwnership } from "./ownership.js";
+import { isTrustedProtocolComment } from "./provenance.js";
 import { currentReviewActivities } from "./reviews.js";
 import type { WorkState } from "./state.js";
 
@@ -220,6 +221,7 @@ async function hasCurrentHumanControlPlaneAcknowledgement(
   });
 
   for (const comment of comments) {
+    if (!isTrustedProtocolComment(comment)) continue;
     try {
       const value = parseAttestation(comment.body ?? "");
       if (value?.kind !== "human_control_plane") continue;
