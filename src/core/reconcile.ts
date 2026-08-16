@@ -12,12 +12,13 @@ import {
   createIntegrationRequest,
   parseIntegrationRequest,
   serializeIntegrationRequest,
+  type IntegrationRequest,
 } from "./integration-plan.js";
 import {
   findIntegrationWorkflowRun,
   INTEGRATION_REQUEST_RECOVERY_GRACE_MS,
 } from "./integration-status.js";
-import { isTrustedProtocolComment } from "./provenance.js";
+import { createProtocolComment, isTrustedProtocolComment } from "./provenance.js";
 
 export interface ReconcileOptions {
   issue?: number;
@@ -119,8 +120,6 @@ async function applyAction(
 
     case "integrate":
       await dispatchIntegration(github, policy, work);
-      // Workflow dispatch is an external asynchronous boundary. The durable request written
-      // before dispatch makes subsequent reconciliation wait/recover rather than replay blindly.
       return false;
 
     case "wait_worker":
@@ -186,8 +185,6 @@ export async function ensureWorkerBranchAtBase(
         sha: baseSha,
       });
     } catch (error) {
-      // A concurrent/restarted allocation may have created the deterministic branch after
-      // our read. Only recover an already-existing ref; all other create failures are real.
       if (httpStatus(error) !== 422) throw error;
     }
     existing = await readBranchSha(github, branch);
@@ -315,30 +312,32 @@ export async function dispatchIntegration(
     issue_number: prNumber,
     per_page: 100,
   });
-  let existing = comments
-    .filter(isTrustedProtocolComment)
-    .map((comment) => {
-      try {
-        return parseIntegrationRequest(comment.body ?? "");
-      } catch {
-        return null;
+  let existing: IntegrationRequest | undefined;
+  for (const comment of comments) {
+    if (!(await isTrustedProtocolComment(github, comment))) continue;
+    try {
+      const candidate = parseIntegrationRequest(comment.body ?? "");
+      if (candidate?.request_id === request.request_id) {
+        existing = candidate;
+        break;
       }
-    })
-    .find((candidate) => candidate?.request_id === request.request_id);
+    } catch {
+      // Malformed historical requests are inert.
+    }
+  }
 
   let created = false;
   if (!existing) {
-    await github.octokit.rest.issues.createComment({
-      owner,
-      repo,
-      issue_number: prNumber,
-      body: `INTEGRATION — REQUESTED\n\nHead: \`${headSha}\`\nRequest: \`${request.request_id}\`\n\n${serializeIntegrationRequest(request)}`,
-    });
+    await createProtocolComment(
+      github,
+      prNumber,
+      `INTEGRATION — REQUESTED\n\nHead: \`${headSha}\`\nRequest: \`${request.request_id}\`\n\n${serializeIntegrationRequest(request)}`,
+    );
     existing = request;
     created = true;
   }
 
-  const run = await findIntegrationWorkflowRun(github, existing.request_id);
+  const run = await findIntegrationWorkflowRun(github, existing);
   if (run) return;
 
   if (!created) {
@@ -354,7 +353,7 @@ export async function dispatchIntegration(
     workflow_id: "fugue-integration.yml",
     ref: policy.identity.baseBranch,
     inputs: {
-      pr: String(prNumber),
+      pr: prNumber,
       request_id: existing.request_id,
     },
   });
