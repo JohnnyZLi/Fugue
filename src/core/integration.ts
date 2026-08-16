@@ -26,6 +26,7 @@ import {
 } from "./integration-plan.js";
 import { assertOwnership } from "./ownership.js";
 import { FUGUE_CLI_VERSION } from "./protocol.js";
+import { isTrustedProtocolComment } from "./provenance.js";
 import { currentQaAttestations } from "./reviews.js";
 import { runValidation } from "./validation.js";
 import { withCleanWorktree } from "./worktree.js";
@@ -319,6 +320,7 @@ async function findCurrentHumanAcknowledgement(
 
   let current: HumanControlPlaneAttestation | null = null;
   for (const comment of comments) {
+    if (!isTrustedProtocolComment(comment)) continue;
     let parsed;
     try {
       parsed = parseAttestation(comment.body ?? "");
