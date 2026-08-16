@@ -12,6 +12,7 @@ import {
 } from "./attestations.js";
 import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
 import { FUGUE_CLI_VERSION } from "./protocol.js";
+import { isTrustedProtocolComment } from "./provenance.js";
 import { resolveReviewActivity, type ReviewActivity } from "./review-activity.js";
 
 export interface CompleteReviewOptions {
@@ -167,6 +168,7 @@ export async function currentReviewActivities(
   }
 
   for (const comment of comments) {
+    if (!isTrustedProtocolComment(comment)) continue;
     let value: ReturnType<typeof parseAttestation>;
     try {
       value = parseAttestation(comment.body ?? "");
