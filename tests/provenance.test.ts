@@ -3,6 +3,7 @@ import {
   FUGUE_PROTOCOL_ACTOR,
   isTrustedProtocolActor,
   isTrustedProtocolComment,
+  isTrustedProtocolCommitStatus,
   isTrustedProtocolWorkflowRun,
 } from "../src/core/provenance.js";
 
@@ -22,5 +23,11 @@ describe("Fugue protocol provenance", () => {
   it("does not treat manually triggered lookalike workflow runs as trusted dispatch evidence", () => {
     expect(isTrustedProtocolWorkflowRun({ actor: { login: "JohnnyZLi", type: "User" } })).toBe(false);
     expect(isTrustedProtocolWorkflowRun({ actor: { login: FUGUE_PROTOCOL_ACTOR, type: "Bot" } })).toBe(true);
+  });
+
+  it("does not treat lookalike commit statuses as trusted Integration state", () => {
+    expect(isTrustedProtocolCommitStatus({ creator: { login: "JohnnyZLi", type: "User" } })).toBe(false);
+    expect(isTrustedProtocolCommitStatus({ creator: { login: FUGUE_PROTOCOL_ACTOR, type: "Bot" } })).toBe(true);
+    expect(isTrustedProtocolCommitStatus({ creator: null })).toBe(false);
   });
 });
