@@ -1,5 +1,10 @@
 import type { FugueGitHub } from "./github.js";
-import { isTrustedProtocolComment } from "./provenance.js";
+import {
+  createProtocolComment,
+  isTrustedProtocolComment,
+  stripProtocolPublisherProof,
+  updateProtocolComment,
+} from "./provenance.js";
 import type { WorkState } from "./state.js";
 import { actionLabel, type WorkflowAction } from "./workflow.js";
 
@@ -66,19 +71,23 @@ export async function upsertStateComment(
     issue_number: work.issueNumber,
     per_page: 100,
   });
-  const current = comments.find((comment) =>
-    isTrustedProtocolComment(comment) &&
-    (comment.body ?? "").includes(START) &&
-    (comment.body ?? "").includes(`work_id: ${work.metadata.work_id}`),
-  );
+
+  let current: typeof comments[number] | undefined;
+  for (const comment of comments) {
+    if (!(await isTrustedProtocolComment(github, comment))) continue;
+    const canonical = stripProtocolPublisherProof(comment.body ?? "");
+    if (!canonical.includes(START) || !canonical.includes(`work_id: ${work.metadata.work_id}`)) continue;
+    current = comment;
+    break;
+  }
 
   if (!current) {
-    await github.octokit.rest.issues.createComment({ owner, repo, issue_number: work.issueNumber, body });
+    await createProtocolComment(github, work.issueNumber, body);
     return;
   }
-  if ((current.body ?? "") === body) return;
+  if (stripProtocolPublisherProof(current.body ?? "") === body) return;
 
-  await github.octokit.rest.issues.updateComment({ owner, repo, comment_id: current.id, body });
+  await updateProtocolComment(github, current.id, body);
 }
 
 export function externalInstruction(
