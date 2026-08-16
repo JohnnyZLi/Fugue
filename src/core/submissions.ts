@@ -11,7 +11,11 @@ import {
 import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
 import type { FugueGitHub } from "./github.js";
 import { FUGUE_CLI_VERSION, type EvaluationIdentity } from "./protocol.js";
-import { isTrustedProtocolComment, type GitHubCommentLike } from "./provenance.js";
+import {
+  createProtocolComment,
+  isTrustedProtocolComment,
+  type GitHubCommentLike,
+} from "./provenance.js";
 import { completeReview, currentReviewActivities, type CompleteReviewOptions } from "./reviews.js";
 
 const REVIEW_START = "<!-- fugue-review-submit";
@@ -52,6 +56,7 @@ interface SubmissionInput<T> {
 }
 
 interface SubmissionComment extends GitHubCommentLike {
+  id: number;
   body?: string | null;
 }
 
@@ -90,7 +95,7 @@ export async function processCurrentSubmissions(
     per_page: 100,
   });
 
-  const rejectedIds = rejectedSubmissionIds(comments);
+  const rejectedIds = await rejectedSubmissionIds(github, comments as SubmissionComment[]);
   const qaInputs: Array<SubmissionInput<QaSubmission>> = [];
   const humanInputs: Array<SubmissionInput<HumanSubmission>> = [];
 
@@ -253,13 +258,11 @@ export async function recordHumanControlPlaneAcknowledgement(
     throw new Error("PR evaluation identity changed before acknowledgement could be recorded.");
   }
 
-  const { owner, repo } = github.repository;
-  await github.octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number: prNumber,
-    body: `HUMAN CONTROL-PLANE ACKNOWLEDGEMENT\n\nHead: \`${snapshot.identity.headSha}\`\nPolicy: \`${snapshot.identity.policyDigest}\`\nActor: @${actor}\n\n${serializeAttestation(attestation)}`,
-  });
+  await createProtocolComment(
+    github,
+    prNumber,
+    `HUMAN CONTROL-PLANE ACKNOWLEDGEMENT\n\nHead: \`${snapshot.identity.headSha}\`\nPolicy: \`${snapshot.identity.policyDigest}\`\nActor: @${actor}\n\n${serializeAttestation(attestation)}`,
+  );
 }
 
 export async function hasCurrentHumanAcknowledgement(
@@ -275,7 +278,7 @@ export async function hasCurrentHumanAcknowledgement(
   });
 
   for (const comment of comments) {
-    if (!isTrustedProtocolComment(comment)) continue;
+    if (!(await isTrustedProtocolComment(github, comment))) continue;
     try {
       const value = parseAttestation(comment.body ?? "");
       if (value?.kind !== "human_control_plane") continue;
@@ -287,10 +290,13 @@ export async function hasCurrentHumanAcknowledgement(
   return false;
 }
 
-function rejectedSubmissionIds(comments: SubmissionComment[]): Set<number> {
+async function rejectedSubmissionIds(
+  github: FugueGitHub,
+  comments: SubmissionComment[],
+): Promise<Set<number>> {
   const ids = new Set<number>();
   for (const comment of comments) {
-    if (!isTrustedProtocolComment(comment)) continue;
+    if (!(await isTrustedProtocolComment(github, comment))) continue;
     try {
       const rejection = parseMarked(comment.body ?? "", REJECTION_START, submissionRejectionSchema);
       for (const id of rejection?.comment_ids ?? []) ids.add(id);
@@ -307,14 +313,12 @@ async function rejectSubmissions(
   commentIds: number[],
   reason: string,
 ): Promise<void> {
-  const { owner, repo } = github.repository;
   const marker = `${REJECTION_START}\n${stringifyYaml({ version: 1, comment_ids: commentIds }).trim()}\n${END}`;
-  await github.octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number: prNumber,
-    body: `FUGUE SUBMISSION — REJECTED\n\n${reason}\n\n${marker}`,
-  });
+  await createProtocolComment(
+    github,
+    prNumber,
+    `FUGUE SUBMISSION — REJECTED\n\n${reason}\n\n${marker}`,
+  );
 }
 
 async function canSubmitProtocolEvidence(github: FugueGitHub, actor: string): Promise<boolean> {
