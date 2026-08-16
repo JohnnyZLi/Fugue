@@ -8,42 +8,23 @@ export interface CiVerification {
 
 export type RequiredCiState = "success" | "pending" | "failure" | "error" | "missing";
 
+export const DEFAULT_REQUIRED_CI_WORKFLOW = ".github/workflows/ci.yml";
+export const REQUIRED_CI_RUN_PREFIX = "Fugue CI ";
+
+interface RequiredCiObservation {
+  state: RequiredCiState;
+  detail: string;
+}
+
 export async function currentRequiredCiState(
   github: FugueGitHub,
   headSha: string,
   requiredNames: readonly string[],
+  workflowId = DEFAULT_REQUIRED_CI_WORKFLOW,
 ): Promise<RequiredCiState> {
   if (!requiredNames.length) return "success";
-
-  const { owner, repo } = github.repository;
-  const [checksResponse, statusResponse] = await Promise.all([
-    github.octokit.rest.checks.listForRef({ owner, repo, ref: headSha, per_page: 100 }),
-    github.octokit.rest.repos.getCombinedStatusForRef({ owner, repo, ref: headSha, per_page: 100 }),
-  ]);
-
-  const states = requiredNames.map((name) => {
-    const matchingChecks = checksResponse.data.check_runs
-      .filter((check) => check.name === name)
-      .sort((a, b) => b.id - a.id);
-    const latestCheck = matchingChecks[0];
-    const matchingStatuses = statusResponse.data.statuses
-      .filter((status) => status.context === name)
-      .sort((a, b) => b.id - a.id);
-    const latestStatus = matchingStatuses[0];
-
-    const checkPassed = latestCheck?.status === "completed" && latestCheck.conclusion === "success";
-    const statusPassed = latestStatus?.state === "success";
-    if (checkPassed || statusPassed) return "success" as const;
-
-    if (!latestCheck && !latestStatus) return "missing" as const;
-    if (latestStatus?.state === "error") return "error" as const;
-    if (latestStatus?.state === "failure") return "failure" as const;
-    if (latestStatus?.state === "pending") return "pending" as const;
-    if (latestCheck && latestCheck.status !== "completed") return "pending" as const;
-    if (latestCheck?.status === "completed" && latestCheck.conclusion !== "success") return "failure" as const;
-    return "missing" as const;
-  });
-
+  const observations = await observeTrustedRequiredCi(github, headSha, requiredNames, workflowId);
+  const states = [...observations.values()].map((item) => item.state);
   if (states.includes("error")) return "error";
   if (states.includes("failure")) return "failure";
   if (states.includes("pending")) return "pending";
@@ -55,40 +36,96 @@ export async function verifyRequiredCi(
   github: FugueGitHub,
   headSha: string,
   requiredNames: readonly string[],
+  workflowId = DEFAULT_REQUIRED_CI_WORKFLOW,
 ): Promise<CiVerification> {
   if (!requiredNames.length) return { passed: true, checks: [] };
-
-  const { owner, repo } = github.repository;
-  const [checksResponse, statusResponse] = await Promise.all([
-    github.octokit.rest.checks.listForRef({ owner, repo, ref: headSha, per_page: 100 }),
-    github.octokit.rest.repos.getCombinedStatusForRef({ owner, repo, ref: headSha, per_page: 100 }),
-  ]);
+  const observations = await observeTrustedRequiredCi(github, headSha, requiredNames, workflowId);
 
   for (const name of requiredNames) {
-    const matchingChecks = checksResponse.data.check_runs
-      .filter((check) => check.name === name)
-      .sort((a, b) => b.id - a.id);
-    const latestCheck = matchingChecks[0];
-    const matchingStatuses = statusResponse.data.statuses
-      .filter((status) => status.context === name)
-      .sort((a, b) => b.id - a.id);
-    const latestStatus = matchingStatuses[0];
-
-    const checkPassed = latestCheck?.status === "completed" && latestCheck.conclusion === "success";
-    const statusPassed = latestStatus?.state === "success";
-
-    if (!checkPassed && !statusPassed) {
-      const detail = latestCheck
-        ? `check=${latestCheck.status}/${latestCheck.conclusion ?? "none"}`
-        : latestStatus
-          ? `status=${latestStatus.state}`
-          : "not found";
-      throw new IntegrationGateFailure(
-        "ci",
-        `Required CI '${name}' has not passed on ${headSha.slice(0, 8)} (${detail}).`,
-      );
-    }
+    const observed = observations.get(name);
+    if (observed?.state === "success") continue;
+    throw new IntegrationGateFailure(
+      "ci",
+      `Required CI '${name}' has not passed on ${headSha.slice(0, 8)} from protected workflow ${workflowId} (${observed?.detail ?? "not found"}).`,
+    );
   }
 
   return { passed: true, checks: [...requiredNames] };
+}
+
+async function observeTrustedRequiredCi(
+  github: FugueGitHub,
+  headSha: string,
+  requiredNames: readonly string[],
+  workflowId: string,
+): Promise<Map<string, RequiredCiObservation>> {
+  const { owner, repo } = github.repository;
+  const runs = await github.octokit.rest.actions.listWorkflowRuns({
+    owner,
+    repo,
+    workflow_id: workflowId,
+    event: "pull_request_target",
+    per_page: 100,
+  });
+  const expectedTitle = `${REQUIRED_CI_RUN_PREFIX}${headSha}`;
+  const run = runs.data.workflow_runs
+    .filter((candidate) =>
+      candidate.event === "pull_request_target" && candidate.display_title === expectedTitle,
+    )
+    .sort((a, b) => b.id - a.id)[0];
+
+  if (!run) {
+    return observationsFor(requiredNames, "missing", "trusted workflow run not found");
+  }
+  if (run.status !== "completed") {
+    return observationsFor(requiredNames, "pending", `workflow=${run.status}`);
+  }
+
+  const jobs = await github.octokit.rest.actions.listJobsForWorkflowRun({
+    owner,
+    repo,
+    run_id: run.id,
+    filter: "latest",
+    per_page: 100,
+  });
+  const result = new Map<string, RequiredCiObservation>();
+
+  for (const name of requiredNames) {
+    const job = jobs.data.jobs
+      .filter((candidate) => candidate.name === name)
+      .sort((a, b) => b.id - a.id)[0];
+    if (!job) {
+      result.set(name, {
+        state: run.conclusion === "success" ? "missing" : workflowFailureState(run.conclusion),
+        detail: `workflow=completed/${run.conclusion ?? "none"}, job=missing`,
+      });
+      continue;
+    }
+    if (job.status !== "completed") {
+      result.set(name, { state: "pending", detail: `job=${job.status}/${job.conclusion ?? "none"}` });
+      continue;
+    }
+    if (job.conclusion === "success") {
+      result.set(name, { state: "success", detail: "job=completed/success" });
+      continue;
+    }
+    result.set(name, {
+      state: workflowFailureState(job.conclusion),
+      detail: `job=completed/${job.conclusion ?? "none"}`,
+    });
+  }
+  return result;
+}
+
+function observationsFor(
+  names: readonly string[],
+  state: RequiredCiState,
+  detail: string,
+): Map<string, RequiredCiObservation> {
+  return new Map(names.map((name) => [name, { state, detail }]));
+}
+
+function workflowFailureState(conclusion: string | null | undefined): "failure" | "error" {
+  if (conclusion === "failure") return "failure";
+  return "error";
 }
