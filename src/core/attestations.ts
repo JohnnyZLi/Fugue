@@ -131,7 +131,9 @@ export function serializeAttestation(value: FugueAttestation): string {
 }
 
 export function parseAttestation(body: string): FugueAttestation | null {
-  const start = body.indexOf(START);
+  // Canonical Fugue writers append the structured attestation after any human-readable
+  // narrative. Parse the trailing marker so user-controlled narrative cannot shadow it.
+  const start = body.lastIndexOf(START);
   if (start < 0) return null;
   const end = body.indexOf(END, start + START.length);
   if (end < 0) throw new Error("Unterminated fugue-attestation block.");
