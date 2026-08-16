@@ -15,6 +15,7 @@ const TRUSTED_WORKFLOWS = new Map<string, ReadonlySet<string>>([
   ],
   [".github/workflows/fugue-integration.yml", new Set(["workflow_dispatch"])],
 ]);
+const defaultBranchCache = new Map<string, string>();
 
 export interface GitHubActorLike {
   login?: string | null;
@@ -52,7 +53,6 @@ interface OidcClaims {
   repository?: string;
   workflow_ref?: string;
   workflow_sha?: string;
-  ref_protected?: boolean | string;
   event_name?: string;
   iat?: number;
   nbf?: number;
@@ -107,11 +107,15 @@ export async function isTrustedProtocolComment(
   if (!Number.isFinite(timestamp)) return false;
 
   try {
-    const jwks = await loadGitHubOidcJwks();
+    const [jwks, branch] = await Promise.all([
+      loadGitHubOidcJwks(),
+      repositoryDefaultBranch(github),
+    ]);
     return verifyPublisherToken(
       proof,
       audience,
       github.repository.fullName,
+      branch,
       timestamp,
       jwks,
     );
@@ -170,6 +174,7 @@ export function verifyPublisherToken(
   token: string,
   expectedAudience: string,
   repository: string,
+  defaultBranch: string,
   commentTimestampMs: number,
   jwks: JwkSet,
 ): boolean {
@@ -202,10 +207,9 @@ export function verifyPublisherToken(
   if (claims.iss !== FUGUE_OIDC_ISSUER) return false;
   if (!audienceContains(claims.aud, expectedAudience)) return false;
   if (claims.repository !== repository) return false;
-  if (!isProtectedRef(claims.ref_protected)) return false;
   if (!claims.workflow_sha || !/^[0-9a-f]{40}$/i.test(claims.workflow_sha)) return false;
 
-  const workflow = trustedWorkflowPath(repository, claims.workflow_ref);
+  const workflow = trustedWorkflowPath(repository, claims.workflow_ref, defaultBranch);
   if (!workflow) return false;
   const allowedEvents = TRUSTED_WORKFLOWS.get(workflow);
   if (!claims.event_name || !allowedEvents?.has(claims.event_name)) return false;
@@ -262,6 +266,18 @@ async function loadGitHubOidcJwks(): Promise<JwkSet> {
   return jwks;
 }
 
+async function repositoryDefaultBranch(github: FugueGitHub): Promise<string> {
+  const key = github.repository.fullName;
+  const cached = defaultBranchCache.get(key);
+  if (cached) return cached;
+  const { owner, repo } = github.repository;
+  const response = await github.octokit.rest.repos.get({ owner, repo });
+  const branch = response.data.default_branch;
+  if (!branch) throw new Error(`Repository ${key} has no default branch.`);
+  defaultBranchCache.set(key, branch);
+  return branch;
+}
+
 function parsePublisherProof(body: string): string | null {
   const canonical = stripProtocolPublisherProof(body);
   if (canonical === body) return null;
@@ -277,15 +293,14 @@ function audienceContains(aud: OidcClaims["aud"], expected: string): boolean {
   return Array.isArray(aud) && aud.includes(expected);
 }
 
-function trustedWorkflowPath(repository: string, workflowRef: string | undefined): string | null {
+function trustedWorkflowPath(
+  repository: string,
+  workflowRef: string | undefined,
+  defaultBranch: string,
+): string | null {
   if (!workflowRef) return null;
   for (const path of TRUSTED_WORKFLOWS.keys()) {
-    const prefix = `${repository}/${path}@refs/heads/`;
-    if (workflowRef.startsWith(prefix) && workflowRef.length > prefix.length) return path;
+    if (workflowRef === `${repository}/${path}@refs/heads/${defaultBranch}`) return path;
   }
   return null;
-}
-
-function isProtectedRef(value: boolean | string | undefined): boolean {
-  return value === true || value === "true";
 }
