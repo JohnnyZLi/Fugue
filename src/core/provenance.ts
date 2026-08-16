@@ -1,4 +1,4 @@
-import { createHash, createPublicKey, verify } from "node:crypto";
+import { createHash, createPublicKey, verify, type JsonWebKey as CryptoJsonWebKey } from "node:crypto";
 import type { FugueGitHub } from "./github.js";
 
 export const FUGUE_PROTOCOL_ACTOR = "github-actions[bot]";
@@ -55,8 +55,12 @@ interface OidcClaims {
   exp?: number;
 }
 
+interface PublisherJwk extends CryptoJsonWebKey {
+  kid?: string;
+}
+
 interface JwkSet {
-  keys?: JsonWebKey[];
+  keys?: PublisherJwk[];
 }
 
 let jwksCache: JwkSet | undefined;
