@@ -7,7 +7,7 @@ on:
       pr:
         description: Pull request number to integrate
         required: true
-        type: string
+        type: number
       request_id:
         description: Durable Fugue Integration request ID
         required: true
@@ -23,6 +23,7 @@ jobs:
     permissions:
       checks: read
       contents: read
+      id-token: write
       issues: write
       pull-requests: read
       statuses: write
@@ -42,11 +43,15 @@ jobs:
       - id: prepare
         name: Prepare immutable Integration plan
         env:
+          FUGUE_PR: ${{ inputs.pr }}
+          FUGUE_REQUEST_ID: ${{ inputs.request_id }}
+          FUGUE_RUNTIME_SHA: ${{ github.sha }}
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
-          node dist/cli.js integration-runtime prepare "${{ inputs.pr }}"
+          node dist/cli.js integration-runtime prepare "$FUGUE_PR"
+          --request-id "$FUGUE_REQUEST_ID"
           --out "$RUNNER_TEMP/fugue-plan.json"
-          --runtime-sha "${{ github.sha }}"
+          --runtime-sha "$FUGUE_RUNTIME_SHA"
           --github-output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
@@ -108,6 +113,7 @@ jobs:
       actions: write
       checks: read
       contents: write
+      id-token: write
       issues: write
       pull-requests: write
       statuses: write
@@ -143,13 +149,15 @@ jobs:
       - name: Publish failed candidate validation
         if: needs.validate.result != 'success'
         env:
+          FUGUE_VALIDATION_RESULT: ${{ needs.validate.result }}
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
           node dist/cli.js integration-runtime finalize
           --plan _plan/fugue-plan.json
-          --validation-result "${{ needs.validate.result }}"
+          --validation-result "$FUGUE_VALIDATION_RESULT"
       - name: Refresh durable Fugue state comment
         if: always()
         env:
+          FUGUE_PR: ${{ inputs.pr }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: node dist/cli.js reconcile --pr "${{ inputs.pr }}"
+        run: node dist/cli.js reconcile --pr "$FUGUE_PR"
