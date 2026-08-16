@@ -112,7 +112,7 @@ summary: Exact-head review passed.
 -->
 ```
 
-This is an input request, not canonical protocol evidence. Protected Fugue automation reconstructs the exact current evaluation identity and writes the canonical QA attestation/status. The submitting GitHub actor must have repository write, maintain, or admin permission. Malformed, stale, unauthorized, or conflicting submissions are durably rejected rather than silently reused.
+This is an input request, not canonical protocol evidence. Protected Fugue automation reconstructs the exact current evaluation identity and writes the canonical QA attestation/status. Canonical durable comments carry a content-bound publisher proof from an approved Fugue workflow on the repository default branch; the shared `github-actions[bot]` login is not sufficient authority by itself. The submitting GitHub actor must have repository write, maintain, or admin permission. Malformed, stale, unauthorized, or conflicting submissions are durably rejected rather than silently reused.
 
 ## Changes requested
 
@@ -141,13 +141,17 @@ identity:
 -->
 ```
 
-The submission itself is not canonical acknowledgement evidence. Protected Fugue automation verifies the GitHub actor has repository write/maintain/admin permission, verifies that the submitted identity still exactly matches the current PR evaluation, and only then writes the canonical Human acknowledgement attestation. If the head, base, policy, protocol, issue/work identity, or work specification changes, the old request cannot acknowledge the new state.
+The submission itself is not canonical acknowledgement evidence. Protected Fugue automation verifies the GitHub actor has repository write/maintain/admin permission, verifies that the submitted identity still exactly matches the current PR evaluation, and only then writes the workflow-bound canonical Human acknowledgement attestation. If the head, base, policy, protocol, issue/work identity, or work specification changes, the old request cannot acknowledge the new state.
 
 The Human does not run `fugue acknowledge` or carry these identity fields during normal work.
 
 ## Final merge
 
-Only ask after the current exact head has `fugue/integration = success`. Re-fetch mutable PR/head/status state immediately before merging. Merge only after the Human says to merge.
+Only ask after Fugue reconstructs a current exact-identity Integration PASS from the signed durable Integration request, its matching protected workflow run, and the signed Integration attestation. `fugue/integration = success` remains the GitHub branch-protection/UI signal but is not authoritative durable Fugue evidence by itself. Re-fetch mutable PR/head/evidence/status state immediately before merging. Merge only after the Human says to merge.
+
+## Local CLI
+
+Local Fugue remains useful for bootstrap, status inspection, and protocol debugging. Canonical publication requires the protected GitHub workflow identity, so a local user-token invocation must not be treated as authoritative mutation/recovery evidence. Route authoritative reconciliation, QA canonicalization, acknowledgement, and Integration publication through the protected workflows.
 
 ## Replacement Leader
 
