@@ -1,9 +1,11 @@
 name: CI
-run-name: Fugue CI ${{ github.event.pull_request.head.sha }}
 
 on:
-  pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches:
+      - main
+      - bootstrap/fugue-foundation
+  pull_request:
 
 permissions:
   contents: read
@@ -12,33 +14,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout exact candidate head without credentials
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - name: Install candidate dependencies
-        env:
-          GITHUB_TOKEN: ""
-          GH_TOKEN: ""
-        run: npm ci
-      - name: Typecheck candidate
-        env:
-          GITHUB_TOKEN: ""
-          GH_TOKEN: ""
-        run: npm run check
-      - name: Test candidate
-        env:
-          GITHUB_TOKEN: ""
-          GH_TOKEN: ""
-        run: npm test
-      - name: Build candidate
-        env:
-          GITHUB_TOKEN: ""
-          GH_TOKEN: ""
-        run: npm run build
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
