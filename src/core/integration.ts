@@ -26,7 +26,7 @@ import {
 } from "./integration-plan.js";
 import { assertOwnership } from "./ownership.js";
 import { FUGUE_CLI_VERSION } from "./protocol.js";
-import { isTrustedProtocolComment } from "./provenance.js";
+import { createProtocolComment, isTrustedProtocolComment } from "./provenance.js";
 import { currentQaAttestations } from "./reviews.js";
 import { runValidation } from "./validation.js";
 import { withCleanWorktree } from "./worktree.js";
@@ -114,7 +114,12 @@ export async function finalizeIntegration(
   }
 
   const prerequisites = await verifyPrerequisites(github, snapshot);
-  const ci = await verifyRequiredCi(github, snapshot.identity.headSha, plan.required_ci);
+  const ci = await verifyRequiredCi(
+    github,
+    snapshot.identity.headSha,
+    plan.required_ci,
+    snapshot.policy.config.validation.required_ci_workflow,
+  );
   await verifyMergeability(github, snapshot.pr.number);
 
   const finalSnapshot = await captureEvaluation(github, snapshot.pr.number);
@@ -156,14 +161,13 @@ export async function finalizeIntegration(
     created_at: new Date().toISOString(),
   });
 
-  const { owner, repo } = github.repository;
-  const comment = await github.octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number: snapshot.pr.number,
-    body: `INTEGRATION — PASS\n\nHead: \`${snapshot.identity.headSha}\`\nBase: \`${snapshot.identity.baseBranch}@${snapshot.identity.baseSha}\`\nPolicy: \`${snapshot.identity.policyDigest}\`\nWork spec: \`${snapshot.identity.workSpecDigest}\`\n\n${serializeAttestation(attestation)}`,
-  });
+  const comment = await createProtocolComment(
+    github,
+    snapshot.pr.number,
+    `INTEGRATION — PASS\n\nHead: \`${snapshot.identity.headSha}\`\nBase: \`${snapshot.identity.baseBranch}@${snapshot.identity.baseSha}\`\nPolicy: \`${snapshot.identity.policyDigest}\`\nWork spec: \`${snapshot.identity.workSpecDigest}\`\n\n${serializeAttestation(attestation)}`,
+  );
 
+  const { owner, repo } = github.repository;
   await github.octokit.rest.repos.createCommitStatus({
     owner,
     repo,
@@ -190,12 +194,11 @@ export async function publishIntegrationFailure(
 
   let targetUrl: string | undefined;
   try {
-    const comment = await github.octokit.rest.issues.createComment({
-      owner,
-      repo,
-      issue_number: identity.prNumber,
-      body: `INTEGRATION — ${label}\n\nHead: \`${identity.headSha}\`\nBase: \`${identity.baseBranch}@${identity.baseSha}\`\n\n${detail}`,
-    });
+    const comment = await createProtocolComment(
+      github,
+      identity.prNumber,
+      `INTEGRATION — ${label}\n\nHead: \`${identity.headSha}\`\nBase: \`${identity.baseBranch}@${identity.baseSha}\`\n\n${detail}`,
+    );
     targetUrl = comment.data.html_url;
   } catch {
     // Preserve the original Integration failure even if evidence posting also fails.
@@ -320,7 +323,7 @@ async function findCurrentHumanAcknowledgement(
 
   let current: HumanControlPlaneAttestation | null = null;
   for (const comment of comments) {
-    if (!isTrustedProtocolComment(comment)) continue;
+    if (!(await isTrustedProtocolComment(github, comment))) continue;
     let parsed;
     try {
       parsed = parseAttestation(comment.body ?? "");
