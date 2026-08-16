@@ -1,4 +1,5 @@
 import type { FugueGitHub } from "./github.js";
+import { isTrustedProtocolComment } from "./provenance.js";
 import type { WorkState } from "./state.js";
 import { actionLabel, type WorkflowAction } from "./workflow.js";
 
@@ -66,7 +67,9 @@ export async function upsertStateComment(
     per_page: 100,
   });
   const current = comments.find((comment) =>
-    (comment.body ?? "").includes(START) && (comment.body ?? "").includes(`work_id: ${work.metadata.work_id}`),
+    isTrustedProtocolComment(comment) &&
+    (comment.body ?? "").includes(START) &&
+    (comment.body ?? "").includes(`work_id: ${work.metadata.work_id}`),
   );
 
   if (!current) {
