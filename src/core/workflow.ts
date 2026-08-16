@@ -171,7 +171,12 @@ export async function observeWork(github: FugueGitHub, work: WorkState): Promise
     ...(ownership.passed
       ? {}
       : { ownershipDetail: ownership.violations.map((item) => `${item.path} (${item.kind})`).join(", ") }),
-    ci: await currentRequiredCiState(github, snapshot.identity.headSha, snapshot.policy.config.validation.required_ci),
+    ci: await currentRequiredCiState(
+      github,
+      snapshot.identity.headSha,
+      snapshot.policy.config.validation.required_ci,
+      snapshot.policy.config.validation.required_ci_workflow,
+    ),
     baseCurrent,
     qa,
     controlPlaneChanged: snapshot.qa.controlPlaneChanged,
@@ -221,7 +226,7 @@ async function hasCurrentHumanControlPlaneAcknowledgement(
   });
 
   for (const comment of comments) {
-    if (!isTrustedProtocolComment(comment)) continue;
+    if (!(await isTrustedProtocolComment(github, comment))) continue;
     try {
       const value = parseAttestation(comment.body ?? "");
       if (value?.kind !== "human_control_plane") continue;
