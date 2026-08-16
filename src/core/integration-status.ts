@@ -6,12 +6,7 @@ import {
   parseIntegrationRequest,
   type IntegrationRequest,
 } from "./integration-plan.js";
-import {
-  isTrustedProtocolComment,
-  isTrustedProtocolCommitStatus,
-  isTrustedProtocolWorkflowRun,
-  type GitHubCommentLike,
-} from "./provenance.js";
+import { isTrustedProtocolComment, isTrustedProtocolWorkflowRun, type GitHubCommentLike } from "./provenance.js";
 
 export type IntegrationState = "none" | "pending" | "success" | "failure" | "error" | "stale";
 
@@ -40,42 +35,32 @@ export async function currentIntegrationState(
   now = Date.now(),
 ): Promise<CurrentIntegrationState> {
   const { owner, repo } = github.repository;
-  const [statuses, comments] = await Promise.all([
-    github.octokit.rest.repos.listCommitStatusesForRef({
-      owner,
-      repo,
-      ref: snapshot.identity.headSha,
-      per_page: 100,
-    }),
-    github.octokit.paginate(github.octokit.rest.issues.listComments, {
-      owner,
-      repo,
-      issue_number: snapshot.pr.number,
-      per_page: 100,
-    }),
-  ]);
+  const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
+    owner,
+    repo,
+    issue_number: snapshot.pr.number,
+    per_page: 100,
+  });
 
-  const trustedComments = comments.filter(isTrustedProtocolComment);
+  const trustedComments: IntegrationComment[] = [];
+  for (const comment of comments) {
+    if (await isTrustedProtocolComment(github, comment)) trustedComments.push(comment);
+  }
+
   const requests = integrationRequests(trustedComments);
   const request = latestCurrentRequest(requests, snapshot);
-  const latest = statuses.data.find((status) =>
-    status.context === "fugue/integration" && isTrustedProtocolCommitStatus(status),
-  );
+  if (!request) return { state: "none" };
 
-  if (latest) {
-    if (requests.length > 0 && !request) {
-      return {
-        state: "stale",
-        ...(latest.target_url ? { targetUrl: latest.target_url } : {}),
-      };
+  const workflowRun = await findIntegrationWorkflowRun(github, request);
+  if (workflowRun) {
+    if (workflowRun.status !== "completed") {
+      return { state: "pending", request, targetUrl: workflowRun.htmlUrl };
     }
-
-    if (latest.state !== "success") {
-      const state = integrationFailureState(latest.state);
+    if (workflowRun.conclusion !== "success") {
       return {
-        state,
-        ...(request ? { request } : {}),
-        ...(latest.target_url ? { targetUrl: latest.target_url } : {}),
+        state: workflowRun.conclusion === "failure" ? "failure" : "error",
+        request,
+        targetUrl: workflowRun.htmlUrl,
       };
     }
 
@@ -92,30 +77,12 @@ export async function currentIntegrationState(
     }
 
     if (!current) {
-      return {
-        state: "stale",
-        ...(request ? { request } : {}),
-        ...(latest.target_url ? { targetUrl: latest.target_url } : {}),
-      };
+      return { state: "stale", request, targetUrl: workflowRun.htmlUrl };
     }
 
     return {
       state: "success",
       attestation: current,
-      ...(request ? { request } : {}),
-      ...(latest.target_url ? { targetUrl: latest.target_url } : {}),
-    };
-  }
-
-  if (!request) return { state: "none" };
-
-  const workflowRun = await findIntegrationWorkflowRun(github, request.request_id);
-  if (workflowRun) {
-    if (workflowRun.status !== "completed") {
-      return { state: "pending", request, targetUrl: workflowRun.htmlUrl };
-    }
-    return {
-      state: "error",
       request,
       targetUrl: workflowRun.htmlUrl,
     };
@@ -127,8 +94,8 @@ export async function currentIntegrationState(
     return { state: "pending", request };
   }
 
-  // A durable trusted request with no matching trusted Actions run after the recovery grace
-  // period is eligible for redispatch. Returning none lets the deterministic planner retry it.
+  // A signed durable request with no matching protected-base workflow run after the recovery
+  // grace period is eligible for redispatch. Returning none lets the deterministic planner retry.
   return { state: "none", request };
 }
 
@@ -143,15 +110,16 @@ export async function findCurrentIntegrationRequest(
     issue_number: snapshot.pr.number,
     per_page: 100,
   });
-  return latestCurrentRequest(
-    integrationRequests(comments.filter(isTrustedProtocolComment)),
-    snapshot,
-  );
+  const trusted: IntegrationComment[] = [];
+  for (const comment of comments) {
+    if (await isTrustedProtocolComment(github, comment)) trusted.push(comment);
+  }
+  return latestCurrentRequest(integrationRequests(trusted), snapshot);
 }
 
 export async function findIntegrationWorkflowRun(
   github: FugueGitHub,
-  requestId: string,
+  request: IntegrationRequest,
 ): Promise<IntegrationWorkflowRun | undefined> {
   const { owner, repo } = github.repository;
   const runs = await github.octokit.rest.actions.listWorkflowRuns({
@@ -159,10 +127,14 @@ export async function findIntegrationWorkflowRun(
     repo,
     workflow_id: "fugue-integration.yml",
     event: "workflow_dispatch",
+    head_sha: request.identity.baseSha,
     per_page: 100,
   });
   const match = runs.data.workflow_runs.find((run) =>
-    isTrustedProtocolWorkflowRun(run) && run.display_title === integrationRunTitle(requestId),
+    isTrustedProtocolWorkflowRun(run) &&
+    run.event === "workflow_dispatch" &&
+    run.head_sha === request.identity.baseSha &&
+    run.display_title === integrationRunTitle(request.request_id),
   );
   if (!match) return undefined;
   return {
@@ -193,9 +165,4 @@ function latestCurrentRequest(
     .filter((request) => sameEvaluationIdentity(request.identity, snapshot.identity))
     .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
     .at(-1);
-}
-
-function integrationFailureState(value: string): "pending" | "failure" | "error" {
-  if (value === "pending" || value === "failure" || value === "error") return value;
-  return "error";
 }
