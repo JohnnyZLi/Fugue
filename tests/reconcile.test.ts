@@ -14,10 +14,14 @@ import {
 import { parseWorkMetadata, upsertWorkMetadata } from "../src/core/metadata.js";
 import { canonicalizePrMetadata, parsePrMetadata } from "../src/core/pr-metadata.js";
 import type { ActivePolicy } from "../src/core/policy.js";
+import { FUGUE_PROTOCOL_ACTOR } from "../src/core/provenance.js";
 import { allocateWorker, dispatchIntegration } from "../src/core/reconcile.js";
 import { externalInstruction, renderStateComment } from "../src/core/state-comment.js";
 import type { WorkState } from "../src/core/state.js";
 import { planWork, type WorkflowObservation } from "../src/core/workflow.js";
+
+const BOT = { login: FUGUE_PROTOCOL_ACTOR, type: "Bot" } as const;
+const USER = { login: "JohnnyZLi", type: "User" } as const;
 
 function work(): WorkState {
   return {
@@ -245,7 +249,7 @@ describe("restart-safe Worker allocation", () => {
 
 describe("restart-safe Integration dispatch", () => {
   it("persists a request before dispatch and suppresses immediate replay when the run is not visible yet", async () => {
-    const comments: Array<{ body: string }> = [];
+    const comments: ProtocolComment[] = [];
     const dispatch = vi.fn(async () => ({ data: {} }));
     const github = integrationGithub(comments, [], dispatch);
     const activePolicy = policy();
@@ -265,8 +269,8 @@ describe("restart-safe Integration dispatch", () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
   });
 
-  it("does not replay after the grace period when the request-bound Actions run exists", async () => {
-    const comments: Array<{ body: string }> = [];
+  it("does not replay after the grace period when the trusted request-bound Actions run exists", async () => {
+    const comments: ProtocolComment[] = [];
     const runs: Array<Record<string, unknown>> = [];
     const dispatch = vi.fn(async () => ({ data: {} }));
     const github = integrationGithub(comments, runs, dispatch);
@@ -290,8 +294,8 @@ describe("restart-safe Integration dispatch", () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
   });
 
-  it("retries a persisted request after the grace period when dispatch never produced a run", async () => {
-    const comments: Array<{ body: string }> = [];
+  it("retries a persisted trusted request after the grace period when dispatch never produced a run", async () => {
+    const comments: ProtocolComment[] = [];
     const dispatch = vi.fn()
       .mockRejectedValueOnce(new Error("simulated dispatch failure"))
       .mockResolvedValue({ data: {} });
@@ -313,11 +317,48 @@ describe("restart-safe Integration dispatch", () => {
     expect(dispatch).toHaveBeenCalledTimes(2);
   });
 
-  it("treats a request-bound run as pending even when no commit-status marker exists", async () => {
+  it("ignores a forged matching Integration request even when it uses a far-future timestamp", async () => {
+    const current = snapshot();
+    const forged = createIntegrationRequest(current.identity, "2099-01-01T00:00:00.000Z");
+    const comments: ProtocolComment[] = [{ body: serializeIntegrationRequest(forged), user: USER }];
+    const dispatch = vi.fn(async () => ({ data: {} }));
+    const github = integrationGithub(comments, [], dispatch);
+
+    await dispatchIntegration(github, policy(), work(), Date.parse("2026-08-16T10:00:00.000Z"));
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(comments.filter((comment) => comment.user?.login === FUGUE_PROTOCOL_ACTOR)).toHaveLength(1);
+  });
+
+  it("does not let a manually triggered lookalike run suppress trusted Integration recovery", async () => {
     const current = snapshot();
     const createdAt = "2026-08-16T08:00:00.000Z";
     const request = createIntegrationRequest(current.identity, createdAt);
-    const comments = [{ body: serializeIntegrationRequest(request) }];
+    const comments: ProtocolComment[] = [{ body: serializeIntegrationRequest(request), user: BOT }];
+    const runs = [{
+      display_title: integrationRunTitle(request.request_id),
+      status: "in_progress",
+      conclusion: null,
+      html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/456",
+      actor: USER,
+    }];
+    const dispatch = vi.fn(async () => ({ data: {} }));
+    const github = integrationGithub(comments, runs, dispatch);
+
+    await dispatchIntegration(
+      github,
+      policy(),
+      work(),
+      Date.parse(createdAt) + INTEGRATION_REQUEST_RECOVERY_GRACE_MS + 1,
+    );
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a trusted request-bound run as pending even when no commit-status marker exists", async () => {
+    const current = snapshot();
+    const createdAt = "2026-08-16T08:00:00.000Z";
+    const request = createIntegrationRequest(current.identity, createdAt);
+    const comments: ProtocolComment[] = [{ body: serializeIntegrationRequest(request), user: BOT }];
     const runs = [{
       display_title: integrationRunTitle(request.request_id),
       status: "in_progress",
@@ -335,11 +376,11 @@ describe("restart-safe Integration dispatch", () => {
     expect(state.request?.request_id).toBe(request.request_id);
   });
 
-  it("makes an old durable request eligible for retry when no matching Actions run exists", async () => {
+  it("makes an old durable trusted request eligible for retry when no matching Actions run exists", async () => {
     const current = snapshot();
     const createdAt = "2026-08-16T08:00:00.000Z";
     const request = createIntegrationRequest(current.identity, createdAt);
-    const github = integrationGithub([{ body: serializeIntegrationRequest(request) }], [], vi.fn());
+    const github = integrationGithub([{ body: serializeIntegrationRequest(request), user: BOT }], [], vi.fn());
 
     const state = await currentIntegrationState(
       github,
@@ -386,8 +427,13 @@ describe("durable state comment", () => {
   });
 });
 
+interface ProtocolComment {
+  body: string;
+  user?: { login: string; type: string };
+}
+
 function integrationGithub(
-  comments: Array<{ body: string }>,
+  comments: ProtocolComment[],
   runs: Array<Record<string, unknown>>,
   dispatch: ReturnType<typeof vi.fn>,
 ): FugueGitHub {
@@ -399,12 +445,16 @@ function integrationGithub(
         issues: {
           listComments: vi.fn(),
           createComment: vi.fn(async (args: { body: string }) => {
-            comments.push({ body: args.body });
+            comments.push({ body: args.body, user: BOT });
             return { data: { html_url: "https://github.com/JohnnyZLi/Fugue/pull/21#issuecomment-1" } };
           }),
         },
         actions: {
-          listWorkflowRuns: vi.fn(async () => ({ data: { workflow_runs: runs } })),
+          listWorkflowRuns: vi.fn(async () => ({
+            data: {
+              workflow_runs: runs.map((run) => ({ actor: BOT, ...run })),
+            },
+          })),
           createWorkflowDispatch: dispatch,
         },
         repos: {
