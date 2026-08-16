@@ -1,5 +1,6 @@
 import { appendFile, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { captureEvaluation, sameEvaluationIdentity } from "../core/evaluation.js";
 import { discoverRepository } from "../core/git.js";
 import { IntegrationGateFailure } from "../core/gates.js";
 import { requireWritableGitHub } from "../core/github.js";
@@ -9,14 +10,17 @@ import {
   publishIntegrationFailure,
 } from "../core/integration.js";
 import {
+  assertValidationMatchesPlan,
   integrationValidationSchema,
   parseIntegrationPlan,
   parseIntegrationValidation,
 } from "../core/integration-plan.js";
+import { findCurrentIntegrationRequest } from "../core/integration-status.js";
 import { runValidation } from "../core/validation.js";
 
 export interface IntegrationPrepareOptions {
   out: string;
+  requestId: string;
   runtimeSha: string;
   githubOutput?: string;
 }
@@ -40,7 +44,25 @@ export async function runIntegrationPrepare(
   const prNumber = parsePositiveInteger(prValue, "PR");
   const repository = await discoverRepository();
   const github = await requireWritableGitHub(repository);
+
+  const requestedSnapshot = await captureEvaluation(github, prNumber);
+  const request = await findCurrentIntegrationRequest(github, requestedSnapshot);
+  if (!request || request.request_id !== options.requestId) {
+    throw new IntegrationGateFailure(
+      "request",
+      `Integration dispatch ${options.requestId} is not the current signed request for PR #${prNumber}.`,
+    );
+  }
+
   const prepared = await prepareIntegration(github, prNumber);
+  if (!sameEvaluationIdentity(request.identity, prepared.plan.identity)) {
+    const error = new IntegrationGateFailure(
+      "request",
+      "Integration evaluation identity changed after the signed dispatch request was accepted.",
+    );
+    await publishIntegrationFailure(github, prepared.plan.identity, error);
+    throw error;
+  }
 
   if (prepared.plan.identity.baseSha !== options.runtimeSha) {
     const error = new IntegrationGateFailure(
@@ -96,6 +118,7 @@ export async function runIntegrationFinalize(options: IntegrationFinalizeOptions
   const validation = parseIntegrationValidation(
     JSON.parse(await readFile(resolve(options.validation), "utf8")) as unknown,
   );
+  assertValidationMatchesPlan(plan, validation);
 
   try {
     const result = await finalizeIntegration(github, plan, validation);
