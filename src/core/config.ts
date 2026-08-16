@@ -22,6 +22,7 @@ export const fugueConfigSchema = z.object({
     install: stringArray,
     checks: stringArray,
     required_ci: stringArray,
+    required_ci_workflow: z.string().min(1).default(".github/workflows/ci.yml"),
     control_paths: stringArray,
   }),
   reviews: z.object({
