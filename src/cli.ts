@@ -110,6 +110,7 @@ const integrationRuntime = program
 integrationRuntime
   .command("prepare")
   .argument("<pr>", "GitHub pull request number")
+  .requiredOption("--request-id <id>", "Signed durable Fugue Integration request ID")
   .requiredOption("--out <path>", "Write the immutable Integration plan JSON")
   .requiredOption("--runtime-sha <sha>", "Protected-base commit containing the trusted Integration runtime")
   .option("--github-output <path>", "Append GitHub Actions job outputs")
