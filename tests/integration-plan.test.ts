@@ -64,13 +64,16 @@ describe("GitHub-hosted Integration plan", () => {
     expect(() => assertValidationMatchesPlan(value, tampered)).toThrow(/protected-base command plan/);
   });
 
-  it("keeps candidate validation credential-separated from trusted publication steps", async () => {
+  it("keeps candidate validation credential-separated and shell inputs quoted", async () => {
     const workflow = await readFile(".github/workflows/fugue-integration.yml", "utf8");
     expect(workflow).toContain("permissions:\n      contents: read");
     expect(workflow).toContain("persist-credentials: false");
     expect(workflow).toContain('GITHUB_TOKEN: ""');
     expect(workflow).toContain('GH_TOKEN: ""');
-    expect(workflow).toContain('--runtime-sha "${{ github.sha }}"');
+    expect(workflow).toContain("FUGUE_RUNTIME_SHA: ${{ github.sha }}");
+    expect(workflow).toContain('--runtime-sha "$FUGUE_RUNTIME_SHA"');
+    expect(workflow).toContain('integration-runtime prepare "$FUGUE_PR"');
+    expect(workflow).not.toContain('integration-runtime prepare "${{ inputs.pr }}"');
   });
 
   it("uses base-trusted PR reconciliation instead of candidate workflow execution", async () => {
