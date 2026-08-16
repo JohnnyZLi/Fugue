@@ -8,6 +8,15 @@ import { upsertStateComment } from "./state-comment.js";
 import { actionLabel, observeWork, planWork, type WorkflowAction } from "./workflow.js";
 import { claimWorker } from "./worker.js";
 import type { FugueGitHub } from "./github.js";
+import {
+  createIntegrationRequest,
+  parseIntegrationRequest,
+  serializeIntegrationRequest,
+} from "./integration-plan.js";
+import {
+  findIntegrationWorkflowRun,
+  INTEGRATION_REQUEST_RECOVERY_GRACE_MS,
+} from "./integration-status.js";
 
 export interface ReconcileOptions {
   issue?: number;
@@ -108,9 +117,9 @@ async function applyAction(
       return true;
 
     case "integrate":
-      await dispatchIntegration(github, policy.identity.baseBranch, work);
-      // A workflow dispatch is an external asynchronous boundary. End this pass instead of
-      // immediately reconstructing and risking a second dispatch before the queued status lands.
+      await dispatchIntegration(github, policy, work);
+      // Workflow dispatch is an external asynchronous boundary. The durable request written
+      // before dispatch makes subsequent reconciliation wait/recover rather than replay blindly.
       return false;
 
     case "wait_worker":
@@ -278,37 +287,75 @@ async function updatePrBranch(github: FugueGitHub, work: WorkState): Promise<voi
 
 export async function dispatchIntegration(
   github: FugueGitHub,
-  baseBranch: string,
+  policy: ActivePolicy,
   work: WorkState,
+  now = Date.now(),
 ): Promise<void> {
   const { owner, repo } = github.repository;
   const prNumber = requirePr(work);
   const headSha = work.pr?.headSha;
   if (!headSha) throw new Error(`Work #${work.issueNumber} has no PR head.`);
 
-  // Dispatch first. A crash before this call leaves no pending marker, so reconciliation can retry.
-  // A crash after it leaves a real Integration workflow that will publish its own in-progress status.
+  const request = createIntegrationRequest({
+    prNumber,
+    headSha,
+    baseBranch: policy.identity.baseBranch,
+    baseSha: policy.identity.baseSha,
+    policyDigest: policy.identity.policyDigest,
+    protocolVersion: policy.identity.protocolVersion,
+    issueNumber: work.issueNumber,
+    workId: work.metadata.work_id,
+    workSpecDigest: work.workSpecDigest,
+  });
+
+  const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
+    owner,
+    repo,
+    issue_number: prNumber,
+    per_page: 100,
+  });
+  let existing = comments
+    .map((comment) => {
+      try {
+        return parseIntegrationRequest(comment.body ?? "");
+      } catch {
+        return null;
+      }
+    })
+    .find((candidate) => candidate?.request_id === request.request_id);
+
+  let created = false;
+  if (!existing) {
+    await github.octokit.rest.issues.createComment({
+      owner,
+      repo,
+      issue_number: prNumber,
+      body: `INTEGRATION — REQUESTED\n\nHead: \`${headSha}\`\nRequest: \`${request.request_id}\`\n\n${serializeIntegrationRequest(request)}`,
+    });
+    existing = request;
+    created = true;
+  }
+
+  const run = await findIntegrationWorkflowRun(github, existing.request_id);
+  if (run) return;
+
+  if (!created) {
+    const createdAt = Date.parse(existing.created_at);
+    if (Number.isFinite(createdAt) && now - createdAt < INTEGRATION_REQUEST_RECOVERY_GRACE_MS) {
+      return;
+    }
+  }
+
   await github.octokit.rest.actions.createWorkflowDispatch({
     owner,
     repo,
     workflow_id: "fugue-integration.yml",
-    ref: baseBranch,
-    inputs: { pr: String(prNumber) },
+    ref: policy.identity.baseBranch,
+    inputs: {
+      pr: String(prNumber),
+      request_id: existing.request_id,
+    },
   });
-
-  try {
-    await github.octokit.rest.repos.createCommitStatus({
-      owner,
-      repo,
-      sha: headSha,
-      state: "pending",
-      context: "fugue/integration",
-      description: "Fugue Integration queued",
-    });
-  } catch {
-    // The dispatch is authoritative. The trusted prepare job publishes "in progress" shortly;
-    // failing this convenience marker must not convert a successful dispatch into a retry loop.
-  }
 }
 
 async function readBranchSha(github: FugueGitHub, branch: string): Promise<string | null> {
