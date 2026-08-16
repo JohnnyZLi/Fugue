@@ -44,7 +44,7 @@ describe("Fugue protocol provenance", () => {
     await expect(isTrustedProtocolComment(github, { user: BOT, body: "canonical-looking" })).resolves.toBe(false);
   });
 
-  it("accepts a content-bound proof minted by the protected control-plane workflow", () => {
+  it("accepts a content-bound proof minted by the trusted workflow on the default branch", () => {
     const body = "CODE QA — APPROVED";
     const audience = protocolAudience(REPOSITORY, body);
     const token = signToken({
@@ -53,14 +53,13 @@ describe("Fugue protocol provenance", () => {
       repository: REPOSITORY,
       workflow_ref: `${REPOSITORY}/.github/workflows/fugue-control-plane.yml@refs/heads/main`,
       workflow_sha: "a".repeat(40),
-      ref_protected: true,
       event_name: "issue_comment",
       iat: 1_000,
       nbf: 1_000,
       exp: 1_300,
     });
 
-    expect(verifyPublisherToken(token, audience, REPOSITORY, 1_100_000, jwks)).toBe(true);
+    expect(verifyPublisherToken(token, audience, REPOSITORY, "main", 1_100_000, jwks)).toBe(true);
   });
 
   it("rejects the same signed body when the workflow ref is candidate-controlled", () => {
@@ -70,16 +69,15 @@ describe("Fugue protocol provenance", () => {
       aud: audience,
       iss: FUGUE_OIDC_ISSUER,
       repository: REPOSITORY,
-      workflow_ref: `${REPOSITORY}/.github/workflows/fugue-control-plane.yml@refs/pull/19/merge`,
+      workflow_ref: `${REPOSITORY}/.github/workflows/fugue-control-plane.yml@refs/heads/agent/18-chat-first`,
       workflow_sha: "a".repeat(40),
-      ref_protected: false,
-      event_name: "pull_request",
+      event_name: "workflow_dispatch",
       iat: 1_000,
       nbf: 1_000,
       exp: 1_300,
     });
 
-    expect(verifyPublisherToken(token, audience, REPOSITORY, 1_100_000, jwks)).toBe(false);
+    expect(verifyPublisherToken(token, audience, REPOSITORY, "main", 1_100_000, jwks)).toBe(false);
   });
 
   it("rejects replay of a valid protected-workflow token onto different canonical content", () => {
@@ -91,7 +89,6 @@ describe("Fugue protocol provenance", () => {
       repository: REPOSITORY,
       workflow_ref: `${REPOSITORY}/.github/workflows/fugue-control-plane.yml@refs/heads/main`,
       workflow_sha: "a".repeat(40),
-      ref_protected: true,
       event_name: "issue_comment",
       iat: 1_000,
       exp: 1_300,
@@ -102,6 +99,7 @@ describe("Fugue protocol provenance", () => {
         token,
         protocolAudience(REPOSITORY, "CODE QA — CHANGES REQUESTED"),
         REPOSITORY,
+        "main",
         1_100_000,
         jwks,
       ),
