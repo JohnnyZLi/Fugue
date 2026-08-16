@@ -20,6 +20,27 @@ import { externalInstruction, renderStateComment } from "../src/core/state-comme
 import type { WorkState } from "../src/core/state.js";
 import { planWork, type WorkflowObservation } from "../src/core/workflow.js";
 
+vi.mock("../src/core/provenance.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/core/provenance.js")>();
+  return {
+    ...actual,
+    isTrustedProtocolComment: vi.fn(async (
+      _github: FugueGitHub,
+      comment: { user?: { login?: string | null } | null },
+    ) => comment.user?.login === "github-actions[bot]"),
+    createProtocolComment: vi.fn(async (github: FugueGitHub, issueNumber: number, body: string) => {
+      const { owner, repo } = github.repository;
+      const response = await github.octokit.rest.issues.createComment({
+        owner,
+        repo,
+        issue_number: issueNumber,
+        body,
+      });
+      return { data: { html_url: response.data.html_url } };
+    }),
+  };
+});
+
 const BOT = { login: FUGUE_PROTOCOL_ACTOR, type: "Bot" } as const;
 const USER = { login: "JohnnyZLi", type: "User" } as const;
 
@@ -261,7 +282,7 @@ describe("restart-safe Integration dispatch", () => {
     const request = parseIntegrationRequest(comments[0]?.body ?? "");
     expect(request).not.toBeNull();
     expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
-      inputs: { pr: "21", request_id: request?.request_id },
+      inputs: { pr: 21, request_id: request?.request_id },
     }));
 
     const createdAt = Date.parse(request!.created_at);
@@ -452,7 +473,12 @@ function integrationGithub(
         actions: {
           listWorkflowRuns: vi.fn(async () => ({
             data: {
-              workflow_runs: runs.map((run) => ({ actor: BOT, ...run })),
+              workflow_runs: runs.map((run) => ({
+                actor: BOT,
+                event: "workflow_dispatch",
+                head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ...run,
+              })),
             },
           })),
           createWorkflowDispatch: dispatch,
