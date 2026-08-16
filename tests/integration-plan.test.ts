@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   assertValidationMatchesPlan,
   integrationPlanSchema,
+  integrationRunTitle,
   integrationValidationSchema,
 } from "../src/core/integration-plan.js";
 
@@ -39,6 +40,11 @@ describe("GitHub-hosted Integration plan", () => {
     expect(value.validation.checks).toEqual(["npm test"]);
   });
 
+  it("binds workflow-run identity to both request ID and PR number", () => {
+    expect(integrationRunTitle("int-1234", 21)).toBe("Fugue Integration PR #21 int-1234");
+    expect(integrationRunTitle("int-1234", 22)).not.toBe(integrationRunTitle("int-1234", 21));
+  });
+
   it("rejects validation evidence for a different identity shape", () => {
     expect(() => integrationValidationSchema.parse({
       version: 1,
@@ -66,6 +72,7 @@ describe("GitHub-hosted Integration plan", () => {
 
   it("keeps candidate validation credential-separated and shell inputs quoted", async () => {
     const workflow = await readFile(".github/workflows/fugue-integration.yml", "utf8");
+    expect(workflow).toContain('run-name: "Fugue Integration PR #${{ inputs.pr }} ${{ inputs.request_id }}"');
     expect(workflow).toContain("permissions:\n      contents: read");
     expect(workflow).toContain("persist-credentials: false");
     expect(workflow).toContain('GITHUB_TOKEN: ""');
@@ -81,5 +88,18 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).toContain("pull_request_target:");
     expect(workflow).not.toContain("pull_request:\n");
     expect(workflow).toContain("ref: ${{ github.event.repository.default_branch }}");
+  });
+
+  it("keeps every security-critical identity, session, gate, state, and planner module under conditional Security QA", async () => {
+    const config = await readFile(".fugue/config.yml", "utf8");
+    for (const path of [
+      "src/core/workflow.ts",
+      "src/core/evaluation.ts",
+      "src/core/review-activity.ts",
+      "src/core/gates.ts",
+      "src/core/state.ts",
+    ]) {
+      expect(config).toContain(`- "${path}"`);
+    }
   });
 });

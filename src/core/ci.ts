@@ -15,6 +15,10 @@ interface RequiredCiObservation {
   detail: string;
 }
 
+export function requiredCiRunTitle(prNumber: number, headSha: string): string {
+  return `CI PR #${prNumber} @ ${headSha}`;
+}
+
 export async function currentRequiredCiState(
   github: FugueGitHub,
   headSha: string,
@@ -59,22 +63,12 @@ async function observeTrustedRequiredCi(
   workflowId: string,
 ): Promise<Map<string, RequiredCiObservation>> {
   const { owner, repo } = github.repository;
-  const [runs, associatedPulls] = await Promise.all([
-    github.octokit.rest.actions.listWorkflowRuns({
-      owner,
-      repo,
-      workflow_id: workflowId,
-      event: "pull_request",
-      head_sha: headSha,
-      per_page: 100,
-    }),
-    github.octokit.rest.repos.listPullRequestsAssociatedWithCommit({
-      owner,
-      repo,
-      commit_sha: headSha,
-      per_page: 100,
-    }),
-  ]);
+  const associatedPulls = await github.octokit.rest.repos.listPullRequestsAssociatedWithCommit({
+    owner,
+    repo,
+    commit_sha: headSha,
+    per_page: 100,
+  });
 
   const pulls = associatedPulls.data.filter((pull) => pull.head.sha === headSha && pull.state === "open");
   if (pulls.length !== 1) {
@@ -84,21 +78,33 @@ async function observeTrustedRequiredCi(
       `expected one open PR for exact head, found ${pulls.length}`,
     );
   }
-  const baseSha = pulls[0]!.base.sha;
-  if (!(await sameRepositoryFileBlob(github, workflowId, headSha, baseSha))) {
-    return observationsFor(
-      requiredNames,
-      "error",
-      `candidate ${workflowId} differs from protected base ${baseSha.slice(0, 8)}`,
-    );
-  }
 
+  const pull = pulls[0]!;
+  const baseSha = pull.base.sha;
+  const runs = await github.octokit.rest.actions.listWorkflowRuns({
+    owner,
+    repo,
+    workflow_id: workflowId,
+    event: "pull_request_target",
+    head_sha: baseSha,
+    per_page: 100,
+  });
+
+  const expectedTitle = requiredCiRunTitle(pull.number, headSha);
   const run = runs.data.workflow_runs
-    .filter((candidate) => candidate.event === "pull_request" && candidate.head_sha === headSha)
+    .filter((candidate) =>
+      candidate.event === "pull_request_target" &&
+      candidate.head_sha === baseSha &&
+      candidate.display_title === expectedTitle,
+    )
     .sort((a, b) => b.id - a.id)[0];
 
   if (!run) {
-    return observationsFor(requiredNames, "missing", "trusted workflow run not found");
+    return observationsFor(
+      requiredNames,
+      "missing",
+      `protected pull_request_target run '${expectedTitle}' not found`,
+    );
   }
   if (run.status !== "completed") {
     return observationsFor(requiredNames, "pending", `workflow=${run.status}`);
@@ -138,26 +144,6 @@ async function observeTrustedRequiredCi(
     });
   }
   return result;
-}
-
-async function sameRepositoryFileBlob(
-  github: FugueGitHub,
-  path: string,
-  headSha: string,
-  baseSha: string,
-): Promise<boolean> {
-  const { owner, repo } = github.repository;
-  try {
-    const [head, base] = await Promise.all([
-      github.octokit.rest.repos.getContent({ owner, repo, path, ref: headSha }),
-      github.octokit.rest.repos.getContent({ owner, repo, path, ref: baseSha }),
-    ]);
-    if (Array.isArray(head.data) || Array.isArray(base.data)) return false;
-    if (head.data.type !== "file" || base.data.type !== "file") return false;
-    return head.data.sha === base.data.sha;
-  } catch {
-    return false;
-  }
 }
 
 function observationsFor(

@@ -21,18 +21,27 @@ import { completeReview, currentReviewActivities, type CompleteReviewOptions } f
 const REVIEW_START = "<!-- fugue-review-submit";
 const HUMAN_START = "<!-- fugue-human-submit";
 const REJECTION_START = "<!-- fugue-submission-rejection";
+const RESERVED_PROTOCOL_START = "<!-- fugue-";
 const END = "-->";
+
+const untrustedSubmissionText = z.string().refine(
+  (value) => !value.includes(RESERVED_PROTOCOL_START),
+  "Submission text contains a reserved Fugue protocol marker.",
+);
 
 const qaSubmissionSchema = z.object({
   version: z.literal(1),
-  session_id: z.string().min(1),
+  session_id: z.string()
+    .min(1)
+    .max(128)
+    .regex(/^rev-(?:code|security|visual)-[A-Za-z0-9]+$/, "Invalid Fugue review session ID."),
   role: z.enum(["code", "security", "visual"]),
   verdict: z.enum(["approved", "changes_requested", "error"]),
   agents_update: z.enum(["not-required", "present", "missing"]).optional(),
   validation_control: z.enum(["acceptable", "unacceptable"]).optional(),
   runtime_tested: z.boolean().optional(),
-  viewports: z.array(z.string()).optional(),
-  summary: z.string().optional(),
+  viewports: z.array(untrustedSubmissionText).optional(),
+  summary: untrustedSubmissionText.optional(),
 });
 
 const humanSubmissionSchema = z.object({
@@ -317,7 +326,7 @@ async function rejectSubmissions(
   await createProtocolComment(
     github,
     prNumber,
-    `FUGUE SUBMISSION — REJECTED\n\n${reason}\n\n${marker}`,
+    `FUGUE SUBMISSION — REJECTED\n\n${safeRejectionReason(reason)}\n\n${marker}`,
   );
 }
 
@@ -344,6 +353,10 @@ function parseMarked<T>(body: string, startMarker: string, schema: z.ZodType<T>)
   if (end < 0) throw new Error(`Unterminated ${startMarker.slice(5)} block.`);
   const raw = parseYaml(body.slice(start + startMarker.length, end).trim()) as unknown;
   return schema.parse(raw);
+}
+
+function safeRejectionReason(reason: string): string {
+  return reason.replaceAll(RESERVED_PROTOCOL_START, "&lt;!-- fugue-");
 }
 
 function roleHeading(role: QaRole): string {

@@ -78,8 +78,8 @@ export function parseIntegrationRequest(body: string): IntegrationRequest | null
   return integrationRequestSchema.parse(raw);
 }
 
-export function integrationRunTitle(requestId: string): string {
-  return `Fugue Integration ${requestId}`;
+export function integrationRunTitle(requestId: string, prNumber: number): string {
+  return `Fugue Integration PR #${prNumber} ${requestId}`;
 }
 
 export function parseIntegrationPlan(value: unknown): IntegrationPlan {

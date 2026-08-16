@@ -80,7 +80,7 @@ commit statuses
     fugue/integration
 ```
 
-Canonical durable Fugue comments are content-bound to an approved Fugue workflow on the repository default branch using GitHub Actions OIDC publisher proof. The shared `github-actions[bot]` login or a matching status context is not authority by itself.
+Canonical durable Fugue comments have one structural Fugue protocol marker and are content-bound using GitHub Actions OIDC proof to an approved Fugue workflow on the repository default branch at the **current protected default-branch revision**. The shared `github-actions[bot]` login, a historical workflow revision, or a matching status context is not authority by itself.
 
 Candidate control-plane changes are proposed future policy. They do not weaken the protected-base rules or workflow code used to evaluate their own PR.
 
@@ -102,7 +102,7 @@ It automatically handles:
 - GitHub-hosted Integration dispatch;
 - one durable issue state comment containing the current next action and copy/paste prompt.
 
-The PR event uses `pull_request_target` so control-plane code and write authority come from the protected base instead of the candidate PR. Canonical comments additionally carry an OIDC proof whose audience binds the exact comment body and whose `workflow_ref` binds the approved workflow path on the repository default branch.
+The PR event uses `pull_request_target` so control-plane code and write authority come from the protected base instead of the candidate PR. Canonical comments additionally carry an OIDC proof whose audience binds the exact comment body, whose `workflow_ref` binds the approved workflow path on the repository default branch, and whose `workflow_sha` must equal the current protected default-branch revision.
 
 ## Worker chats
 
@@ -155,7 +155,7 @@ viewports:
   - 390x844
 ```
 
-The submission does **not** carry canonical head/base/policy identity. Protected Fugue automation finds the current review session, reconstructs the exact evaluation identity, validates role-specific evidence, verifies the submitting actor has repository write/maintain/admin permission, and writes the canonical signed attestation/status. Malformed, stale, unauthorized, or conflicting submissions are durably rejected rather than silently reused.
+The submission does **not** carry canonical head/base/policy identity. Protected Fugue automation finds the current review session, reconstructs the exact evaluation identity, validates role-specific evidence, verifies the submitting actor has repository write/maintain/admin permission, and writes the canonical signed attestation/status. Untrusted submission fields cannot contain Fugue protocol markers, and canonical publication refuses bodies with more than one protocol marker, so a rejection path cannot become a signing oracle. Malformed, stale, unauthorized, or conflicting submissions are durably rejected rather than silently reused.
 
 ## Changes requested
 
@@ -190,7 +190,7 @@ No terminal command is required in normal operation.
 
 ## Required CI provenance
 
-Required CI is not accepted merely because a check or status has the configured name. Fugue identifies the exact-head PR, verifies the configured CI workflow file on the candidate is byte-for-byte the same Git blob as the protected-base workflow, then inspects the workflow run and required jobs for that exact head. A candidate-modified lookalike workflow or arbitrary status/check cannot satisfy the internal Fugue CI gate.
+Required CI is executed by the configured workflow from the protected base using `pull_request_target`, not by candidate-controlled PR workflow code. The protected workflow checks out the exact candidate head with only `contents: read`, no persisted checkout credential, and blank `GITHUB_TOKEN` / `GH_TOKEN` for candidate commands. Fugue accepts the required job only from the protected-base workflow run whose durable run name binds both the exact PR number and candidate head SHA. A candidate workflow file, arbitrary lookalike check/status, or run for another PR/head cannot satisfy the internal Fugue CI gate or gain a pre-gate write-capable durable-state path.
 
 ## GitHub-hosted Integration
 
@@ -224,7 +224,7 @@ FINALIZE (write-capable trusted Fugue)
 
 The candidate is never used as the source of the workflow code that judges it, and candidate validation does not receive Fugue publication authority.
 
-Authoritative Integration state is reconstructed from the signed exact-identity Integration request, its matching protected workflow run, and the signed Integration attestation. `fugue/integration` remains the GitHub branch-protection/UI signal, but the shared Actions status context is not treated as durable Fugue truth by itself.
+Authoritative Integration state is reconstructed from the signed exact-identity Integration request, its matching protected workflow run bound to both `request_id` and the expected PR input, and the signed Integration attestation. `fugue/integration` remains the GitHub branch-protection/UI signal, but the shared Actions status context is not treated as durable Fugue truth by itself.
 
 ## Repository bootstrap
 

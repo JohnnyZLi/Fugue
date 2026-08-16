@@ -5,6 +5,7 @@ export const FUGUE_PROTOCOL_ACTOR = "github-actions[bot]";
 export const FUGUE_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
 export const FUGUE_OIDC_JWKS_URL = `${FUGUE_OIDC_ISSUER}/.well-known/jwks`;
 
+const PROTOCOL_MARKER_PREFIX = "<!-- fugue-";
 const PROOF_START = "<!-- fugue-publisher-proof";
 const PROOF_END = "-->";
 const CLOCK_SKEW_SECONDS = 60;
@@ -15,7 +16,7 @@ const TRUSTED_WORKFLOWS = new Map<string, ReadonlySet<string>>([
   ],
   [".github/workflows/fugue-integration.yml", new Set(["workflow_dispatch"])],
 ]);
-const defaultBranchCache = new Map<string, string>();
+const defaultBranchCache = new Map<string, { branch: string; sha: string }>();
 
 export interface GitHubActorLike {
   login?: string | null;
@@ -92,6 +93,19 @@ export function isTrustedProtocolCommitStatus(status: GitHubCommitStatusLike): b
   return isTrustedProtocolActor(status.creator);
 }
 
+/**
+ * Canonical publication has exactly one Fugue protocol marker before the publisher proof is
+ * attached. This keeps untrusted prose/YAML fields from smuggling a second parseable marker into
+ * a body that protected Actions would otherwise sign as a whole.
+ */
+export function hasCanonicalProtocolBoundary(body: string): boolean {
+  const start = body.indexOf(PROTOCOL_MARKER_PREFIX);
+  if (start < 0) return false;
+  if (body.indexOf(PROTOCOL_MARKER_PREFIX, start + PROTOCOL_MARKER_PREFIX.length) >= 0) return false;
+  if (body.startsWith(PROOF_START, start)) return false;
+  return body.indexOf(PROOF_END, start + PROTOCOL_MARKER_PREFIX.length) >= 0;
+}
+
 export async function isTrustedProtocolComment(
   github: FugueGitHub,
   comment: GitHubCommentLike,
@@ -102,20 +116,22 @@ export async function isTrustedProtocolComment(
   if (!proof) return false;
 
   const canonicalBody = stripProtocolPublisherProof(body);
+  if (!hasCanonicalProtocolBoundary(canonicalBody)) return false;
   const audience = protocolAudience(github.repository.fullName, canonicalBody);
   const timestamp = Date.parse(comment.updated_at ?? comment.created_at ?? "");
   if (!Number.isFinite(timestamp)) return false;
 
   try {
-    const [jwks, branch] = await Promise.all([
+    const [jwks, protectedBase] = await Promise.all([
       loadGitHubOidcJwks(),
-      repositoryDefaultBranch(github),
+      repositoryDefaultBranchIdentity(github),
     ]);
     return verifyPublisherToken(
       proof,
       audience,
       github.repository.fullName,
-      branch,
+      protectedBase.branch,
+      protectedBase.sha,
       timestamp,
       jwks,
     );
@@ -175,6 +191,7 @@ export function verifyPublisherToken(
   expectedAudience: string,
   repository: string,
   defaultBranch: string,
+  protectedWorkflowSha: string,
   commentTimestampMs: number,
   jwks: JwkSet,
 ): boolean {
@@ -208,6 +225,8 @@ export function verifyPublisherToken(
   if (!audienceContains(claims.aud, expectedAudience)) return false;
   if (claims.repository !== repository) return false;
   if (!claims.workflow_sha || !/^[0-9a-f]{40}$/i.test(claims.workflow_sha)) return false;
+  if (!/^[0-9a-f]{40}$/i.test(protectedWorkflowSha)) return false;
+  if (claims.workflow_sha.toLowerCase() !== protectedWorkflowSha.toLowerCase()) return false;
 
   const workflow = trustedWorkflowPath(repository, claims.workflow_ref, defaultBranch);
   if (!workflow) return false;
@@ -227,6 +246,9 @@ export function verifyPublisherToken(
 async function attachPublisherProof(repository: string, body: string): Promise<string> {
   if (body.includes(PROOF_START)) {
     throw new Error("Canonical Fugue comment body contains a reserved publisher-proof marker.");
+  }
+  if (!hasCanonicalProtocolBoundary(body)) {
+    throw new Error("Canonical Fugue comment body must contain exactly one Fugue protocol marker block.");
   }
   const token = await requestGitHubOidcToken(protocolAudience(repository, body));
   return `${body}\n\n${PROOF_START}\nversion: 1\ntoken: ${token}\n${PROOF_END}`;
@@ -266,7 +288,9 @@ async function loadGitHubOidcJwks(): Promise<JwkSet> {
   return jwks;
 }
 
-async function repositoryDefaultBranch(github: FugueGitHub): Promise<string> {
+async function repositoryDefaultBranchIdentity(
+  github: FugueGitHub,
+): Promise<{ branch: string; sha: string }> {
   const key = github.repository.fullName;
   const cached = defaultBranchCache.get(key);
   if (cached) return cached;
@@ -274,8 +298,12 @@ async function repositoryDefaultBranch(github: FugueGitHub): Promise<string> {
   const response = await github.octokit.rest.repos.get({ owner, repo });
   const branch = response.data.default_branch;
   if (!branch) throw new Error(`Repository ${key} has no default branch.`);
-  defaultBranchCache.set(key, branch);
-  return branch;
+  const ref = await github.octokit.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+  const sha = ref.data.object.sha;
+  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error(`Repository ${key} default branch has an invalid head SHA.`);
+  const identity = { branch, sha };
+  defaultBranchCache.set(key, identity);
+  return identity;
 }
 
 function parsePublisherProof(body: string): string | null {

@@ -1,5 +1,5 @@
 name: Fugue Integration
-run-name: Fugue Integration ${{ inputs.request_id }}
+run-name: "Fugue Integration PR #${{ inputs.pr }} ${{ inputs.request_id }}"
 
 on:
   workflow_dispatch:

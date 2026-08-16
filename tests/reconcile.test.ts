@@ -290,7 +290,7 @@ describe("restart-safe Integration dispatch", () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
   });
 
-  it("does not replay after the grace period when the trusted request-bound Actions run exists", async () => {
+  it("does not replay after the grace period when the trusted request-and-PR-bound Actions run exists", async () => {
     const comments: ProtocolComment[] = [];
     const runs: Array<Record<string, unknown>> = [];
     const dispatch = vi.fn(async () => ({ data: {} }));
@@ -300,7 +300,7 @@ describe("restart-safe Integration dispatch", () => {
     await dispatchIntegration(github, activePolicy, work());
     const request = parseIntegrationRequest(comments[0]?.body ?? "")!;
     runs.push({
-      display_title: integrationRunTitle(request.request_id),
+      display_title: integrationRunTitle(request.request_id, 21),
       status: "in_progress",
       conclusion: null,
       html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/123",
@@ -357,7 +357,7 @@ describe("restart-safe Integration dispatch", () => {
     const request = createIntegrationRequest(current.identity, createdAt);
     const comments: ProtocolComment[] = [{ body: serializeIntegrationRequest(request), user: BOT }];
     const runs = [{
-      display_title: integrationRunTitle(request.request_id),
+      display_title: integrationRunTitle(request.request_id, 21),
       status: "in_progress",
       conclusion: null,
       html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/456",
@@ -375,13 +375,36 @@ describe("restart-safe Integration dispatch", () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
   });
 
-  it("treats a trusted request-bound run as pending even when no commit-status marker exists", async () => {
+  it("does not let a same-request run for another PR suppress trusted Integration recovery", async () => {
     const current = snapshot();
     const createdAt = "2026-08-16T08:00:00.000Z";
     const request = createIntegrationRequest(current.identity, createdAt);
     const comments: ProtocolComment[] = [{ body: serializeIntegrationRequest(request), user: BOT }];
     const runs = [{
-      display_title: integrationRunTitle(request.request_id),
+      display_title: integrationRunTitle(request.request_id, 999),
+      status: "completed",
+      conclusion: "failure",
+      html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/forged-pr",
+    }];
+    const dispatch = vi.fn(async () => ({ data: {} }));
+    const github = integrationGithub(comments, runs, dispatch);
+
+    await dispatchIntegration(
+      github,
+      policy(),
+      work(),
+      Date.parse(createdAt) + INTEGRATION_REQUEST_RECOVERY_GRACE_MS + 1,
+    );
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a trusted request-and-PR-bound run as pending even when no commit-status marker exists", async () => {
+    const current = snapshot();
+    const createdAt = "2026-08-16T08:00:00.000Z";
+    const request = createIntegrationRequest(current.identity, createdAt);
+    const comments: ProtocolComment[] = [{ body: serializeIntegrationRequest(request), user: BOT }];
+    const runs = [{
+      display_title: integrationRunTitle(request.request_id, 21),
       status: "in_progress",
       conclusion: null,
       html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/456",

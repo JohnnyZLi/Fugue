@@ -134,7 +134,7 @@ export async function findIntegrationWorkflowRun(
     isTrustedProtocolWorkflowRun(run) &&
     run.event === "workflow_dispatch" &&
     run.head_sha === request.identity.baseSha &&
-    run.display_title === integrationRunTitle(request.request_id),
+    run.display_title === integrationRunTitle(request.request_id, request.identity.prNumber),
   );
   if (!match) return undefined;
   return {
