@@ -17,6 +17,7 @@ import {
   findIntegrationWorkflowRun,
   INTEGRATION_REQUEST_RECOVERY_GRACE_MS,
 } from "./integration-status.js";
+import { isTrustedProtocolComment } from "./provenance.js";
 
 export interface ReconcileOptions {
   issue?: number;
@@ -315,6 +316,7 @@ export async function dispatchIntegration(
     per_page: 100,
   });
   let existing = comments
+    .filter(isTrustedProtocolComment)
     .map((comment) => {
       try {
         return parseIntegrationRequest(comment.body ?? "");
