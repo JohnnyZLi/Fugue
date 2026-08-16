@@ -18,18 +18,11 @@ interface RequiredCiObservation {
 export async function currentRequiredCiState(
   github: FugueGitHub,
   headSha: string,
-  baseSha: string,
   requiredNames: readonly string[],
   workflowId = DEFAULT_REQUIRED_CI_WORKFLOW,
 ): Promise<RequiredCiState> {
   if (!requiredNames.length) return "success";
-  const observations = await observeTrustedRequiredCi(
-    github,
-    headSha,
-    baseSha,
-    requiredNames,
-    workflowId,
-  );
+  const observations = await observeTrustedRequiredCi(github, headSha, requiredNames, workflowId);
   const states = [...observations.values()].map((item) => item.state);
   if (states.includes("error")) return "error";
   if (states.includes("failure")) return "failure";
@@ -41,18 +34,11 @@ export async function currentRequiredCiState(
 export async function verifyRequiredCi(
   github: FugueGitHub,
   headSha: string,
-  baseSha: string,
   requiredNames: readonly string[],
   workflowId = DEFAULT_REQUIRED_CI_WORKFLOW,
 ): Promise<CiVerification> {
   if (!requiredNames.length) return { passed: true, checks: [] };
-  const observations = await observeTrustedRequiredCi(
-    github,
-    headSha,
-    baseSha,
-    requiredNames,
-    workflowId,
-  );
+  const observations = await observeTrustedRequiredCi(github, headSha, requiredNames, workflowId);
 
   for (const name of requiredNames) {
     const observed = observations.get(name);
@@ -69,13 +55,37 @@ export async function verifyRequiredCi(
 async function observeTrustedRequiredCi(
   github: FugueGitHub,
   headSha: string,
-  baseSha: string,
   requiredNames: readonly string[],
   workflowId: string,
 ): Promise<Map<string, RequiredCiObservation>> {
   const { owner, repo } = github.repository;
-  const workflowMatchesBase = await sameRepositoryFileBlob(github, workflowId, headSha, baseSha);
-  if (!workflowMatchesBase) {
+  const [runs, associatedPulls] = await Promise.all([
+    github.octokit.rest.actions.listWorkflowRuns({
+      owner,
+      repo,
+      workflow_id: workflowId,
+      event: "pull_request",
+      head_sha: headSha,
+      per_page: 100,
+    }),
+    github.octokit.rest.repos.listPullRequestsAssociatedWithCommit({
+      owner,
+      repo,
+      commit_sha: headSha,
+      per_page: 100,
+    }),
+  ]);
+
+  const pulls = associatedPulls.data.filter((pull) => pull.head.sha === headSha && pull.state === "open");
+  if (pulls.length !== 1) {
+    return observationsFor(
+      requiredNames,
+      "error",
+      `expected one open PR for exact head, found ${pulls.length}`,
+    );
+  }
+  const baseSha = pulls[0]!.base.sha;
+  if (!(await sameRepositoryFileBlob(github, workflowId, headSha, baseSha))) {
     return observationsFor(
       requiredNames,
       "error",
@@ -83,14 +93,6 @@ async function observeTrustedRequiredCi(
     );
   }
 
-  const runs = await github.octokit.rest.actions.listWorkflowRuns({
-    owner,
-    repo,
-    workflow_id: workflowId,
-    event: "pull_request",
-    head_sha: headSha,
-    per_page: 100,
-  });
   const run = runs.data.workflow_runs
     .filter((candidate) => candidate.event === "pull_request" && candidate.head_sha === headSha)
     .sort((a, b) => b.id - a.id)[0];
