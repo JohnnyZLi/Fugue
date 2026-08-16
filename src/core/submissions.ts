@@ -11,6 +11,7 @@ import {
 import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
 import type { FugueGitHub } from "./github.js";
 import { FUGUE_CLI_VERSION, type EvaluationIdentity } from "./protocol.js";
+import { isTrustedProtocolComment, type GitHubCommentLike } from "./provenance.js";
 import { completeReview, currentReviewActivities, type CompleteReviewOptions } from "./reviews.js";
 
 const REVIEW_START = "<!-- fugue-review-submit";
@@ -50,6 +51,10 @@ interface SubmissionInput<T> {
   commentId: number;
 }
 
+interface SubmissionComment extends GitHubCommentLike {
+  body?: string | null;
+}
+
 export interface SubmissionProcessingResult {
   accepted: number;
   blockedReason?: string;
@@ -85,7 +90,7 @@ export async function processCurrentSubmissions(
     per_page: 100,
   });
 
-  const rejectedIds = rejectedSubmissionIds(comments.map((comment) => comment.body ?? ""));
+  const rejectedIds = rejectedSubmissionIds(comments);
   const qaInputs: Array<SubmissionInput<QaSubmission>> = [];
   const humanInputs: Array<SubmissionInput<HumanSubmission>> = [];
 
@@ -270,6 +275,7 @@ export async function hasCurrentHumanAcknowledgement(
   });
 
   for (const comment of comments) {
+    if (!isTrustedProtocolComment(comment)) continue;
     try {
       const value = parseAttestation(comment.body ?? "");
       if (value?.kind !== "human_control_plane") continue;
@@ -281,11 +287,12 @@ export async function hasCurrentHumanAcknowledgement(
   return false;
 }
 
-function rejectedSubmissionIds(bodies: string[]): Set<number> {
+function rejectedSubmissionIds(comments: SubmissionComment[]): Set<number> {
   const ids = new Set<number>();
-  for (const body of bodies) {
+  for (const comment of comments) {
+    if (!isTrustedProtocolComment(comment)) continue;
     try {
-      const rejection = parseMarked(body, REJECTION_START, submissionRejectionSchema);
+      const rejection = parseMarked(comment.body ?? "", REJECTION_START, submissionRejectionSchema);
       for (const id of rejection?.comment_ids ?? []) ids.add(id);
     } catch {
       // Invalid rejection-looking text is not protocol state.
