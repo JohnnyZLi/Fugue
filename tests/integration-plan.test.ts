@@ -11,7 +11,7 @@ import {
   integrationValidationSchema,
 } from "../src/core/integration-plan.js";
 
-const CURRENT_WORK_SPEC_DIGEST = "sha256:ffbb7fc23856746dd7bbf0b0e7b960293a17fb54403b09f8c6f1eaa6d767d177";
+const CURRENT_WORK_SPEC_DIGEST = "sha256:a808b8ae2dbf920771f978dfb3c747d7372b24bf516e3d4d92b0d26afa55a15a";
 
 const identity = {
   prNumber: 21,
@@ -121,6 +121,11 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).toContain('GITHUB_TOKEN: ""');
     expect(workflow).toContain('GH_TOKEN: ""');
     expect(workflow).toContain("FUGUE_RUNTIME_SHA: ${{ github.sha }}");
+    expect(workflow).toContain("dispatch_secret:");
+    expect(workflow).toContain("Commit protected Integration run-start evidence");
+    expect(workflow).toContain("fugue/integration/${digest}");
+    expect(workflow).toContain("ACTIONS_ID_TOKEN_REQUEST_URL");
+    expect(workflow.indexOf("Commit protected Integration run-start evidence")).toBeLessThan(workflow.indexOf("actions/checkout@v4"));
     expect(workflow).toContain('--runtime-sha "$FUGUE_RUNTIME_SHA"');
     expect(workflow).not.toContain('integration-runtime prepare "${{ inputs.pr }}"');
   });
@@ -139,6 +144,8 @@ describe("GitHub-hosted Integration plan", () => {
     const config = await readFile(".fugue/config.yml", "utf8");
     for (const path of [
       "src/cli.ts",
+      "src/commands/advance.ts",
+      "src/commands/run.ts",
       "src/core/validation.ts",
       "src/core/git.ts",
       "src/core/config.ts",
@@ -156,6 +163,8 @@ describe("GitHub-hosted Integration plan", () => {
     const config = parseConfig(raw);
     for (const path of [
       "src/cli.ts",
+      "src/commands/advance.ts",
+      "src/commands/run.ts",
       "src/core/validation.ts",
       "src/core/config.ts",
       "src/core/ownership.ts",
@@ -171,5 +180,11 @@ describe("GitHub-hosted Integration plan", () => {
       expect(resolution.controlPlaneChanged, path).toBe(true);
       expect(resolution.required.some((item) => item.role === "security"), path).toBe(true);
     }
+  });
+
+  it("does not use filtered workflow-run search as Integration binding authority", async () => {
+    const source = await readFile("src/core/integration-status.ts", "utf8");
+    expect(source).not.toContain("listWorkflowRuns");
+    expect(source).toContain("getIntegrationRunStartEvidence");
   });
 });

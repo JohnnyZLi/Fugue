@@ -9,13 +9,17 @@ import {
   type IntegrationRecord,
 } from "../src/core/integration-plan.js";
 import {
+  authorizeIntegrationDispatch,
   bindIntegrationRun,
   currentIntegrationState,
   ensureIntegrationDispatch,
-  findIntegrationWorkflowRun,
   getCurrentIntegrationRecord,
+  getIntegrationRunStartEvidence,
+  integrationEvidenceRefName,
+  integrationRunStartSchema,
   publishIntegrationRecord,
   sealIntegrationWorkflowRunEvent,
+  serializeIntegrationRunStartEvidence,
 } from "../src/core/integration-status.js";
 import { upsertWorkMetadata, workMetadataSchema } from "../src/core/metadata.js";
 import type { ActivePolicy } from "../src/core/policy.js";
@@ -59,6 +63,9 @@ vi.mock("../src/core/provenance.js", async (importOriginal) => {
       expected: string,
     ) => {
       if (((github as TestGithub).__publisherSha ?? expected) !== expected) return false;
+      if (body.includes("<!-- fugue-durable-recovery") ||
+          body.includes("<!-- fugue-integration-dispatch-anchor") ||
+          body.includes("<!-- fugue-integration-run-start")) return body.includes("token: test-proof");
       const key = body.match(/Fugue-Authority-Key: ([0-9a-f]{32})/i)?.[1];
       const commit = body.match(/Fugue-Authority-Commit: ([0-9a-f]{32})/i)?.[1];
       return Boolean(key && commit && !/^0+$/.test(key) && !/^0+$/.test(commit));
@@ -85,7 +92,7 @@ vi.mock("../src/core/provenance.js", async (importOriginal) => {
 const BOT = { login: FUGUE_PROTOCOL_ACTOR, type: "Bot" } as const;
 const BASE = "b".repeat(40);
 const HEAD = "a".repeat(40);
-const CURRENT_WORK_SPEC_DIGEST = "sha256:ffbb7fc23856746dd7bbf0b0e7b960293a17fb54403b09f8c6f1eaa6d767d177";
+const CURRENT_WORK_SPEC_DIGEST = "sha256:a808b8ae2dbf920771f978dfb3c747d7372b24bf516e3d4d92b0d26afa55a15a";
 
 function workMetadata(execution = true) {
   return workMetadataSchema.parse({
@@ -223,8 +230,9 @@ describe("d3 protected durable authority", () => {
     expect(first.exhausted).toBe(false);
     expect(github.__listStatus).toHaveBeenCalledTimes(2);
     expect(vi.mocked(verifyDurableManifestProof)).toHaveBeenCalledTimes(8);
-    expect(vi.mocked(verifyProtocolPublicationBodyAtRevision)).not.toHaveBeenCalled();
-    expect(github.__comments.some((comment) => comment.body.includes("fugue-durable-recovery"))).toBe(true);
+    expect(vi.mocked(verifyProtocolPublicationBodyAtRevision)).toHaveBeenCalledTimes(1);
+    expect([...github.__refs.keys()].some((ref) => ref.startsWith("fugue/recovery/"))).toBe(true);
+    expect(github.__comments.some((comment) => comment.body.includes("fugue-durable-recovery"))).toBe(false);
   });
 
   it("recovers the newest committed state after all ordinary state comments are destroyed", async () => {
@@ -260,6 +268,7 @@ describe("d3 protected durable authority", () => {
         parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
       });
       if (!recovered.record) {
+        github.__comments.splice(0);
         for (let index = 0; index < 300; index += 1) {
           github.__statuses.push({ id: ++github.__nextStatusId, sha: BASE, context: `continuous/${attempt}/${index}`, description: "new-noise" });
         }
@@ -267,6 +276,7 @@ describe("d3 protected durable authority", () => {
     }
     expect(recovered?.record).toBeDefined();
     expect(canonicalRequirements(recovered!.record!.value)).toBe("older-valid-authority");
+    expect([...github.__refs.keys()].some((ref) => ref.startsWith("fugue/recovery/"))).toBe(true);
   });
 
   it("treats replayed work locator comments as hints and repairs them from newer d3 authority", async () => {
@@ -337,22 +347,44 @@ describe("Coordinator event durability", () => {
     expect(work?.title).toBe("New title");
     expect(canonicalRequirements(work!)).toContain("new Human edit");
   });
+
+
+  it("totally orders distinct authorized edits that share issue.updated_at and action", async () => {
+    const github = makeGithub();
+    const oldBody = upsertWorkMetadata("## Outcome\nsame-second older", workMetadata(false));
+    const newBody = upsertWorkMetadata("## Outcome\nsame-second newer", workMetadata(false));
+    const updatedAt = "2026-08-17T03:07:00.000Z";
+    await preserveCoordinatorIssueEvent(github, policy(), {
+      eventName: "issues", action: "edited", actor: "JohnnyZLi", eventId: "run-701:new", eventSequence: 701,
+      issueNumber: 18, issueTitle: "Newer same-second title", issueBody: newBody,
+      issueLabels: ["state:working", "agent:ready"], issueUpdatedAt: updatedAt, issueIsPullRequest: false,
+    });
+    await preserveCoordinatorIssueEvent(github, policy(), {
+      eventName: "issues", action: "edited", actor: "JohnnyZLi", eventId: "run-700:old", eventSequence: 700,
+      issueNumber: 18, issueTitle: "Older same-second title", issueBody: oldBody,
+      issueLabels: ["state:working", "agent:ready"], issueUpdatedAt: updatedAt, issueIsPullRequest: false,
+    });
+    const recovered = await recoverCoordinatorSnapshots(github, policy());
+    expect(recovered[0]).toMatchObject({ event_sequence: 701, event_id: "run-701:new", title: "Newer same-second title" });
+    await ingestCoordinatorSnapshot(github, policy(), recovered[0]!);
+    const work = await loadCurrentCanonicalWorkState(github, 18, BASE);
+    expect(work?.title).toBe("Newer same-second title");
+    expect(canonicalRequirements(work!)).toContain("same-second newer");
+  });
 });
 
 describe("durable Integration one-request/one-run/result authority", () => {
-  it("binds a request to the earliest causally valid attempt-1 run and rejects later replacements", async () => {
+  it("binds only the run that consumes the one-use protected dispatch capability", async () => {
     const github = makeGithub();
-    const request = createIntegrationRequest(snapshot().identity, "2026-08-17T03:20:00.000Z", "0123456789abcdef");
-    await publishIntegrationRecord(github, createIntegrationRecord(request));
-    github.__runs.push(run(request, 101, "2026-08-17T03:20:01.000Z", "in_progress", null));
-    github.__runs.push(run(request, 102, "2026-08-17T03:20:02.000Z", "queued", null));
-    await expect(findIntegrationWorkflowRun(github, request)).resolves.toMatchObject({ id: 101, attempt: 1 });
-    const bound = await bindIntegrationRun(github, snapshot(), request.request_id, 101);
+    const record = await publishAuthorizedRecord(github, 101);
+    await installRunStartEvidence(github, record, 101, "2026-08-17T03:20:01.000Z");
+    const bound = await bindIntegrationRun(github, snapshot(), record.request.request_id, 101);
     expect(bound.run?.id).toBe(101);
-    await expect(bindIntegrationRun(github, snapshot(), request.request_id, 102)).rejects.toThrow(/already bound/);
+    await expect(bindIntegrationRun(github, snapshot(), record.request.request_id, 102)).rejects.toThrow(/already bound/);
+    expect(github.__listWorkflowRuns).not.toHaveBeenCalled();
   });
 
-  it("preserves terminal PASS after request/result comments and the bound workflow run are deleted", async () => {
+  it("preserves terminal PASS after comments and the exact Actions run are deleted", async () => {
     const github = makeGithub();
     const record = await publishBoundRecord(github, 201);
     const attestation = integrationAttestation(record);
@@ -369,7 +401,7 @@ describe("durable Integration one-request/one-run/result authority", () => {
     expect(state.attestation?.integration).toEqual({ request_id: record.request.request_id, run_id: 201, run_attempt: 1 });
   });
 
-  it("preserves terminal failure and never silently converts it into retry", async () => {
+  it("preserves durable terminal failure and never silently converts it into retry", async () => {
     const github = makeGithub();
     const record = await publishBoundRecord(github, 301);
     await publishIntegrationRecord(github, {
@@ -377,77 +409,74 @@ describe("durable Integration one-request/one-run/result authority", () => {
       terminal: { state: "failure", detail: "protected gate failed", created_at: "2026-08-17T03:40:05.000Z" },
       created_at: "2026-08-17T03:40:05.000Z",
     });
-    github.__comments.splice(0);
-    github.__runs.push(run(record.request, 999, "2026-08-17T03:41:00.000Z", "completed", "success"));
-    github.__attempts.clear();
+    github.__comments.splice(0); github.__runs.splice(0); github.__attempts.clear();
     expect((await settleIntegrationState(github)).state).toBe("failure");
-    const dispatch = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:00:00Z"));
-    expect(dispatch.dispatch).toBe(false);
-    expect(dispatch.request?.request_id).toBe(record.request.request_id);
+    expect((await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:00:00Z"))).dispatch).toBe(false);
   });
 
-  it("keeps a deleted bound run pending until immutable completion evidence resolves failure vs cancellation", async () => {
+  it("seals failure from durable run-start evidence after the Actions run is deleted and no workflow_run consumer runs", async () => {
     const github = makeGithub();
     const bound = await publishBoundRecord(github, 401);
-    github.__runs.splice(0);
-    github.__attempts.clear();
+    github.__runs.splice(0); github.__attempts.clear(); github.__comments.splice(0);
     const next = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:10:00Z"));
     expect(next.dispatch).toBe(false);
-    expect((await currentIntegrationState(github, snapshot())).state).toBe("pending");
-    const current = await getCurrentIntegrationRecord(github, snapshot().identity);
-    expect(current?.terminal).toBeNull();
-    expect(current?.run?.id).toBe(401);
-  });
-
-  it("finds the globally earliest causally valid attempt-1 run beyond the first 100 results", async () => {
-    const github = makeGithub();
-    const request = createIntegrationRequest(snapshot().identity, "2026-08-17T03:20:00.000Z", "1111111111111111");
-    await publishIntegrationRecord(github, createIntegrationRecord(request));
-    for (let index = 0; index < 150; index += 1) {
-      github.__runs.push(run(request, 1000 + index, `2026-08-17T03:2${Math.floor(index / 60)}:${String(index % 60).padStart(2,"0")}.000Z`, "queued", null));
-    }
-    github.__runs.push(run(request, 500, "2026-08-17T03:20:01.000Z", "in_progress", null));
-    await expect(findIntegrationWorkflowRun(github, request)).resolves.toMatchObject({ id: 500, attempt: 1 });
-  });
-
-  it("seals a genuine attempt-1 failure from immutable workflow_run evidence even when the run object is already deleted", async () => {
-    const github = makeGithub();
-    const request = createIntegrationRequest(snapshot().identity, "2026-08-17T03:25:00.000Z", "2222222222222222");
-    await publishIntegrationRecord(github, createIntegrationRecord(request));
-    await expect(sealIntegrationWorkflowRunEvent(github, completionEvent(request, 550, "failure", "2026-08-17T03:25:05.000Z"))).resolves.toBe(true);
-    github.__runs.splice(0); github.__attempts.clear(); github.__comments.splice(0);
-    expect((await settleIntegrationState(github)).state).toBe("failure");
-    expect((await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:30:00Z"))).dispatch).toBe(false);
-  });
-
-  it("seals failure after binding but before terminal publication and preserves it after run deletion", async () => {
-    const github = makeGithub();
-    const bound = await publishBoundRecord(github, 560);
-    await expect(sealIntegrationWorkflowRunEvent(github, completionEvent(bound.request, 560, "failure", "2026-08-17T03:30:05.000Z"))).resolves.toBe(true);
-    github.__runs.splice(0); github.__attempts.clear(); github.__comments.splice(0);
     const current = await getCurrentIntegrationRecord(github, snapshot().identity);
     expect(current?.terminal?.state).toBe("failure");
-    expect(current?.run?.id).toBe(560);
+    expect(current?.run?.id).toBe(401);
+    expect((await currentIntegrationState(github, snapshot(), Date.parse("2026-08-17T04:10:00Z"))).state).toBe("failure");
   });
 
-  it("corrects an out-of-order later completion to the globally earlier protected run ID", async () => {
+  it("recovers a genuine failure before integration-runtime prepare from pre-checkout run-start evidence", async () => {
     const github = makeGithub();
-    const request = createIntegrationRequest(snapshot().identity, "2026-08-17T03:35:00.000Z", "3333333333333333");
-    await publishIntegrationRecord(github, createIntegrationRecord(request));
-    await sealIntegrationWorkflowRunEvent(github, completionEvent(request, 900, "failure", "2026-08-17T03:35:09.000Z"));
-    await sealIntegrationWorkflowRunEvent(github, completionEvent(request, 600, "failure", "2026-08-17T03:35:06.000Z"));
+    const record = await publishAuthorizedRecord(github, 550, "2026-08-17T03:25:00.000Z");
+    await installRunStartEvidence(github, record, 550, "2026-08-17T03:25:01.000Z");
+    // No bindIntegrationRun call and no workflow_run sealing event: model checkout/setup/build failure plus run deletion.
+    github.__runs.splice(0); github.__attempts.clear(); github.__comments.splice(0);
+    const next = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:00:00Z"));
+    expect(next.dispatch).toBe(false);
+    const current = await getCurrentIntegrationRecord(github, snapshot().identity);
+    expect(current?.run?.id).toBe(550);
+    expect(current?.terminal?.state).toBe("failure");
+  });
+
+  it("does not consult capped workflow-run search even with more than 1000 same-request flood records", async () => {
+    const github = makeGithub();
+    const record = await publishAuthorizedRecord(github, 500);
+    await installRunStartEvidence(github, record, 500, "2026-08-17T03:20:01.000Z");
+    for (let index = 0; index < 1200; index += 1) {
+      github.__runs.push(run(record.request, 1000 + index, `2026-08-17T03:21:${String(index % 60).padStart(2, "0")}.000Z`, "queued", null));
+    }
+    const bound = await bindIntegrationRun(github, snapshot(), record.request.request_id, 500);
+    expect(bound.run?.id).toBe(500);
+    expect(github.__listWorkflowRuns).not.toHaveBeenCalled();
+  });
+
+  it("seals an observed protected failure only for the run-start evidence run ID", async () => {
+    const github = makeGithub();
+    const record = await publishAuthorizedRecord(github, 600, "2026-08-17T03:35:00.000Z");
+    await installRunStartEvidence(github, record, 600, "2026-08-17T03:35:01.000Z");
+    await expect(sealIntegrationWorkflowRunEvent(github, completionEvent(record.request, 900, "failure", "2026-08-17T03:35:09.000Z"))).resolves.toBe(false);
+    await expect(sealIntegrationWorkflowRunEvent(github, completionEvent(record.request, 600, "failure", "2026-08-17T03:35:06.000Z"))).resolves.toBe(true);
     const current = await getCurrentIntegrationRecord(github, snapshot().identity);
     expect(current?.run?.id).toBe(600);
     expect(current?.terminal?.state).toBe("failure");
   });
 
+  it("keeps an observed cancellation retryable but never guesses cancellation after evidence/run deletion", async () => {
+    const github = makeGithub();
+    const record = await publishAuthorizedRecord(github, 700, "2026-08-17T03:36:00.000Z");
+    await installRunStartEvidence(github, record, 700, "2026-08-17T03:36:01.000Z");
+    await expect(sealIntegrationWorkflowRunEvent(github, completionEvent(record.request, 700, "cancelled", "2026-08-17T03:36:05.000Z"))).resolves.toBe(true);
+    const current = await getCurrentIntegrationRecord(github, snapshot().identity);
+    expect(current?.terminal?.state).toBe("aborted");
+  });
+
   it("treats replayed Integration receipt comments as hints and keeps newer terminal d3 authority", async () => {
     const github = makeGithub();
-    const request = createIntegrationRequest(snapshot().identity, "2026-08-17T03:45:00.000Z", "4444444444444444");
-    const initial = await publishIntegrationRecord(github, createIntegrationRecord(request));
+    const record = await publishAuthorizedRecord(github, 800, "2026-08-17T03:45:00.000Z");
     const stale = github.__comments.find((comment) => comment.body.includes("integration-d3"))!.body;
     await publishIntegrationRecord(github, {
-      ...initial,
+      ...record,
       terminal: { state: "failure", detail: "terminal", created_at: "2026-08-17T03:45:05.000Z" },
       created_at: "2026-08-17T03:45:05.000Z",
     });
@@ -479,6 +508,7 @@ interface TestRun {
   conclusion: string | null;
   html_url: string;
 }
+interface TestGitCommit { sha: string; message: string; tree: { sha: string }; parents: Array<{ sha: string }>; }
 interface TestGithub extends FugueGitHub {
   __baseSha: string;
   __publisherSha?: string;
@@ -486,8 +516,11 @@ interface TestGithub extends FugueGitHub {
   __statuses: TestStatus[];
   __runs: TestRun[];
   __attempts: Map<number, TestRun>;
+  __refs: Map<string, string>;
+  __gitCommits: Map<string, TestGitCommit>;
   __nextStatusId: number;
   __listStatus: ReturnType<typeof vi.fn>;
+  __listWorkflowRuns: ReturnType<typeof vi.fn>;
 }
 
 function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?: boolean; interleaveBeforeManifest?: number } = {}): TestGithub {
@@ -495,6 +528,11 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
   const statuses: TestStatus[] = [];
   const runs: TestRun[] = [];
   const attempts = new Map<number, TestRun>();
+  const refs = new Map<string, string>();
+  const gitCommits = new Map<string, TestGitCommit>();
+  gitCommits.set(BASE, { sha: BASE, message: "protected base", tree: { sha: "1".repeat(40) }, parents: [] });
+  gitCommits.set(HEAD, { sha: HEAD, message: "candidate", tree: { sha: "2".repeat(40) }, parents: [{ sha: BASE }] });
+  let nextGitCommit = 0;
   let nextCommentId = 0;
   let nextStatusId = 0;
   let failedManifest = false;
@@ -514,6 +552,36 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
     const filtered = comments.filter((comment) => comment.issueNumber === args.issue_number).sort((a, b) => a.id - b.id);
     return { data: filtered.slice((page - 1) * perPage, page * perPage) };
   });
+  const getRef = vi.fn(async (args: { ref: string }) => {
+    const sha = refs.get(args.ref);
+    if (!sha) throw Object.assign(new Error("Not Found"), { status: 404 });
+    return { data: { object: { sha } } };
+  });
+  const getCommit = vi.fn(async (args: { commit_sha: string }) => {
+    const commit = gitCommits.get(args.commit_sha);
+    if (!commit) throw Object.assign(new Error("Not Found"), { status: 404 });
+    return { data: commit };
+  });
+  const createCommit = vi.fn(async (args: { message: string; tree: string; parents: string[] }) => {
+    const sha = (++nextGitCommit).toString(16).padStart(40, "0");
+    const commit: TestGitCommit = { sha, message: args.message, tree: { sha: args.tree }, parents: args.parents.map((parent) => ({ sha: parent })) };
+    gitCommits.set(sha, commit);
+    return { data: commit };
+  });
+  const createRef = vi.fn(async (args: { ref: string; sha: string }) => {
+    const ref = args.ref.replace(/^refs\//, "");
+    if (refs.has(ref)) throw Object.assign(new Error("Reference exists"), { status: 422 });
+    refs.set(ref, args.sha);
+    return { data: { ref: args.ref, object: { sha: args.sha } } };
+  });
+  const updateRef = vi.fn(async (args: { ref: string; sha: string; force?: boolean }) => {
+    const current = refs.get(args.ref);
+    const next = gitCommits.get(args.sha);
+    if (!current || !next) throw Object.assign(new Error("Not Found"), { status: 404 });
+    if (!args.force && next.parents[0]?.sha !== current) throw Object.assign(new Error("Not fast forward"), { status: 422 });
+    refs.set(args.ref, args.sha);
+    return { data: { ref: args.ref, object: { sha: args.sha } } };
+  });
 
   return {
     repository: { owner: "JohnnyZLi", repo: "Fugue", fullName: "JohnnyZLi/Fugue" },
@@ -522,9 +590,12 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
     __statuses: statuses,
     __runs: runs,
     __attempts: attempts,
+    __refs: refs,
+    __gitCommits: gitCommits,
     get __nextStatusId() { return nextStatusId; },
     set __nextStatusId(value: number) { nextStatusId = value; },
     __listStatus: listCommitStatusesForRef,
+    __listWorkflowRuns: listWorkflowRuns,
     octokit: {
       paginate: vi.fn(async (fn: unknown) => {
         if (fn === listForRepo) return [{ number: 18, pull_request: undefined, state: "open", labels: [], body: "", title: "Issue", html_url: "https://example.test/issues/18" }];
@@ -544,8 +615,7 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
           updateComment: vi.fn(async (args: { comment_id: number; body: string }) => {
             const comment = comments.find((item) => item.id === args.comment_id);
             if (!comment) throw Object.assign(new Error("Not Found"), { status: 404 });
-            comment.body = args.body;
-            comment.updated_at = new Date().toISOString();
+            comment.body = args.body; comment.updated_at = new Date().toISOString();
             return { data: { id: comment.id, body: comment.body, html_url: `https://example.test/comment/${comment.id}`, created_at: comment.created_at } };
           }),
           deleteComment: vi.fn(async (args: { comment_id: number }) => {
@@ -559,8 +629,7 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
         repos: {
           createCommitStatus: vi.fn(async (args: { sha: string; context: string; description?: string; target_url?: string }) => {
             if (args.context.includes("/m/") && (options.failManifestAlways || (options.failFirstManifest && !failedManifest))) {
-              failedManifest = true;
-              throw Object.assign(new Error("status context exhausted"), { status: 422 });
+              failedManifest = true; throw Object.assign(new Error("status context exhausted"), { status: 422 });
             }
             if (args.context.includes("/m/") && options.interleaveBeforeManifest && !interleavedManifest) {
               interleavedManifest = true;
@@ -569,8 +638,7 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
               }
             }
             const status = { id: ++nextStatusId, sha: args.sha, context: args.context, description: args.description ?? "", target_url: args.target_url, created_at: new Date().toISOString() };
-            statuses.push(status);
-            return { data: status };
+            statuses.push(status); return { data: status };
           }),
           listCommitStatusesForRef,
           getCollaboratorPermissionLevel: vi.fn(async () => ({ data: { permission: "admin" } })),
@@ -585,7 +653,7 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
           }),
           createWorkflowDispatch: vi.fn(async () => ({ data: {} })),
         },
-        git: { getRef: vi.fn(async () => ({ data: { object: { sha: BASE } } })), createRef: vi.fn(async () => ({ data: {} })) },
+        git: { getRef, getCommit, createCommit, createRef, updateRef },
         pulls: { get: vi.fn(async () => ({ data: { head: { sha: HEAD }, base: { ref: "main" } } })) },
       },
     },
@@ -609,13 +677,54 @@ function run(request: ReturnType<typeof createIntegrationRequest>, id: number, c
   };
 }
 
+async function publishAuthorizedRecord(
+  github: TestGithub,
+  runId: number,
+  createdAt = "2026-08-17T03:30:00.000Z",
+): Promise<IntegrationRecord> {
+  const request = createIntegrationRequest(snapshot().identity, createdAt, runId.toString(16).padStart(16, "0"));
+  const authorized = await authorizeIntegrationDispatch(
+    github,
+    request,
+    createdAt,
+    runId.toString(16).padStart(64, "0"),
+  );
+  return publishIntegrationRecord(github, createIntegrationRecord(request, {
+    dispatch: authorized.authorization,
+    createdAt,
+  }));
+}
+
+async function installRunStartEvidence(
+  github: TestGithub,
+  record: IntegrationRecord,
+  runId: number,
+  createdAt: string,
+): Promise<void> {
+  if (!record.dispatch) throw new Error("test Integration record lacks dispatch authorization");
+  const ref = integrationEvidenceRefName(record.dispatch.secret_digest);
+  const refData = await github.octokit.rest.git.getRef({ owner: "JohnnyZLi", repo: "Fugue", ref });
+  const anchorSha = refData.data.object.sha;
+  const anchor = await github.octokit.rest.git.getCommit({ owner: "JohnnyZLi", repo: "Fugue", commit_sha: anchorSha });
+  const evidence = integrationRunStartSchema.parse({
+    version: 1, kind: "integration_run_start", request_id: record.request.request_id,
+    pr_number: record.identity.prNumber, head_sha: record.identity.headSha, base_sha: record.identity.baseSha,
+    secret_digest: record.dispatch.secret_digest, run_id: runId, run_attempt: 1, created_at: createdAt,
+  });
+  const signed = await signProtocolBody(github, serializeIntegrationRunStartEvidence(evidence));
+  const commit = await github.octokit.rest.git.createCommit({
+    owner: "JohnnyZLi", repo: "Fugue", message: signed, tree: anchor.data.tree.sha, parents: [anchorSha],
+  });
+  await github.octokit.rest.git.updateRef({ owner: "JohnnyZLi", repo: "Fugue", ref, sha: commit.data.sha, force: false });
+  expect((await getIntegrationRunStartEvidence(github, record))?.run_id).toBe(runId);
+}
+
 async function publishBoundRecord(github: TestGithub, runId: number): Promise<IntegrationRecord> {
-  const request = createIntegrationRequest(snapshot().identity, "2026-08-17T03:30:00.000Z", runId.toString(16).padStart(16, "0"));
-  await publishIntegrationRecord(github, createIntegrationRecord(request));
-  const first = run(request, runId, "2026-08-17T03:30:01.000Z", "in_progress", null);
-  github.__runs.push(first);
-  github.__attempts.set(runId, first);
-  return bindIntegrationRun(github, snapshot(), request.request_id, runId);
+  const record = await publishAuthorizedRecord(github, runId);
+  await installRunStartEvidence(github, record, runId, "2026-08-17T03:30:01.000Z");
+  const first = run(record.request, runId, "2026-08-17T03:30:01.000Z", "in_progress", null);
+  github.__runs.push(first); github.__attempts.set(runId, first);
+  return bindIntegrationRun(github, snapshot(), record.request.request_id, runId);
 }
 
 function integrationAttestation(record: IntegrationRecord) {

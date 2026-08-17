@@ -19,7 +19,6 @@ import {
   isTrustedProtocolComment,
   readRepositoryDefaultBranchIdentity,
   signProtocolBody,
-  updateProtocolComment,
   verifyProtocolPublicationBodyAtRevision,
   createDurableManifestProof,
   verifyDurableManifestProof,
@@ -71,6 +70,7 @@ export const coordinatorSnapshotSchema = z.object({
   version: z.literal(1),
   kind: z.literal("coordinator_snapshot"),
   event_id: z.string().min(1),
+  event_sequence: z.number().int().nonnegative().default(0),
   event_name: z.literal("issues"),
   action: z.string().min(1),
   actor: z.string().min(1),
@@ -100,6 +100,7 @@ const recoveryCursorSchema = z.object({
   scope: z.string().min(1),
   storage_sha: z.string().regex(/^[0-9a-f]{40}$/i),
   publisher_sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  checkpoint_at: z.string().min(1).default("1970-01-01T00:00:00.000Z"),
   complete_top_id: z.number().int().nonnegative(),
   scan_top_id: z.number().int().nonnegative(),
   scan_floor_id: z.number().int().nonnegative(),
@@ -511,7 +512,7 @@ export async function recoverDurableProtocolRecord<T>(
       ...(bestManifest ? { best_manifest: bestManifest } : { best_manifest: undefined }),
     });
     if (!scan.exhausted) {
-      await writeRecoveryCursor(github, options, cursor, cursorEntry?.id);
+      await writeRecoveryCursor(github, options, cursor);
       return { exhausted: false };
     }
 
@@ -524,7 +525,7 @@ export async function recoverDurableProtocolRecord<T>(
         page: 1,
         chunks: Array.from({ length: bestManifest.chunk_count }, () => null),
       });
-      await writeRecoveryCursor(github, options, cursor, cursorEntry?.id);
+      await writeRecoveryCursor(github, options, cursor);
       // Discovery and materialization are each independently bounded; finish a found manifest
       // in the same public recovery call so normal reads do not depend on presentation locators.
       return recoverDurableProtocolRecord(github, options);
@@ -539,7 +540,7 @@ export async function recoverDurableProtocolRecord<T>(
       best_manifest: undefined,
       chunks: undefined,
     });
-    await writeRecoveryCursor(github, options, cursor, cursorEntry?.id);
+    await writeRecoveryCursor(github, options, cursor);
     return bestValue && bestBody
       ? { record: { value: bestValue, body: bestBody }, exhausted: true }
       : { exhausted: true };
@@ -567,7 +568,7 @@ export async function recoverDurableProtocolRecord<T>(
   );
   cursor = recoveryCursorSchema.parse({ ...cursor, before_id: materialized.beforeId, page: materialized.page, chunks });
   if (!materialized.exhausted) {
-    await writeRecoveryCursor(github, options, cursor, cursorEntry?.id);
+    await writeRecoveryCursor(github, options, cursor);
     return { exhausted: false };
   }
   if (chunks.some((chunk) => !chunk)) {
@@ -604,7 +605,7 @@ export async function recoverDurableProtocolRecord<T>(
     best_manifest: undefined,
     chunks: undefined,
   });
-  await writeRecoveryCursor(github, options, cursor, cursorEntry?.id);
+  await writeRecoveryCursor(github, options, cursor);
   return bestValue && bestBody
     ? { record: { value: bestValue, body: bestBody }, exhausted: true }
     : { exhausted: true };
@@ -784,27 +785,47 @@ async function statusPage(github: FugueGitHub, sha: string, page: number): Promi
 async function findRecoveryCursor<T>(
   github: FugueGitHub,
   options: DurableRecordOptions<T>,
-): Promise<{ id: number; cursor: RecoveryCursor } | undefined> {
-  const comments = await recentIssueComments(github, options.issueNumber);
-  let current: { id: number; cursor: RecoveryCursor } | undefined;
-  for (const comment of comments) {
-    const body = comment.body ?? "";
-    if (!body.includes(RECOVERY_START)) continue;
-    if (!(await isTrustedProtocolComment(github, comment))) continue;
-    let cursor: RecoveryCursor | null;
-    try {
-      cursor = parsePayloadBlock(body, RECOVERY_START, recoveryCursorSchema);
-    } catch {
-      continue;
-    }
-    if (!cursor) continue;
-    if (cursor.scope !== options.scope || cursor.storage_sha !== options.storageSha || cursor.publisher_sha !== options.publisherSha) continue;
-    if (!current || compareRecoveryProgress(cursor, current.cursor) > 0 ||
-        (compareRecoveryProgress(cursor, current.cursor) === 0 && comment.id > current.id)) {
-      current = { id: comment.id, cursor };
-    }
+): Promise<{ commitSha: string; cursor: RecoveryCursor } | undefined> {
+  const { owner, repo } = github.repository;
+  const ref = recoveryRefName(options);
+  let headSha: string;
+  try {
+    const response = await github.octokit.rest.git.getRef({ owner, repo, ref });
+    headSha = response.data.object.sha;
+  } catch (error) {
+    if (httpStatus(error) === 404) return undefined;
+    throw error;
   }
-  return current;
+  const commit = await github.octokit.rest.git.getCommit({ owner, repo, commit_sha: headSha });
+  const body = commit.data.message ?? "";
+  let cursor: RecoveryCursor | null;
+  try {
+    cursor = parsePayloadBlock(body, RECOVERY_START, recoveryCursorSchema);
+  } catch (error) {
+    throw new CanonicalWorkStateIntegrityError(`Durable recovery checkpoint ${ref} is malformed: ${message(error)}`);
+  }
+  if (!cursor || cursor.scope !== options.scope || cursor.storage_sha !== options.storageSha ||
+      cursor.publisher_sha !== options.publisherSha) {
+    throw new CanonicalWorkStateIntegrityError(`Durable recovery checkpoint ${ref} does not match its protected scope.`);
+  }
+  const timestamp = Date.parse(cursor.checkpoint_at);
+  if (!Number.isFinite(timestamp) || !(await verifyProtocolPublicationBodyAtRevision(
+    github,
+    body,
+    options.publisherSha,
+    timestamp,
+  ))) {
+    throw new CanonicalWorkStateIntegrityError(`Durable recovery checkpoint ${ref} lacks current protected provenance.`);
+  }
+  return { commitSha: headSha, cursor };
+}
+
+function recoveryRefName<T>(options: DurableRecordOptions<T>): string {
+  const digest = createHash("sha256")
+    .update(`${options.storageSha.toLowerCase()}\0${options.publisherSha.toLowerCase()}\0${options.scope}`, "utf8")
+    .digest("hex")
+    .slice(0, 40);
+  return `fugue/recovery/${digest}`;
 }
 
 function compareRecoveryProgress(left: RecoveryCursor, right: RecoveryCursor): number {
@@ -812,26 +833,53 @@ function compareRecoveryProgress(left: RecoveryCursor, right: RecoveryCursor): n
   if (left.scan_top_id !== right.scan_top_id) return left.scan_top_id - right.scan_top_id;
   if (left.phase !== right.phase) return left.phase === "materialize" ? 1 : -1;
   if (left.before_id !== right.before_id) return right.before_id - left.before_id;
-  return left.page - right.page;
+  if (left.page !== right.page) return left.page - right.page;
+  const leftChunks = left.chunks?.filter((chunk) => chunk != null).length ?? 0;
+  const rightChunks = right.chunks?.filter((chunk) => chunk != null).length ?? 0;
+  return leftChunks - rightChunks;
 }
 
 async function writeRecoveryCursor<T>(
   github: FugueGitHub,
   options: DurableRecordOptions<T>,
-  cursor: RecoveryCursor,
-  existingId?: number,
+  supplied: RecoveryCursor,
 ): Promise<void> {
-  const payload = Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
-  const body = `${RECOVERY_START}\nversion: 1\npayload: ${payload}\n${END}\n\nDurable Fugue recovery: ${options.scope}`;
-  if (existingId) {
+  const { owner, repo } = github.repository;
+  const ref = recoveryRefName(options);
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const current = await findRecoveryCursor(github, options);
+    if (current && compareRecoveryProgress(current.cursor, supplied) >= 0) return;
+    const cursor = recoveryCursorSchema.parse({ ...supplied, checkpoint_at: new Date().toISOString() });
+    const payload = Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+    const unsigned = `${RECOVERY_START}\nversion: 1\npayload: ${payload}\n${END}\n\nDurable Fugue recovery checkpoint: ${options.scope}`;
+    const signed = await signProtocolBody(github, unsigned);
+    const timestamp = Date.parse(cursor.checkpoint_at);
+    if (!(await verifyProtocolPublicationBodyAtRevision(github, signed, options.publisherSha, timestamp))) {
+      throw new CanonicalWorkStateIntegrityError(`Durable recovery checkpoint ${ref} failed protected provenance self-check.`);
+    }
+    const parentSha = current?.commitSha ?? options.publisherSha;
+    const parent = await github.octokit.rest.git.getCommit({ owner, repo, commit_sha: parentSha });
+    const commit = await github.octokit.rest.git.createCommit({
+      owner,
+      repo,
+      message: signed,
+      tree: parent.data.tree.sha,
+      parents: [parentSha],
+    });
     try {
-      await updateProtocolComment(github, existingId, body);
+      if (current) {
+        await github.octokit.rest.git.updateRef({ owner, repo, ref, sha: commit.data.sha, force: false });
+      } else {
+        await github.octokit.rest.git.createRef({ owner, repo, ref: `refs/${ref}`, sha: commit.data.sha });
+      }
       return;
     } catch (error) {
-      if (httpStatus(error) !== 404) throw error;
+      if (httpStatus(error) !== 422) throw error;
+      lastError = error;
     }
   }
-  await createProtocolComment(github, options.issueNumber, body);
+  throw new CanonicalWorkStateIntegrityError(`Unable to advance durable recovery checkpoint ${ref}: ${message(lastError)}`);
 }
 
 async function recentIssueComments(github: FugueGitHub, issueNumber: number) {
@@ -1174,12 +1222,12 @@ async function loadCoordinatorLocator(
   return matches.sort(compareCoordinatorSnapshots).at(-1);
 }
 
-function compareCoordinatorSnapshots(left: CoordinatorSnapshot, right: CoordinatorSnapshot): number {
+export function compareCoordinatorSnapshots(left: CoordinatorSnapshot, right: CoordinatorSnapshot): number {
   return compareAuthorityOrder(coordinatorAuthorityOrder(left), coordinatorAuthorityOrder(right));
 }
 
 function coordinatorAuthorityOrder(snapshot: CoordinatorSnapshot): string {
-  return `${snapshot.issue_updated_at}\u0000${snapshot.event_id}`;
+  return `${snapshot.issue_updated_at}\u0000${String(snapshot.event_sequence).padStart(20, "0")}\u0000${snapshot.event_id}`;
 }
 
 function coordinatorScope(issueNumber: number): string {

@@ -89,15 +89,15 @@ A candidate that observes or copies pre-commit statuses cannot finish an aborted
 
 ### Bounded recovery
 
-Fake manifests must not create unbounded read amplification. Normal reconstruction uses a protected post-commit locator comment. If that mirror is deleted or tampered, recovery processes fixed-size status pages, at most a fixed small number of manifests per invocation, and resolves their bounded chunk sets entirely from the already-loaded adjacent pages. A signed protected recovery cursor advances across finite hostile history over scheduled runs. Permanent status spam can delay recovery, but it cannot force unbounded per-read pagination, make an older state current, or require Human repository surgery.
+Fake manifests must not create unbounded read amplification, and an attacker with `issues:write` plus `statuses:write` must not be able to erase recovery progress. Locator comments are presentation hints only. Recovery processes fixed-size status pages and bounded manifest/chunk work under a frozen status-ID ceiling, then checkpoints its low-water/materialization state as an OIDC-signed same-tree Git commit behind a deterministic `refs/fugue/recovery/*` ref. That ref advances only by fast-forward, so deleting every issue comment or continuously appending statuses cannot reset the scan to page 1 or starve older valid authority.
 
-The same durable-record primitive backs work-state, Coordinator snapshots, and Integration state. Ordinary locator/result comments can therefore be recreated after `issues:write` deletion.
+The same durable-record primitive backs work-state, Coordinator snapshots, and Integration state. Ordinary locator/result comments can therefore be recreated after `issues:write` deletion, while recovery progress itself lives outside the Issues/Statuses mutation plane.
 
 ## Protected Coordinator intent
 
 Coordinator intent is accepted only from the exact immutable GitHub Actions `issues` event payload for an authorized write/maintain/admin actor. Fugue does not authenticate one Human event and later fetch mutable issue contents.
 
-GitHub Actions allows only one pending run per concurrency group, so issue-event runs do **not** share the repository-wide pending slot. Each authorized issue event has a run-specific non-replacing concurrency identity. The run commits its full event snapshot—title, body, labels, actor, action, and issue revision—to d3 durable authority before canonical work-state mutation. Scheduled reconciliation recovers and replays the latest protected issue revision. A crash after capture or deletion of the ordinary snapshot comment therefore does not erase the Human edit.
+GitHub Actions allows only one pending run per concurrency group, so issue-event runs do **not** share the repository-wide pending slot. Each authorized issue event has a run-specific non-replacing concurrency identity. The run commits its full event snapshot—title, body, labels, actor, action, issue revision, protected delivery sequence, and content-bound event ID—to d3 durable authority before canonical work-state mutation. Ordering uses `issue_updated_at`, then that protected sequence and event ID, so two distinct edits in the same GitHub timestamp second and action still have one total causal order. Scheduled reconciliation recovers and replays the newest protected edit; a slower older run cannot re-canonicalize over it.
 
 Other control-plane event classes remain repository-serialized.
 
@@ -133,11 +133,11 @@ QA submissions are requests, not canonical evidence. Protected Fugue verifies th
 
 ## Human control-plane acknowledgement
 
-Control-plane changes remain an explicit Human boundary. `control_plane.paths` includes workflow/policy files **and** source-level trust runtime: CLI dispatch, validation, configuration, ownership, reconciliation, state/provenance, submissions/gates, repository discovery/authentication, evaluation/QA/review code, and Integration control.
+Control-plane changes remain an explicit Human boundary. `control_plane.paths` includes workflow/policy files **and** source-level trust runtime: CLI dispatch and local recovery entrypoints (including `src/commands/advance.ts` and `src/commands/run.ts`), validation, configuration, ownership, reconciliation, state/provenance, submissions/gates, repository discovery/authentication, evaluation/QA/review code, and Integration control.
 
 The Human only decides whether to acknowledge the current exact evaluation identity. The Leader re-fetches the identity and submits the structured request through GitHub; the Human does not copy SHAs or run a terminal command.
 
-Security-QA conditional coverage likewise includes direct trust primitives such as `src/cli.ts`, `src/core/validation.ts`, `src/core/config.ts`, `src/core/ownership.ts`, and `src/core/git.ts` in addition to the existing state/provenance/QA/CI/Integration modules.
+Security-QA conditional coverage likewise includes direct trust primitives and mutation/recovery entrypoints such as `src/cli.ts`, `src/commands/advance.ts`, `src/commands/run.ts`, `src/core/validation.ts`, `src/core/config.ts`, `src/core/ownership.ts`, and `src/core/git.ts` in addition to the existing state/provenance/QA/CI/Integration modules.
 
 ## Required CI provenance
 
@@ -151,12 +151,14 @@ The durable lifecycle is:
 
 ```text
 REQUEST
-    protected Fugue creates an unpredictable signed request ID
-    and commits it to the candidate head as a d3 Integration record
+    protected Fugue creates an unpredictable signed request ID plus a fresh
+    one-use 256-bit dispatch capability; only its digest is durable in d3
+    and an OIDC-signed dispatch-anchor Git ref
 
-FIRST PROTECTED RUN
-    exactly one causally valid workflow-run ID at attempt 1 may bind that request
-    prepare proves GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT match that first-run authority
+RUN START
+    before checkout/setup/build, attempt 1 proves the one-use capability
+    and fast-forwards that exact ref to an OIDC-signed run-start commit
+    carrying GITHUB_RUN_ID + attempt 1
 
 VALIDATE
     candidate checkout is read-only and credential-separated
@@ -167,9 +169,9 @@ TERMINAL
     then writes presentation attestation comment / fugue/integration status
 ```
 
-A later dispatch with the same request ID cannot replace the bound run. Re-running the same run ID cannot replace attempt 1. If a genuine first run completes `failure`, that failure is terminal even if it happened before the prepare runtime could write its normal binding mirror. It never becomes an automatic retry.
+Filtered workflow-run search is not binding authority. Same-request flood runs do not know the one-use capability and cannot advance its evidence ref, while reruns are rejected because only attempt 1 may consume it. The exact run ID comes from the protected run-start commit, so GitHub list caps do not affect first-run identity.
 
-Cancellation/abortion and deletion of a bound run are different: Fugue durably marks that request aborted, then recovery creates a **new request ID**. It never silently substitutes another workflow-run ID under the old request.
+If transport never crosses the run-start boundary, protected recovery may abort that unused request and create a fresh one. Once run-start is durable, however, deletion of the exact Actions run cannot become a retry: after the recovery grace period Fugue seals terminal failure unless it already has durable PASS/failure/error or an actually observed cancellation/abortion. A `workflow_run` consumer can seal outcomes promptly, but cancelling or deleting that consumer cannot erase the run-start evidence or turn a possible genuine failure into retryable transport.
 
 Terminal PASS/failure is stored in the durable record and therefore survives deletion of the workflow run, request comment, Integration result/attestation comment, or UI status. A terminal PASS embeds the full Integration attestation plus exact request ID, run ID, and attempt 1. `fugue/integration` remains the branch-protection/UI signal; it is not durable authority by itself.
 

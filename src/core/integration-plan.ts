@@ -16,6 +16,11 @@ export const integrationRequestSchema = z.object({
   created_at: z.string().min(1),
 });
 
+export const integrationDispatchAuthorizationSchema = z.object({
+  secret_digest: z.string().regex(/^[0-9a-f]{64}$/i),
+  authorized_at: z.string().min(1),
+});
+
 export const integrationRunBindingSchema = z.object({
   id: z.number().int().positive(),
   attempt: z.literal(1),
@@ -41,6 +46,7 @@ export const integrationRecordSchema = z.object({
   kind: z.literal("integration_record"),
   identity: evaluationIdentitySchema,
   request: integrationRequestSchema,
+  dispatch: integrationDispatchAuthorizationSchema.nullable().default(null),
   run: integrationRunBindingSchema.nullable(),
   terminal: integrationTerminalSchema.nullable(),
   created_at: z.string().min(1),
@@ -82,6 +88,7 @@ export const integrationValidationSchema = z.object({
 });
 
 export type IntegrationRequest = z.infer<typeof integrationRequestSchema>;
+export type IntegrationDispatchAuthorization = z.infer<typeof integrationDispatchAuthorizationSchema>;
 export type IntegrationRunBinding = z.infer<typeof integrationRunBindingSchema>;
 export type IntegrationRecord = z.infer<typeof integrationRecordSchema>;
 export type IntegrationPlan = z.infer<typeof integrationPlanSchema>;
@@ -112,6 +119,7 @@ export function createIntegrationRequest(
 export function createIntegrationRecord(
   request: IntegrationRequest,
   input: {
+    dispatch?: IntegrationDispatchAuthorization | null;
     run?: IntegrationRunBinding | null;
     terminal?: IntegrationRecord["terminal"];
     createdAt?: string;
@@ -122,6 +130,7 @@ export function createIntegrationRecord(
     kind: "integration_record",
     identity: request.identity,
     request,
+    dispatch: input.dispatch ?? null,
     run: input.run ?? null,
     terminal: input.terminal ?? null,
     created_at: input.createdAt ?? new Date().toISOString(),

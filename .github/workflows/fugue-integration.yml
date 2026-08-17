@@ -12,6 +12,10 @@ on:
         description: Durable Fugue Integration request ID
         required: true
         type: string
+      dispatch_secret:
+        description: One-use protected dispatch capability
+        required: true
+        type: string
 
 concurrency:
   group: fugue-integration-${{ github.repository }}-${{ inputs.pr }}
@@ -22,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       checks: read
-      contents: read
+      contents: write
       id-token: write
       issues: write
       pull-requests: read
@@ -30,6 +34,115 @@ jobs:
     outputs:
       head_sha: ${{ steps.prepare.outputs.head_sha }}
     steps:
+      - name: Commit protected Integration run-start evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+
+          const repository = process.env.GITHUB_REPOSITORY;
+          const [owner, repo] = repository.split('/');
+          const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          const inputs = event.inputs ?? {};
+          const requestId = String(inputs.request_id ?? '');
+          const prNumber = Number(inputs.pr);
+          const secret = String(inputs.dispatch_secret ?? '');
+          const runId = Number(process.env.GITHUB_RUN_ID);
+          const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
+          const baseSha = process.env.GITHUB_SHA;
+          if (!/^int-[0-9a-f]{16}-[0-9a-f]{16}$/.test(requestId) || !Number.isInteger(prNumber) || prNumber <= 0 ||
+              !/^[0-9a-f]{64}$/i.test(secret) || !Number.isInteger(runId) || runId <= 0 || runAttempt !== 1 ||
+              !/^[0-9a-f]{40}$/i.test(baseSha)) {
+            throw new Error('Invalid protected Integration dispatch context.');
+          }
+          const digest = createHash('sha256').update(secret, 'utf8').digest('hex');
+          const ref = `fugue/integration/${digest}`;
+          const apiBase = `https://api.github.com/repos/${owner}/${repo}`;
+          const headers = {
+            Authorization: `Bearer ${process.env.GH_TOKEN}`,
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+          };
+          async function api(path, init = {}) {
+            const response = await fetch(`${apiBase}${path}`, { ...init, headers: { ...headers, ...(init.headers ?? {}) } });
+            const text = await response.text();
+            if (!response.ok) throw new Error(`GitHub API ${response.status} for ${path}: ${text.slice(0, 300)}`);
+            return text ? JSON.parse(text) : {};
+          }
+          function parseBlock(body, marker) {
+            const start = body.indexOf(marker);
+            if (start < 0) return null;
+            const end = body.indexOf('-->', start + marker.length);
+            if (end < 0) throw new Error(`Unterminated ${marker} evidence.`);
+            const block = body.slice(start + marker.length, end).trim();
+            const match = block.match(/^version: 1\npayload: ([A-Za-z0-9_-]+)$/);
+            if (!match) throw new Error(`Malformed ${marker} evidence.`);
+            return JSON.parse(Buffer.from(match[1], 'base64url').toString('utf8'));
+          }
+          function evidenceBody(marker, value, label) {
+            const payload = Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+            return `${marker}\nversion: 1\npayload: ${payload}\n-->\n\n${label}`;
+          }
+
+          const refData = await api(`/git/ref/${ref}`);
+          const anchorSha = refData.object?.sha;
+          if (!/^[0-9a-f]{40}$/i.test(anchorSha)) throw new Error('Protected Integration dispatch anchor ref is invalid.');
+          const anchorCommit = await api(`/git/commits/${anchorSha}`);
+          const existingStart = parseBlock(anchorCommit.message ?? '', '<!-- fugue-integration-run-start');
+          if (existingStart) {
+            if (existingStart.run_id === runId && existingStart.run_attempt === 1) process.exit(0);
+            throw new Error('Protected Integration dispatch capability was already consumed by another run.');
+          }
+          const anchor = parseBlock(anchorCommit.message ?? '', '<!-- fugue-integration-dispatch-anchor');
+          if (!anchor || anchor.kind !== 'integration_dispatch_anchor' || anchor.request_id !== requestId ||
+              anchor.pr_number !== prNumber || anchor.base_sha !== baseSha || anchor.secret_digest !== digest ||
+              !/^[0-9a-f]{40}$/i.test(anchor.head_sha)) {
+            throw new Error('Workflow dispatch does not match its protected one-use Integration anchor.');
+          }
+
+          const createdAt = new Date().toISOString();
+          const startEvidence = {
+            version: 1,
+            kind: 'integration_run_start',
+            request_id: requestId,
+            pr_number: prNumber,
+            head_sha: anchor.head_sha,
+            base_sha: baseSha,
+            secret_digest: digest,
+            run_id: runId,
+            run_attempt: 1,
+            created_at: createdAt,
+          };
+          const canonical = evidenceBody('<!-- fugue-integration-run-start', startEvidence, 'INTEGRATION RUN — STARTED');
+          const bodyDigest = createHash('sha256').update(canonical, 'utf8').digest('hex');
+          const audience = `fugue:v1:${repository}:comment:${bodyDigest}`;
+          const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+          oidcUrl.searchParams.set('audience', audience);
+          const oidcResponse = await fetch(oidcUrl, {
+            headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+          });
+          if (!oidcResponse.ok) throw new Error(`Unable to mint protected Integration OIDC proof (${oidcResponse.status}).`);
+          const oidc = await oidcResponse.json();
+          if (typeof oidc.value !== 'string' || !oidc.value) throw new Error('GitHub OIDC response did not contain a token.');
+          const signed = `${canonical}\n\n<!-- fugue-publisher-proof\nversion: 1\ntoken: ${oidc.value}\n-->`;
+          const created = await api('/git/commits', {
+            method: 'POST',
+            body: JSON.stringify({
+              message: signed,
+              tree: anchorCommit.tree.sha,
+              parents: [anchorSha],
+              author: { name: 'github-actions[bot]', email: '41898282+github-actions[bot]@users.noreply.github.com', date: createdAt },
+              committer: { name: 'github-actions[bot]', email: '41898282+github-actions[bot]@users.noreply.github.com', date: createdAt },
+            }),
+          });
+          await api(`/git/refs/${ref}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ sha: created.sha, force: false }),
+          });
+          NODE
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}

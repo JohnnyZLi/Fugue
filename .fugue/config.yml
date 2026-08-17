@@ -17,6 +17,8 @@ control_plane:
     - "src/cli.ts"
     - "src/commands/reconcile.ts"
     - "src/commands/integration-runtime.ts"
+    - "src/commands/advance.ts"
+    - "src/commands/run.ts"
     - "src/commands/init.ts"
     - "src/core/repository-init.ts"
     - "src/core/reconcile.ts"
@@ -115,6 +117,8 @@ reviews:
       - "src/commands/init.ts"
       - "src/commands/reconcile.ts"
       - "src/commands/integration-runtime.ts"
+      - "src/commands/advance.ts"
+      - "src/commands/run.ts"
 
   visual:
     required: conditional

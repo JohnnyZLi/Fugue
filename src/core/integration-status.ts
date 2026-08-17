@@ -1,17 +1,28 @@
+import { createHash, randomBytes } from "node:crypto";
+import { z } from "zod";
 import { type IntegrationAttestation } from "./attestations.js";
 import { sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
 import type { FugueGitHub } from "./github.js";
 import {
   createIntegrationRecord,
   createIntegrationRequest,
+  integrationDispatchAuthorizationSchema,
   integrationRunTitle,
   parseIntegrationRecord,
   serializeIntegrationRecord,
+  type IntegrationDispatchAuthorization,
   type IntegrationRecord,
   type IntegrationRequest,
   type IntegrationRunBinding,
 } from "./integration-plan.js";
-import { createProtocolComment, isTrustedProtocolComment, isTrustedProtocolWorkflowRun } from "./provenance.js";
+import {
+  assertRepositoryDefaultBranchRevision,
+  createProtocolComment,
+  isTrustedProtocolComment,
+  isTrustedProtocolWorkflowRun,
+  signProtocolBody,
+  verifyProtocolPublicationBodyAtRevision,
+} from "./provenance.js";
 import {
   DurableProtocolRecoveryPendingError,
   publishDurableProtocolRecord,
@@ -51,6 +62,215 @@ interface WorkflowRunRecord {
 
 const INTEGRATION_RECEIPT = "Fugue-Authority-Receipt: integration-d3";
 export const INTEGRATION_REQUEST_RECOVERY_GRACE_MS = 10 * 60 * 1000;
+const INTEGRATION_DISPATCH_ANCHOR_START = "<!-- fugue-integration-dispatch-anchor";
+const INTEGRATION_RUN_START = "<!-- fugue-integration-run-start";
+const PROTOCOL_END = "-->";
+
+const integrationDispatchAnchorSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("integration_dispatch_anchor"),
+  request_id: z.string().min(1),
+  pr_number: z.number().int().positive(),
+  head_sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  base_sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  secret_digest: z.string().regex(/^[0-9a-f]{64}$/i),
+  authorized_at: z.string().min(1),
+});
+
+export const integrationRunStartSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("integration_run_start"),
+  request_id: z.string().min(1),
+  pr_number: z.number().int().positive(),
+  head_sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  base_sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  secret_digest: z.string().regex(/^[0-9a-f]{64}$/i),
+  run_id: z.number().int().positive(),
+  run_attempt: z.literal(1),
+  created_at: z.string().min(1),
+});
+
+export type IntegrationRunStartEvidence = z.infer<typeof integrationRunStartSchema>;
+type IntegrationDispatchAnchor = z.infer<typeof integrationDispatchAnchorSchema>;
+
+function encodeIntegrationEvidence(marker: string, value: unknown): string {
+  const payload = Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+  return `${marker}\nversion: 1\npayload: ${payload}\n${PROTOCOL_END}`;
+}
+
+function parseIntegrationEvidence<T>(body: string, marker: string, schema: z.ZodType<T>): T | null {
+  const start = body.indexOf(marker);
+  if (start < 0) return null;
+  const end = body.indexOf(PROTOCOL_END, start + marker.length);
+  if (end < 0) throw new Error(`Unterminated ${marker.slice(5)} block.`);
+  const block = body.slice(start + marker.length, end).trim();
+  const match = block.match(/^version: 1\npayload: ([A-Za-z0-9_-]+)$/);
+  if (!match?.[1]) throw new Error(`Malformed ${marker.slice(5)} block.`);
+  return schema.parse(JSON.parse(Buffer.from(match[1], "base64url").toString("utf8")) as unknown);
+}
+
+export function integrationEvidenceRefName(secretDigest: string): string {
+  if (!/^[0-9a-f]{64}$/i.test(secretDigest)) throw new Error("Invalid Integration dispatch digest.");
+  return `fugue/integration/${secretDigest.toLowerCase()}`;
+}
+
+export function serializeIntegrationRunStartEvidence(value: IntegrationRunStartEvidence): string {
+  return `${encodeIntegrationEvidence(INTEGRATION_RUN_START, integrationRunStartSchema.parse(value))}\n\nINTEGRATION RUN — STARTED`;
+}
+
+function serializeIntegrationDispatchAnchor(value: IntegrationDispatchAnchor): string {
+  return `${encodeIntegrationEvidence(INTEGRATION_DISPATCH_ANCHOR_START, integrationDispatchAnchorSchema.parse(value))}\n\nINTEGRATION DISPATCH — AUTHORIZED`;
+}
+
+function parseIntegrationDispatchAnchor(body: string): IntegrationDispatchAnchor | null {
+  return parseIntegrationEvidence(body, INTEGRATION_DISPATCH_ANCHOR_START, integrationDispatchAnchorSchema);
+}
+
+function parseIntegrationRunStart(body: string): IntegrationRunStartEvidence | null {
+  return parseIntegrationEvidence(body, INTEGRATION_RUN_START, integrationRunStartSchema);
+}
+
+export async function authorizeIntegrationDispatch(
+  github: FugueGitHub,
+  request: IntegrationRequest,
+  authorizedAt = new Date().toISOString(),
+  secret = randomBytes(32).toString("hex"),
+): Promise<{ secret: string; authorization: IntegrationDispatchAuthorization }> {
+  if (!/^[0-9a-f]{64}$/i.test(secret)) throw new Error("Integration dispatch secret must be 256-bit hexadecimal.");
+  const secretDigest = createHash("sha256").update(secret, "utf8").digest("hex");
+  const authorization = integrationDispatchAuthorizationSchema.parse({ secret_digest: secretDigest, authorized_at: authorizedAt });
+  const anchor = integrationDispatchAnchorSchema.parse({
+    version: 1,
+    kind: "integration_dispatch_anchor",
+    request_id: request.request_id,
+    pr_number: request.identity.prNumber,
+    head_sha: request.identity.headSha,
+    base_sha: request.identity.baseSha,
+    secret_digest: secretDigest,
+    authorized_at: authorizedAt,
+  });
+  await createIntegrationDispatchAnchor(github, request, anchor);
+  return { secret, authorization };
+}
+
+async function createIntegrationDispatchAnchor(
+  github: FugueGitHub,
+  request: IntegrationRequest,
+  anchor: IntegrationDispatchAnchor,
+): Promise<void> {
+  const { owner, repo } = github.repository;
+  await assertRepositoryDefaultBranchRevision(github, request.identity.baseSha);
+  const signed = await signProtocolBody(github, serializeIntegrationDispatchAnchor(anchor));
+  const timestamp = Date.parse(anchor.authorized_at);
+  if (!(await verifyProtocolPublicationBodyAtRevision(github, signed, request.identity.baseSha, timestamp))) {
+    throw new Error("Protected Integration dispatch anchor failed publisher self-check.");
+  }
+  const parent = await github.octokit.rest.git.getCommit({ owner, repo, commit_sha: request.identity.baseSha });
+  const commit = await github.octokit.rest.git.createCommit({
+    owner,
+    repo,
+    message: signed,
+    tree: parent.data.tree.sha,
+    parents: [request.identity.baseSha],
+  });
+  await assertRepositoryDefaultBranchRevision(github, request.identity.baseSha);
+  const ref = integrationEvidenceRefName(anchor.secret_digest);
+  try {
+    await github.octokit.rest.git.createRef({ owner, repo, ref: `refs/${ref}`, sha: commit.data.sha });
+  } catch (error) {
+    if (httpStatus(error) !== 422) throw error;
+    const existing = await readIntegrationEvidenceHead(github, ref);
+    const parsed = existing ? parseIntegrationDispatchAnchor(existing.message) : null;
+    if (!parsed || JSON.stringify(parsed) !== JSON.stringify(anchor) ||
+        !(await verifyProtocolPublicationBodyAtRevision(github, existing!.message, request.identity.baseSha, timestamp))) {
+      throw new Error(`Integration dispatch evidence ref ${ref} already exists with different authority.`);
+    }
+  }
+}
+
+async function readIntegrationEvidenceHead(
+  github: FugueGitHub,
+  ref: string,
+): Promise<{ sha: string; message: string; treeSha: string; parents: string[] } | undefined> {
+  const { owner, repo } = github.repository;
+  let sha: string;
+  try {
+    const response = await github.octokit.rest.git.getRef({ owner, repo, ref });
+    sha = response.data.object.sha;
+  } catch (error) {
+    if (httpStatus(error) === 404) return undefined;
+    throw error;
+  }
+  const commit = await github.octokit.rest.git.getCommit({ owner, repo, commit_sha: sha });
+  return {
+    sha,
+    message: commit.data.message ?? "",
+    treeSha: commit.data.tree.sha,
+    parents: commit.data.parents.map((parent) => parent.sha),
+  };
+}
+
+async function verifyIntegrationDispatchAnchor(
+  github: FugueGitHub,
+  record: IntegrationRecord,
+  body: string,
+): Promise<IntegrationDispatchAnchor | undefined> {
+  let anchor: IntegrationDispatchAnchor | null;
+  try { anchor = parseIntegrationDispatchAnchor(body); } catch { return undefined; }
+  if (!anchor || !record.dispatch) return undefined;
+  if (anchor.request_id !== record.request.request_id || anchor.pr_number !== record.identity.prNumber ||
+      anchor.head_sha !== record.identity.headSha || anchor.base_sha !== record.identity.baseSha ||
+      anchor.secret_digest !== record.dispatch.secret_digest || anchor.authorized_at !== record.dispatch.authorized_at) return undefined;
+  const timestamp = Date.parse(anchor.authorized_at);
+  if (!Number.isFinite(timestamp) ||
+      !(await verifyProtocolPublicationBodyAtRevision(github, body, record.identity.baseSha, timestamp))) return undefined;
+  return anchor;
+}
+
+export async function getIntegrationRunStartEvidence(
+  github: FugueGitHub,
+  record: IntegrationRecord,
+): Promise<IntegrationRunStartEvidence | undefined> {
+  if (!record.dispatch) return undefined;
+  const ref = integrationEvidenceRefName(record.dispatch.secret_digest);
+  const head = await readIntegrationEvidenceHead(github, ref);
+  if (!head) throw new Error(`Durable Integration dispatch evidence ref ${ref} is missing.`);
+  let start: IntegrationRunStartEvidence | null;
+  try { start = parseIntegrationRunStart(head.message); } catch { start = null; }
+  if (!start) {
+    if (!(await verifyIntegrationDispatchAnchor(github, record, head.message))) {
+      throw new Error(`Durable Integration dispatch evidence ref ${ref} is not a valid protected anchor.`);
+    }
+    return undefined;
+  }
+  if (start.request_id !== record.request.request_id || start.pr_number !== record.identity.prNumber ||
+      start.head_sha !== record.identity.headSha || start.base_sha !== record.identity.baseSha ||
+      start.secret_digest !== record.dispatch.secret_digest || start.run_attempt !== 1) {
+    throw new Error(`Protected Integration run-start evidence ${ref} does not match its durable request.`);
+  }
+  const timestamp = Date.parse(start.created_at);
+  if (!Number.isFinite(timestamp) ||
+      !(await verifyProtocolPublicationBodyAtRevision(github, head.message, record.identity.baseSha, timestamp))) {
+    throw new Error(`Protected Integration run-start evidence ${ref} has invalid provenance.`);
+  }
+  const parentSha = head.parents[0];
+  if (!parentSha) throw new Error(`Protected Integration run-start evidence ${ref} has no dispatch-anchor parent.`);
+  const { owner, repo } = github.repository;
+  const parent = await github.octokit.rest.git.getCommit({ owner, repo, commit_sha: parentSha });
+  if (!(await verifyIntegrationDispatchAnchor(github, record, parent.data.message ?? ""))) {
+    throw new Error(`Protected Integration run-start evidence ${ref} is not descended from its authorized dispatch anchor.`);
+  }
+  return start;
+}
+
+function integrationRunBindingFromEvidence(github: FugueGitHub, evidence: IntegrationRunStartEvidence): IntegrationRunBinding {
+  return {
+    id: evidence.run_id,
+    attempt: 1,
+    created_at: evidence.created_at,
+    html_url: `https://github.com/${github.repository.fullName}/actions/runs/${evidence.run_id}`,
+  };
+}
 
 export async function currentIntegrationState(
   github: FugueGitHub,
@@ -66,43 +286,35 @@ export async function currentIntegrationState(
   }
   if (!record) return { state: "none" };
   const request = record.request;
-
   if (record.terminal) {
     if (record.terminal.state === "success") {
-      return {
-        state: "success",
-        request,
-        attestation: record.terminal.attestation,
-        targetUrl: record.run?.html_url,
-      };
+      return { state: "success", request, attestation: record.terminal.attestation, targetUrl: record.run?.html_url };
     }
     if (record.terminal.state === "aborted") return { state: "none" };
     return { state: record.terminal.state, request, targetUrl: record.run?.html_url };
   }
 
-  if (record.run) {
-    const bound = await getBoundIntegrationWorkflowRun(github, record);
-    if (!bound) return { state: "pending", request };
-    if (bound.status !== "completed") return { state: "pending", request, targetUrl: bound.htmlUrl };
-    if (isRecoverableAbortedRun(bound.status, bound.conclusion)) return { state: "none", request };
-    if (bound.conclusion === "failure") return { state: "failure", request, targetUrl: bound.htmlUrl };
-    return { state: "pending", request, targetUrl: bound.htmlUrl };
-  }
-
-  const first = await findIntegrationWorkflowRun(github, request);
-  if (first) {
-    if (first.status !== "completed") return { state: "pending", request, targetUrl: first.htmlUrl };
-    if (first.conclusion === "failure") return { state: "failure", request, targetUrl: first.htmlUrl };
-    if (isRecoverableAbortedRun(first.status, first.conclusion)) return { state: "none", request };
-    return { state: "pending", request, targetUrl: first.htmlUrl };
+  const evidence = await getIntegrationRunStartEvidence(github, record);
+  const binding = record.run ?? (evidence ? integrationRunBindingFromEvidence(github, evidence) : undefined);
+  if (binding) {
+    const live = await getIntegrationWorkflowRunForBinding(github, request, binding);
+    if (!live) {
+      const started = Date.parse(binding.created_at);
+      return Number.isFinite(started) && now - started >= INTEGRATION_REQUEST_RECOVERY_GRACE_MS
+        ? { state: "failure", request, targetUrl: binding.html_url }
+        : { state: "pending", request, targetUrl: binding.html_url };
+    }
+    if (live.status !== "completed") return { state: "pending", request, targetUrl: live.htmlUrl };
+    if (live.conclusion === "failure") return { state: "failure", request, targetUrl: live.htmlUrl };
+    if (isRecoverableAbortedRun(live.status, live.conclusion)) return { state: "none", request };
+    return { state: "pending", request, targetUrl: live.htmlUrl };
   }
 
   const created = Date.parse(request.created_at);
   if (!Number.isFinite(created)) return { state: "error", request };
-  if (now - created < INTEGRATION_REQUEST_RECOVERY_GRACE_MS) return { state: "pending", request };
-  // Absence is ambiguous under actions:write: a protected run may have completed and been deleted
-  // while its immutable workflow_run completion event is still queued for protected reconciliation.
-  return { state: "pending", request };
+  return now - created >= INTEGRATION_REQUEST_RECOVERY_GRACE_MS
+    ? { state: "none", request }
+    : { state: "pending", request };
 }
 
 export interface DurableIntegrationWorkflowRunEvent {
@@ -131,25 +343,18 @@ export async function sealIntegrationWorkflowRunEvent(
   if (!Number.isInteger(prNumber) || prNumber <= 0) return false;
   const { owner, repo } = github.repository;
   const pr = await github.octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
-  const identity = {
-    prNumber,
-    headSha: pr.data.head.sha,
-    baseBranch: pr.data.base.ref,
-    baseSha: event.headSha,
-  };
   let record: IntegrationRecord | undefined;
   try {
     const recovered = await recoverDurableProtocolRecord(github, {
-      storageSha: identity.headSha,
-      publisherSha: identity.baseSha,
+      storageSha: pr.data.head.sha,
+      publisherSha: event.headSha,
       scope: integrationScope(prNumber),
       issueNumber: prNumber,
       parse: parseIntegrationRecord,
       timestamp: (value) => Date.parse(value.created_at),
       order: (value) => value.created_at,
-      validate: (value) => value.identity.prNumber === prNumber &&
-        value.identity.headSha === identity.headSha && value.identity.baseSha === identity.baseSha &&
-        value.request.request_id === match[2],
+      validate: (value) => value.identity.prNumber === prNumber && value.identity.headSha === pr.data.head.sha &&
+        value.identity.baseSha === event.headSha && value.request.request_id === match[2],
     });
     if (!recovered.record) return false;
     record = recovered.record.value;
@@ -157,47 +362,40 @@ export async function sealIntegrationWorkflowRunEvent(
     if (error instanceof DurableProtocolRecoveryPendingError) return false;
     throw error;
   }
-  if (record.terminal && (!record.run || record.run.id <= event.runId)) return false;
-  if (Date.parse(event.createdAt) < Date.parse(record.request.created_at)) return false;
-  if (record.run && record.run.id < event.runId) return false;
-
-  const visibleFirst = await findIntegrationWorkflowRun(github, record.request);
-  if (visibleFirst && visibleFirst.id < event.runId) return false;
-  const binding: IntegrationRunBinding = { id: event.runId, attempt: 1, created_at: event.createdAt, html_url: event.htmlUrl };
-  const conclusion = event.conclusion;
-  if (conclusion === "cancelled") {
+  if (record.terminal) return false;
+  const evidence = await getIntegrationRunStartEvidence(github, record);
+  if (!evidence || evidence.run_id !== event.runId) return false;
+  const binding = integrationRunBindingFromEvidence(github, evidence);
+  if (record.run && record.run.id !== binding.id) return false;
+  const createdAt = new Date().toISOString();
+  if (event.conclusion === "cancelled") {
     await publishIntegrationRecord(github, {
-      ...record,
-      run: binding,
-      terminal: { state: "aborted", detail: "Protected attempt 1 completed cancelled.", created_at: new Date().toISOString() },
-      created_at: new Date().toISOString(),
+      ...record, run: binding,
+      terminal: { state: "aborted", detail: "Protected attempt 1 completed cancelled.", created_at: createdAt },
+      created_at: createdAt,
     });
     return true;
   }
-  if (conclusion === "failure") {
+  if (event.conclusion === "failure") {
     await publishIntegrationRecord(github, {
-      ...record,
-      run: binding,
-      terminal: { state: "failure", detail: "Protected attempt 1 completed failure (sealed from immutable workflow_run event).", created_at: new Date().toISOString() },
-      created_at: new Date().toISOString(),
+      ...record, run: binding,
+      terminal: { state: "failure", detail: "Protected attempt 1 completed failure.", created_at: createdAt },
+      created_at: createdAt,
     });
     return true;
   }
-  if (conclusion === "success") {
-    // A successful workflow must already have committed terminal PASS. Missing PASS is fail-closed.
+  if (event.conclusion === "success") {
     await publishIntegrationRecord(github, {
-      ...record,
-      run: binding,
-      terminal: { state: "error", detail: "Protected attempt 1 completed success without durable terminal PASS evidence.", created_at: new Date().toISOString() },
-      created_at: new Date().toISOString(),
+      ...record, run: binding,
+      terminal: { state: "error", detail: "Protected attempt 1 completed success without durable terminal PASS evidence.", created_at: createdAt },
+      created_at: createdAt,
     });
     return true;
   }
   await publishIntegrationRecord(github, {
-    ...record,
-    run: binding,
-    terminal: { state: "error", detail: `Protected attempt 1 completed ${conclusion ?? "without conclusion"}; only observed cancellation is retryable.`, created_at: new Date().toISOString() },
-    created_at: new Date().toISOString(),
+    ...record, run: binding,
+    terminal: { state: "error", detail: `Protected attempt 1 completed ${event.conclusion ?? "without conclusion"}.`, created_at: createdAt },
+    created_at: createdAt,
   });
   return true;
 }
@@ -246,19 +444,18 @@ export async function publishIntegrationRecord(
 ): Promise<IntegrationRecord> {
   const current = await getCurrentIntegrationRecord(github, record.identity);
   if (current && sameIntegrationRecord(current, record)) return current;
-  const correctingEarlierRun = Boolean(
-    current?.run && record.run &&
-    current.request.request_id === record.request.request_id &&
-    record.run.id < current.run.id
-  );
-  if (current && current.terminal && current.terminal.state !== "aborted" && !correctingEarlierRun) {
+  if (current && current.terminal && current.terminal.state !== "aborted") {
     throw new Error(`Integration request ${current.request.request_id} already has terminal ${current.terminal.state} authority.`);
   }
   if (current && record.request.request_id !== current.request.request_id && current.terminal?.state !== "aborted") {
     throw new Error(`Cannot replace active Integration request ${current.request.request_id}.`);
   }
-  if (current?.run && record.run && current.run.id !== record.run.id && !correctingEarlierRun) {
-    throw new Error(`Integration request ${record.request.request_id} is already bound to earlier protected run ${current.run.id}.`);
+  if (current && record.request.request_id === current.request.request_id &&
+      JSON.stringify(current.dispatch) !== JSON.stringify(record.dispatch)) {
+    throw new Error(`Integration request ${record.request.request_id} cannot replace its protected dispatch authorization.`);
+  }
+  if (current?.run && record.run && current.run.id !== record.run.id) {
+    throw new Error(`Integration request ${record.request.request_id} is already bound to protected run ${current.run.id}.`);
   }
 
   const minimum = current ? Date.parse(current.created_at) + 1 : 0;
@@ -282,7 +479,7 @@ export async function ensureIntegrationDispatch(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
   now = Date.now(),
-): Promise<{ request?: IntegrationRequest; dispatch: boolean }> {
+): Promise<{ request?: IntegrationRequest; dispatch: boolean; dispatchSecret?: string }> {
   let current: IntegrationRecord | undefined;
   try {
     current = await getCurrentIntegrationRecord(github, snapshot.identity);
@@ -290,101 +487,90 @@ export async function ensureIntegrationDispatch(
     if (error instanceof DurableProtocolRecoveryPendingError) return { dispatch: false };
     throw error;
   }
+  if (current?.terminal && current.terminal.state !== "aborted") return { request: current.request, dispatch: false };
+  if (current?.terminal?.state === "aborted") current = undefined;
 
-  if (current?.terminal && current.terminal.state !== "aborted") {
-    return { request: current.request, dispatch: false };
-  }
-
-  if (current?.run) {
-    const bound = await getBoundIntegrationWorkflowRun(github, current);
-    if (!bound) {
-      // The immutable workflow_run completion event is the authority for failure vs cancellation.
-      // Until it is sealed, disappearance is fail-closed pending and never permits redispatch.
-      return { request: current.request, dispatch: false };
-    } else if (isRecoverableAbortedRun(bound.status, bound.conclusion)) {
+  if (current) {
+    const evidence = await getIntegrationRunStartEvidence(github, current);
+    if (evidence && !current.run) {
+      current = await publishIntegrationRecord(github, {
+        ...current,
+        run: integrationRunBindingFromEvidence(github, evidence),
+        created_at: new Date(now).toISOString(),
+      });
+    }
+    if (current.run) {
+      const bound = await getBoundIntegrationWorkflowRun(github, current);
+      if (!bound) {
+        const started = Date.parse(current.run.created_at);
+        if (!Number.isFinite(started) || now - started < INTEGRATION_REQUEST_RECOVERY_GRACE_MS) {
+          return { request: current.request, dispatch: false };
+        }
+        await publishIntegrationRecord(github, {
+          ...current,
+          terminal: {
+            state: "failure",
+            detail: "Protected attempt 1 crossed its durable run-start boundary but the Actions run disappeared before terminal publication; deletion can never downgrade possible failure into retry.",
+            created_at: new Date(now).toISOString(),
+          },
+          created_at: new Date(now).toISOString(),
+        });
+        return { request: current.request, dispatch: false };
+      }
+      if (bound.status !== "completed") return { request: current.request, dispatch: false };
+      if (isRecoverableAbortedRun(bound.status, bound.conclusion)) {
+        await publishIntegrationRecord(github, {
+          ...current,
+          terminal: { state: "aborted", detail: `Protected attempt 1 concluded ${bound.conclusion}.`, created_at: new Date(now).toISOString() },
+          created_at: new Date(now).toISOString(),
+        });
+        current = undefined;
+      } else if (bound.conclusion === "failure") {
+        await publishIntegrationRecord(github, {
+          ...current,
+          terminal: { state: "failure", detail: "Protected Integration attempt 1 completed failure before terminal publication.", created_at: new Date(now).toISOString() },
+          created_at: new Date(now).toISOString(),
+        });
+        return { request: current.request, dispatch: false };
+      } else {
+        await publishIntegrationRecord(github, {
+          ...current,
+          terminal: { state: "error", detail: "Protected Integration attempt 1 completed without durable terminal PASS evidence.", created_at: new Date(now).toISOString() },
+          created_at: new Date(now).toISOString(),
+        });
+        return { request: current.request, dispatch: false };
+      }
+    } else if (!evidence) {
+      const created = Date.parse(current.request.created_at);
+      if (!Number.isFinite(created) || now - created < INTEGRATION_REQUEST_RECOVERY_GRACE_MS) {
+        return { request: current.request, dispatch: false };
+      }
       await publishIntegrationRecord(github, {
         ...current,
         terminal: {
           state: "aborted",
-          detail: `Protected attempt 1 concluded ${bound.conclusion}.`,
+          detail: "Authorized Integration dispatch never crossed its protected run-start boundary; transport may recover with a fresh request.",
           created_at: new Date(now).toISOString(),
         },
         created_at: new Date(now).toISOString(),
       });
       current = undefined;
-    } else if (bound.status === "completed" && bound.conclusion === "failure") {
-      await publishIntegrationRecord(github, {
-        ...current,
-        terminal: {
-          state: "failure",
-          detail: "Protected Integration attempt 1 completed failure before its terminal mirror was observed.",
-          created_at: new Date(now).toISOString(),
-        },
-        created_at: new Date(now).toISOString(),
-      });
-      return { request: current.request, dispatch: false };
-    } else {
-      return { request: current.request, dispatch: false };
     }
-  }
-
-  if (current && !current.terminal) {
-    const first = await findIntegrationWorkflowRun(github, current.request);
-    const requestCreated = Date.parse(current.request.created_at);
-    if (first && first.status !== "completed") return { request: current.request, dispatch: false };
-    if (first?.conclusion === "failure") {
-      const run = integrationRunBinding(first);
-      await publishIntegrationRecord(github, {
-        ...current,
-        run,
-        terminal: {
-          state: "failure",
-          detail: "The request's first protected attempt completed failure before Fugue prepare could bind it.",
-          created_at: new Date(now).toISOString(),
-        },
-        created_at: new Date(now).toISOString(),
-      });
-      return { request: current.request, dispatch: false };
-    }
-    if (first && !isRecoverableAbortedRun(first.status, first.conclusion)) {
-      const run = integrationRunBinding(first);
-      await publishIntegrationRecord(github, {
-        ...current,
-        run,
-        terminal: {
-          state: "error",
-          detail: `The request's first protected attempt completed ${first.conclusion ?? "without a conclusion"} without durable terminal Integration evidence.`,
-          created_at: new Date(now).toISOString(),
-        },
-        created_at: new Date(now).toISOString(),
-      });
-      return { request: current.request, dispatch: false };
-    }
-    if (!first) {
-      // Absence is ambiguous under actions:write because a genuine failed attempt may have been deleted.
-      // The protected workflow_run completion event seals observable cancellation/failure; no missing run is retried.
-      return { request: current.request, dispatch: false };
-    }
-    await publishIntegrationRecord(github, {
-      ...current,
-      run: integrationRunBinding(first),
-      terminal: {
-        state: "aborted",
-        detail: `First protected run ${first.id} concluded ${first.conclusion}; only an observed aborted transport outcome permits a fresh request.`,
-        created_at: new Date(now).toISOString(),
-      },
-      created_at: new Date(now).toISOString(),
-    });
   }
 
   const request = createIntegrationRequest(snapshot.identity, new Date(now).toISOString());
-  await publishIntegrationRecord(github, createIntegrationRecord(request, { createdAt: new Date(now).toISOString() }));
+  const authorizedAt = new Date(now).toISOString();
+  const authorized = await authorizeIntegrationDispatch(github, request, authorizedAt);
+  await publishIntegrationRecord(github, createIntegrationRecord(request, {
+    dispatch: authorized.authorization,
+    createdAt: authorizedAt,
+  }));
   await createProtocolComment(
     github,
     snapshot.identity.prNumber,
     `INTEGRATION — REQUESTED\n\nHead: \`${snapshot.identity.headSha}\`\nRequest: \`${request.request_id}\`\n\n<!-- fugue-integration-request-mirror\nversion: 1\nrequest_id: ${request.request_id}\n-->`,
   );
-  return { request, dispatch: true };
+  return { request, dispatch: true, dispatchSecret: authorized.secret };
 }
 
 export async function bindIntegrationRun(
@@ -398,48 +584,18 @@ export async function bindIntegrationRun(
     throw new Error(`Integration run ${runId} does not match an active durable request ${requestId}.`);
   }
   if (current.run) {
-    if (current.run.id !== runId) {
-      throw new Error(`Integration request ${requestId} is already bound to protected run ${current.run.id}.`);
-    }
+    if (current.run.id !== runId) throw new Error(`Integration request ${requestId} is already bound to protected run ${current.run.id}.`);
     return current;
   }
-
-  const first = await findIntegrationWorkflowRun(github, current.request);
-  if (!first || first.id !== runId) {
-    throw new Error(`Integration run ${runId} is not the first causally valid protected attempt for request ${requestId}.`);
+  const evidence = await getIntegrationRunStartEvidence(github, current);
+  if (!evidence || evidence.run_id !== runId) {
+    throw new Error(`Integration run ${runId} does not match the one-use protected dispatch evidence for request ${requestId}.`);
   }
   return publishIntegrationRecord(github, {
     ...current,
-    run: integrationRunBinding(first),
+    run: integrationRunBindingFromEvidence(github, evidence),
     created_at: new Date().toISOString(),
   });
-}
-
-export async function findIntegrationWorkflowRun(
-  github: FugueGitHub,
-  request: IntegrationRequest,
-): Promise<IntegrationWorkflowRun | undefined> {
-  const { owner, repo } = github.repository;
-  const requestCreated = Date.parse(request.created_at);
-  if (!Number.isFinite(requestCreated)) return undefined;
-  const runs = await github.octokit.paginate(github.octokit.rest.actions.listWorkflowRuns, {
-    owner,
-    repo,
-    workflow_id: "fugue-integration.yml",
-    event: "workflow_dispatch",
-    head_sha: request.identity.baseSha,
-    per_page: 100,
-  });
-  const candidates = (runs as unknown as WorkflowRunRecord[])
-    .filter((run) => matchesIntegrationRunIdentity(run, request, requestCreated))
-    .sort((left, right) => left.id - right.id);
-  for (const run of candidates) {
-    const attempt = await firstAttempt(github, run);
-    if (!attempt || !matchesIntegrationRunIdentity(attempt, request, requestCreated)) continue;
-    if (normalizedRunAttempt(attempt.run_attempt) !== 1) continue;
-    return workflowRun(attempt);
-  }
-  return undefined;
 }
 
 export async function getBoundIntegrationWorkflowRun(
@@ -447,39 +603,31 @@ export async function getBoundIntegrationWorkflowRun(
   record: IntegrationRecord,
 ): Promise<IntegrationWorkflowRun | undefined> {
   if (!record.run) return undefined;
+  return getIntegrationWorkflowRunForBinding(github, record.request, record.run);
+}
+
+async function getIntegrationWorkflowRunForBinding(
+  github: FugueGitHub,
+  request: IntegrationRequest,
+  binding: IntegrationRunBinding,
+): Promise<IntegrationWorkflowRun | undefined> {
   const { owner, repo } = github.repository;
   try {
     const response = await github.octokit.rest.actions.getWorkflowRunAttempt({
       owner,
       repo,
-      run_id: record.run.id,
+      run_id: binding.id,
       attempt_number: 1,
     });
     const run = response.data as unknown as WorkflowRunRecord;
-    const requestCreated = Date.parse(record.request.created_at);
-    if (!matchesIntegrationRunIdentity(run, record.request, requestCreated)) return undefined;
+    const requestCreated = Date.parse(request.created_at);
+    if (!matchesIntegrationRunIdentity(run, request, requestCreated)) return undefined;
     if (normalizedRunAttempt(run.run_attempt) !== 1) return undefined;
     return workflowRun(run);
   } catch (error) {
     if (httpStatus(error) === 404) return undefined;
     throw error;
   }
-}
-
-async function firstAttempt(github: FugueGitHub, run: WorkflowRunRecord): Promise<WorkflowRunRecord | undefined> {
-  if (normalizedRunAttempt(run.run_attempt) === 1) return run;
-  const { owner, repo } = github.repository;
-  try {
-    const response = await github.octokit.rest.actions.getWorkflowRunAttempt({ owner, repo, run_id: run.id, attempt_number: 1 });
-    return response.data as unknown as WorkflowRunRecord;
-  } catch (error) {
-    if (httpStatus(error) === 404) return undefined;
-    throw error;
-  }
-}
-
-function integrationRunBinding(run: IntegrationWorkflowRun): IntegrationRunBinding {
-  return { id: run.id, attempt: 1, created_at: run.createdAt, html_url: run.htmlUrl };
 }
 
 function workflowRun(run: WorkflowRunRecord): IntegrationWorkflowRun {

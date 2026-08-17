@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
   assertWorkMetadataForIssue,
@@ -10,6 +11,7 @@ import { beginReview } from "./reviews.js";
 import { resolveActivePolicy, type ActivePolicy } from "./policy.js";
 import {
   canonicalRequirements,
+  compareCoordinatorSnapshots,
   coordinatorSnapshotSchema,
   createCanonicalWorkState,
   publishCoordinatorSnapshot,
@@ -44,6 +46,7 @@ export interface CoordinatorIssueEvent {
   action: string;
   actor: string;
   eventId?: string;
+  eventSequence?: number;
   issueNumber?: number;
   label?: string;
   issueTitle?: string;
@@ -201,6 +204,7 @@ export async function preserveCoordinatorIssueEvent(
     version: 1,
     kind: "coordinator_snapshot",
     event_id: event.eventId ?? `${event.issueNumber}:${event.issueUpdatedAt}:${event.action}:${event.label ?? ""}`,
+    event_sequence: event.eventSequence ?? 0,
     event_name: "issues",
     action: event.action,
     actor: event.actor,
@@ -237,13 +241,13 @@ export async function ingestCoordinatorSnapshot(
 ): Promise<boolean> {
   const latest = await recoverCoordinatorSnapshots(github, policy);
   const current = latest.find((candidate) => candidate.issue === snapshot.issue);
-  if (current && (Date.parse(current.issue_updated_at) > Date.parse(snapshot.issue_updated_at) ||
-      (current.issue_updated_at === snapshot.issue_updated_at && current.event_id > snapshot.event_id))) return false;
+  if (current && compareCoordinatorSnapshots(current, snapshot) > 0) return false;
   return ingestCoordinatorIssueEvent(github, policy, {
     eventName: snapshot.event_name,
     action: snapshot.action,
     actor: snapshot.actor,
     eventId: snapshot.event_id,
+    eventSequence: snapshot.event_sequence,
     issueNumber: snapshot.issue,
     ...(snapshot.label ? { label: snapshot.label } : {}),
     issueTitle: snapshot.title,
@@ -445,13 +449,13 @@ export async function dispatchIntegration(github: FugueGitHub, policy: ActivePol
     throw new Error(`Integration dispatch base changed while reconciling PR #${prNumber}.`);
   }
   const next = await ensureIntegrationDispatch(github, snapshot, now);
-  if (!next.dispatch || !next.request) return;
+  if (!next.dispatch || !next.request || !next.dispatchSecret) return;
   await github.octokit.rest.actions.createWorkflowDispatch({
     owner,
     repo,
     workflow_id: "fugue-integration.yml",
     ref: policy.identity.baseBranch,
-    inputs: { pr: prNumber, request_id: next.request.request_id },
+    inputs: { pr: prNumber, request_id: next.request.request_id, dispatch_secret: next.dispatchSecret },
   });
 }
 
@@ -572,12 +576,27 @@ export function coordinatorIssueEventFromEnvironment(): CoordinatorIssueEvent | 
     ? issue.labels.map((item) => typeof item === "string" ? item : typeof item.name === "string" ? item.name : "").filter(Boolean)
     : undefined;
   const rawId = typeof issue?.id === "number" ? String(issue.id) : String(issueNumber ?? "issue");
-  const eventId = `${rawId}:${issueUpdatedAt ?? process.env.GITHUB_RUN_ID ?? "unknown"}:${action}:${label ?? ""}`;
+  const runId = process.env.GITHUB_RUN_ID ?? "0";
+  const runNumber = Number(process.env.GITHUB_RUN_NUMBER ?? process.env.GITHUB_RUN_ID ?? "0");
+  const eventSequence = Number.isInteger(runNumber) && runNumber >= 0 ? runNumber : 0;
+  const eventDigest = createHash("sha256").update(JSON.stringify({
+    rawId,
+    issueNumber,
+    action,
+    actor,
+    label: label ?? "",
+    issueTitle: issueTitle ?? "",
+    issueBody: issueBody ?? "",
+    issueLabels: issueLabels ?? [],
+    issueUpdatedAt: issueUpdatedAt ?? "",
+  }), "utf8").digest("hex").slice(0, 24);
+  const eventId = `${runId}:${eventDigest}`;
   return {
     eventName,
     action,
     actor,
     eventId,
+    eventSequence,
     ...(issueNumber ? { issueNumber } : {}),
     ...(label ? { label } : {}),
     ...(issueTitle !== undefined ? { issueTitle } : {}),
