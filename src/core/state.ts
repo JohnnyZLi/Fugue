@@ -52,6 +52,7 @@ const RECOVERY_PACK_MAX_ENTRIES = 16;
 const RECOVERY_PACK_VALUE_LIMIT = 44 * 1024;
 const MANIFEST_PATTERN = /^n=(\d+);c=([0-9a-f]{32});b=([0-9a-f]{64});a=(\d+);z=(\d+)$/i;
 const DURABLE_MANIFEST_URL = "https://token.actions.githubusercontent.com/fugue/d3";
+const WORK_AUTHORITY_PREFIX = "work-v2:";
 
 const stateLabelSchema = z.enum(["state:ready", "state:working", "state:blocked"]);
 const canonicalPrSchema = z.object({
@@ -72,6 +73,8 @@ export const canonicalWorkStateSchema = z.object({
   pr: canonicalPrSchema.nullable(),
   base_sha: z.string().regex(/^[0-9a-f]{40}$/i),
   created_at: z.string().min(1),
+  authority_sequence: z.number().int().nonnegative().optional(),
+  parent_digest: z.string().regex(/^sha256:[0-9a-f]{64}$/i).nullable().optional(),
 });
 
 export const coordinatorSnapshotSchema = z.object({
@@ -216,8 +219,21 @@ export function createCanonicalWorkState(input: {
   pr?: CanonicalPrState | null;
   baseSha: string;
   createdAt?: string;
+  predecessor?: CanonicalWorkState;
+  logicalRoot?: boolean;
 }): CanonicalWorkState {
   assertWorkMetadataForIssue(input.metadata, input.issue);
+  const predecessor = input.predecessor ? canonicalWorkStateSchema.parse(input.predecessor) : undefined;
+  if (predecessor && (predecessor.issue !== input.issue || predecessor.base_sha.toLowerCase() !== input.baseSha.toLowerCase())) {
+    throw new CanonicalWorkStateIntegrityError("Canonical work-state predecessor does not match the proposed issue/base identity.");
+  }
+  if (predecessor && input.logicalRoot) {
+    throw new CanonicalWorkStateIntegrityError("Canonical work-state publication cannot be both a logical root and a successor.");
+  }
+  const authoritySequence = predecessor
+    ? (predecessor.authority_sequence ?? -1) + 1
+    : input.logicalRoot ? 0 : undefined;
+  const parentDigest = predecessor ? canonicalWorkStateDigest(predecessor) : input.logicalRoot ? null : undefined;
   return canonicalWorkStateSchema.parse({
     version: 1,
     kind: "work_state",
@@ -230,7 +246,19 @@ export function createCanonicalWorkState(input: {
     pr: input.pr ?? null,
     base_sha: input.baseSha,
     created_at: input.createdAt ?? new Date().toISOString(),
+    ...(authoritySequence === undefined ? {} : { authority_sequence: authoritySequence, parent_digest: parentDigest }),
   });
+}
+
+function canonicalWorkStateDigest(state: CanonicalWorkState): string {
+  const parsed = canonicalWorkStateSchema.parse(state);
+  return `sha256:${createHash("sha256").update(JSON.stringify(parsed), "utf8").digest("hex")}`;
+}
+
+function canonicalWorkAuthorityOrder(state: CanonicalWorkState): string {
+  return state.authority_sequence === undefined
+    ? state.created_at
+    : `${WORK_AUTHORITY_PREFIX}${String(state.authority_sequence).padStart(20, "0")}`;
 }
 
 export function canonicalRequirements(state: CanonicalWorkState): string {
@@ -276,7 +304,10 @@ export function sameCanonicalWorkState(left: CanonicalWorkState, right: Canonica
 }
 
 function exactCanonicalWorkState(left: CanonicalWorkState, right: CanonicalWorkState): boolean {
-  return sameCanonicalWorkState(left, right) && left.created_at === right.created_at;
+  return sameCanonicalWorkState(left, right) &&
+    left.created_at === right.created_at &&
+    left.authority_sequence === right.authority_sequence &&
+    left.parent_digest === right.parent_digest;
 }
 
 function durablePrefix(scope: string): string {
@@ -752,6 +783,35 @@ export async function createFugueAuthorityVariable(github: FugueGitHub, name: st
   throw new CanonicalWorkStateIntegrityError(`Unable to create protected Fugue authority variable ${name} (${response.status}).`);
 }
 
+async function deleteAuthorityVariableIfExact(github: FugueGitHub, name: string, expectedValue: string): Promise<void> {
+  if (await getFugueAuthorityVariable(github, name) !== expectedValue) return;
+  await deleteFugueAuthorityVariable(github, name);
+  if (await getFugueAuthorityVariable(github, name) === expectedValue) {
+    throw new CanonicalWorkStateIntegrityError(`Unable to roll back stale protected Fugue authority variable ${name}.`);
+  }
+}
+
+async function createFugueAuthorityVariableAtRevision(
+  github: FugueGitHub,
+  name: string,
+  value: string,
+  expectedPublisherSha: string,
+): Promise<boolean> {
+  await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
+  const created = await createFugueAuthorityVariable(github, name, value);
+  if (!created) return false;
+  try {
+    // The repository-variable API cannot predicate the POST on another resource's SHA. Treat the
+    // write as provisional until a post-mutation re-proof succeeds; a stale write is removed before
+    // this call can report a committed Authority witness.
+    await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
+    return true;
+  } catch (error) {
+    await deleteAuthorityVariableIfExact(github, name, value);
+    throw error;
+  }
+}
+
 export async function updateFugueAuthorityVariable(github: FugueGitHub, name: string, value: string): Promise<void> {
   const injected = injectedAuthorityVariables(github);
   if (injected) {
@@ -780,6 +840,42 @@ export async function deleteFugueAuthorityVariable(github: FugueGitHub, name: st
   }
 }
 
+async function rollbackFugueAuthorityVariableReplacement(
+  github: FugueGitHub,
+  sourceName: string,
+  expectedSourceValue: string,
+  targetName: string,
+  targetValue: string,
+): Promise<void> {
+  const injected = injectedAuthorityVariables(github);
+  if (injected) {
+    if (injected.get(sourceName) === expectedSourceValue && !injected.has(targetName)) return;
+    if (!injected.has(sourceName) && injected.get(targetName) === targetValue) {
+      injected.delete(targetName);
+      injected.set(sourceName, expectedSourceValue);
+    }
+    if (injected.get(sourceName) === expectedSourceValue && !injected.has(targetName)) return;
+    throw new CanonicalWorkStateIntegrityError(
+      `Unable to roll back stale protected Fugue authority replacement ${sourceName} -> ${targetName}.`,
+    );
+  }
+
+  const source = await getFugueAuthorityVariable(github, sourceName);
+  const target = await getFugueAuthorityVariable(github, targetName);
+  if (source === expectedSourceValue && target === undefined) return;
+  if (source === undefined && target === targetValue) {
+    const response = await authorityRequest(github, `/actions/variables/${encodeURIComponent(targetName)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name: sourceName, value: expectedSourceValue }),
+    });
+    if (response.ok && await getFugueAuthorityVariable(github, sourceName) === expectedSourceValue &&
+        await getFugueAuthorityVariable(github, targetName) === undefined) return;
+  }
+  throw new CanonicalWorkStateIntegrityError(
+    `Unable to roll back stale protected Fugue authority replacement ${sourceName} -> ${targetName}.`,
+  );
+}
+
 async function replaceFugueAuthorityVariable(
   github: FugueGitHub,
   sourceName: string,
@@ -791,32 +887,49 @@ async function replaceFugueAuthorityVariable(
   if (expectedPublisherSha) await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
   if (sourceName === targetName) return expectedSourceValue === targetValue;
   const injected = injectedAuthorityVariables(github);
+  let replaced = false;
   if (injected) {
     if (injected.get(targetName) === targetValue) return true;
     if (injected.has(targetName) || injected.get(sourceName) !== expectedSourceValue) return false;
     injected.delete(sourceName);
     injected.set(targetName, targetValue);
+    replaced = true;
+  } else {
+    const target = await getFugueAuthorityVariable(github, targetName);
+    if (target !== undefined) return target === targetValue;
+    if (await getFugueAuthorityVariable(github, sourceName) !== expectedSourceValue) return false;
+    const response = await authorityRequest(github, `/actions/variables/${encodeURIComponent(sourceName)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name: targetName, value: targetValue }),
+    });
+    if (!response.ok && response.status !== 404 && response.status !== 409 && response.status !== 422) {
+      throw new CanonicalWorkStateIntegrityError(
+        `Unable to atomically replace protected Fugue authority variable ${sourceName} (${response.status}).`,
+      );
+    }
+    replaced = await getFugueAuthorityVariable(github, targetName) === targetValue;
+  }
+  if (!replaced || !expectedPublisherSha) return replaced;
+  try {
+    // A slot-preserving rename carrying a new witness is also provisional until the exact protected
+    // revision is re-proved after GitHub has applied the PATCH.
+    await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
     return true;
+  } catch (error) {
+    await rollbackFugueAuthorityVariableReplacement(github, sourceName, expectedSourceValue, targetName, targetValue);
+    throw error;
   }
-  const target = await getFugueAuthorityVariable(github, targetName);
-  if (target !== undefined) return target === targetValue;
-  if (await getFugueAuthorityVariable(github, sourceName) !== expectedSourceValue) return false;
-  const response = await authorityRequest(github, `/actions/variables/${encodeURIComponent(sourceName)}`, {
-    method: "PATCH",
-    body: JSON.stringify({ name: targetName, value: targetValue }),
-  });
-  if (!response.ok && response.status !== 404 && response.status !== 409 && response.status !== 422) {
-    throw new CanonicalWorkStateIntegrityError(
-      `Unable to atomically replace protected Fugue authority variable ${sourceName} (${response.status}).`,
-    );
-  }
-  return await getFugueAuthorityVariable(github, targetName) === targetValue;
 }
 
 interface VerifiedRecoveryEntry {
   sourceVariableName: string;
   signedBody: string;
   cursor: RecoveryCursor;
+}
+
+interface VerifiedRecoveryBucket {
+  entries: VerifiedRecoveryEntry[];
+  compactableSources: Set<string>;
 }
 
 function recoveryIdentity(cursor: RecoveryCursor): string {
@@ -993,21 +1106,31 @@ async function verifiedRecoveryEntriesForBucket(
   github: FugueGitHub,
   bucket: string,
   variables?: readonly FugueAuthorityVariable[],
-): Promise<VerifiedRecoveryEntry[]> {
+): Promise<VerifiedRecoveryBucket> {
   const source = variables ?? await listFugueAuthorityVariables(github, "FUGUE_D3");
   const verified: VerifiedRecoveryEntry[] = [];
+  const compactableSources = new Set<string>();
   for (const variable of source) {
     if (variable.name.startsWith(RECOVERY_RESERVE_PREFIX)) continue;
     if (variableRecoveryBucket(variable.name) !== bucket) continue;
     if (variable.name.startsWith(RECOVERY_PACK_PREFIX)) {
       const bodies = parseRecoveryPack(variable.value);
       if (!bodies) continue; // Never delete an unreadable pack: it may be the sole surviving progress copy.
+      let sourceFullyVerified = true;
       for (const signedBody of bodies) {
         const parsed = parseRecoveryCursorBody(signedBody);
-        if (!parsed || recoveryCursorBucket(parsed) !== bucket) continue;
+        if (!parsed || recoveryCursorBucket(parsed) !== bucket) {
+          sourceFullyVerified = false;
+          continue;
+        }
         const cursor = await verifyRecoveryCursorBody(github, signedBody);
         if (cursor) verified.push({ sourceVariableName: variable.name, signedBody, cursor });
+        else sourceFullyVerified = false;
       }
+      // A readable pack is rewrite-safe only when every member revalidates. Valid siblings remain
+      // readable for winner selection, but a transiently unverifiable sibling quarantines the whole
+      // source from rename/delete/compaction so its only durable copy cannot be destroyed.
+      if (sourceFullyVerified) compactableSources.add(variable.name);
       continue;
     }
     const cursor = await verifyRecoveryCursorBody(github, variable.value);
@@ -1017,8 +1140,9 @@ async function verifiedRecoveryEntriesForBucket(
       continue;
     }
     verified.push({ sourceVariableName: variable.name, signedBody: variable.value, cursor });
+    compactableSources.add(variable.name);
   }
-  return verified;
+  return { entries: verified, compactableSources };
 }
 
 async function findRecoveryCursor(
@@ -1028,7 +1152,8 @@ async function findRecoveryCursor(
   const identity = recoveryOptionsIdentity(options);
   let best: VerifiedRecoveryEntry | undefined;
   const variables = await listFugueAuthorityVariables(github, "FUGUE_D3");
-  for (const entry of await verifiedRecoveryEntriesForBucket(github, recoveryOptionsBucket(options), variables)) {
+  const bucket = await verifiedRecoveryEntriesForBucket(github, recoveryOptionsBucket(options), variables);
+  for (const entry of bucket.entries) {
     if (recoveryIdentity(entry.cursor) !== identity) continue;
     if (best && recoveryAuthorityConflict(entry.cursor, best.cursor)) {
       throw new CanonicalWorkStateIntegrityError(
@@ -1107,7 +1232,9 @@ async function compactRecoveryBucket(
   variables: readonly FugueAuthorityVariable[],
   allocation?: VerifiedRecoveryAllocation,
 ): Promise<RecoveryCompactionResult> {
-  const entries = await verifiedRecoveryEntriesForBucket(github, bucket, variables);
+  const verifiedBucket = await verifiedRecoveryEntriesForBucket(github, bucket, variables);
+  const entries = verifiedBucket.entries;
+  const compactableSources = verifiedBucket.compactableSources;
   if (!entries.length) return { progress: false, allocated: false };
   const sourceValues = new Map(variables.map((variable) => [variable.name, variable.value] as const));
   const grouped = new Map<string, VerifiedRecoveryEntry[]>();
@@ -1164,7 +1291,7 @@ async function compactRecoveryBucket(
   }
 
   for (const sourceName of [...bySource.keys()].sort()) {
-    if (winnerSources.has(sourceName)) continue;
+    if (winnerSources.has(sourceName) || !compactableSources.has(sourceName)) continue;
     const expected = sourceValues.get(sourceName);
     if (allocation && !allocated && expected !== undefined &&
         await replaceFugueAuthorityVariable(
@@ -1185,14 +1312,12 @@ async function compactRecoveryBucket(
 
   // At the hard cap, a waiting witness can still be representable inside an existing partial
   // content-addressed pack even when there is no reserve or redundant donor variable. Transform one
-  // occupied verified source directly into the replacement pack, keeping repository variable count
-  // constant. For a newer existing identity, replace that identity in its source first; if that
-  // source cannot fit the new body, another partial source may carry the newer witness while the old
-  // copy remains harmlessly non-greatest until later cleanup.
+  // occupied fully verified source directly into the replacement pack, keeping repository variable
+  // count constant. A partially unverifiable pack is deliberately not a donor.
   if (allocation && !allocated && allocation.bucket === bucket) {
     const allocationIdentity = recoveryIdentity(allocation.entry.cursor);
     const currentWinner = winners.find((entry) => recoveryIdentity(entry.cursor) === allocationIdentity);
-    const sourceCandidates = [...winnerSources].map((sourceName) => ({
+    const sourceCandidates = [...winnerSources].filter((sourceName) => compactableSources.has(sourceName)).map((sourceName) => ({
       sourceName,
       expectedValue: sourceValues.get(sourceName),
       entries: winners.filter((entry) => entry.sourceVariableName === sourceName),
@@ -1240,6 +1365,7 @@ async function compactRecoveryBucket(
   type SourceUnit = { sourceName: string; expectedValue: string; entries: VerifiedRecoveryEntry[] };
   const units: SourceUnit[] = [];
   for (const sourceName of [...winnerSources].sort()) {
+    if (!compactableSources.has(sourceName)) continue;
     const expectedValue = sourceValues.get(sourceName);
     if (expectedValue === undefined) continue;
     const sourceEntries = winners.filter((entry) => entry.sourceVariableName === sourceName)
@@ -1333,10 +1459,11 @@ async function consumeRecoveryReserveForAllocation(
 
 async function allocateRecoveryVariable(github: FugueGitHub, allocation: RecoveryAllocation): Promise<boolean> {
   const verifiedAllocation = await verifyRecoveryAllocation(github, allocation);
-  await assertRepositoryDefaultBranchRevision(github, verifiedAllocation.entry.cursor.publisher_sha);
-  if (await createFugueAuthorityVariable(github, verifiedAllocation.name, verifiedAllocation.value)) return true;
+  const publisherSha = verifiedAllocation.entry.cursor.publisher_sha;
+  await assertRepositoryDefaultBranchRevision(github, publisherSha);
+  if (await createFugueAuthorityVariableAtRevision(github, verifiedAllocation.name, verifiedAllocation.value, publisherSha)) return true;
   if (await getFugueAuthorityVariable(github, verifiedAllocation.name) === verifiedAllocation.value) {
-    await assertRepositoryDefaultBranchRevision(github, verifiedAllocation.entry.cursor.publisher_sha);
+    await assertRepositoryDefaultBranchRevision(github, publisherSha);
     return true;
   }
   if (await consumeRecoveryReserveForAllocation(github, verifiedAllocation)) return true;
@@ -1355,24 +1482,29 @@ async function allocateRecoveryVariable(github: FugueGitHub, allocation: Recover
       );
       madeProgress ||= result.progress;
       if (result.allocated || await getFugueAuthorityVariable(github, verifiedAllocation.name) === verifiedAllocation.value) {
+        await assertRepositoryDefaultBranchRevision(github, publisherSha);
         await ensureRecoveryReserveVariables(github);
         return true;
       }
     }
-    await assertRepositoryDefaultBranchRevision(github, verifiedAllocation.entry.cursor.publisher_sha);
-    if (await createFugueAuthorityVariable(github, verifiedAllocation.name, verifiedAllocation.value)) {
+    await assertRepositoryDefaultBranchRevision(github, publisherSha);
+    if (await createFugueAuthorityVariableAtRevision(github, verifiedAllocation.name, verifiedAllocation.value, publisherSha)) {
       await ensureRecoveryReserveVariables(github);
       return true;
     }
     if (!madeProgress) break;
   }
-  return await getFugueAuthorityVariable(github, verifiedAllocation.name) === verifiedAllocation.value;
+  const durable = await getFugueAuthorityVariable(github, verifiedAllocation.name) === verifiedAllocation.value;
+  if (durable) await assertRepositoryDefaultBranchRevision(github, publisherSha);
+  return durable;
 }
 
 /**
  * Recovery/commit witnesses are immutable signed state. Compaction never relies on a fixed number
- * of free slots: an occupied verified source is atomically renamed/replaced by its content-addressed
- * pack before any other source in that group is removed. Reserves are only an allocation optimization.
+ * of free slots: an occupied fully verified source is atomically renamed/replaced by its
+ * content-addressed pack before any other source in that group is removed. A source pack with any
+ * unverifiable member is quarantined from destructive compaction. Reserves are only an allocation
+ * optimization.
  */
 export async function compactFugueRecoveryAuthorityVariables(
   github: FugueGitHub,
@@ -1435,8 +1567,9 @@ Durable Fugue recovery checkpoint: ${options.scope}`;
     throw new CanonicalWorkStateIntegrityError("Durable recovery checkpoint failed protected provenance self-check.");
   }
 
-  // Re-check immediately before the create-only/slot-preserving Authority mutation. This is the
-  // last trust-root observation before the witness can become durable.
+  // Re-check before allocation; the create/rename itself is provisional and performs a second
+  // post-mutation revision proof, rolling the exact new witness back if the base advanced inside
+  // the final check-to-POST/PATCH window.
   await assertRepositoryDefaultBranchRevision(github, options.publisherSha);
   const name = recoveryVariableName(options, signed);
   if (!(await allocateRecoveryVariable(github, { name, value: signed }))) {
@@ -1526,11 +1659,38 @@ export async function publishCanonicalWorkState(
   const current = await loadCurrentCanonicalWorkState(github, parsed.issue, parsed.base_sha);
   if (current && sameCanonicalWorkState(current, parsed)) return false;
 
+  const logical = parsed.authority_sequence !== undefined;
+  if (logical !== (parsed.parent_digest !== undefined)) {
+    throw new CanonicalWorkStateIntegrityError("Logical canonical work state must carry both authority sequence and parent digest.");
+  }
+  if (logical) {
+    if (current) {
+      const expectedSequence = (current.authority_sequence ?? -1) + 1;
+      if (parsed.authority_sequence !== expectedSequence || parsed.parent_digest !== canonicalWorkStateDigest(current)) {
+        // The proposal was derived from an older overlapping snapshot. Do not let completion time
+        // manufacture a later authority order; deterministic reconciliation will derive a fresh
+        // successor from current durable state instead.
+        return false;
+      }
+    } else if (parsed.authority_sequence !== 0 || parsed.parent_digest !== null) {
+      return false;
+    }
+  } else if (current?.authority_sequence !== undefined) {
+    // Once a scope has entered predecessor-bound logical ordering, legacy publication-time records
+    // cannot re-enter that scope or outrank the causal chain.
+    return false;
+  }
+
   await assertRepositoryDefaultBranchRevision(github, parsed.base_sha);
-  const minimumCreated = current ? Date.parse(current.created_at) + 1 : 0;
   const requestedCreated = Date.parse(parsed.created_at);
-  const createdMs = Math.max(Date.now(), minimumCreated, Number.isFinite(requestedCreated) ? requestedCreated : 0);
-  parsed = canonicalWorkStateSchema.parse({ ...parsed, created_at: new Date(createdMs).toISOString() });
+  if (!Number.isFinite(requestedCreated)) {
+    throw new CanonicalWorkStateIntegrityError("Canonical work state has an invalid publication timestamp.");
+  }
+  if (!logical) {
+    const minimumCreated = current ? Date.parse(current.created_at) + 1 : 0;
+    const createdMs = Math.max(Date.now(), minimumCreated, requestedCreated);
+    parsed = canonicalWorkStateSchema.parse({ ...parsed, created_at: new Date(createdMs).toISOString() });
+  }
 
   await publishDurableProtocolRecord(github, {
     storageSha: parsed.base_sha,
@@ -1538,7 +1698,7 @@ export async function publishCanonicalWorkState(
     scope: workScope(parsed.issue),
     unsignedBody: renderCanonicalWorkStateComment(parsed),
     publicationTimestamp: Date.parse(parsed.created_at),
-    authorityOrder: parsed.created_at,
+    authorityOrder: canonicalWorkAuthorityOrder(parsed),
   });
   await replaceWorkLocator(github, parsed);
   return true;
@@ -1579,7 +1739,7 @@ async function recoverWorkStateAtBase(
     issueNumber,
     parse: parseCanonicalWorkState,
     timestamp: (value) => Date.parse(value.created_at),
-    order: (value) => value.created_at,
+    order: canonicalWorkAuthorityOrder,
     validate: (value) => value.issue === issueNumber && value.base_sha.toLowerCase() === baseSha.toLowerCase(),
   });
 }
@@ -1650,6 +1810,7 @@ export async function rollCanonicalWorkStatesToCurrentBase(
       metadata: previous.metadata,
       pr: previous.pr,
       baseSha: policy.identity.baseSha,
+      logicalRoot: true,
     });
     if (await publishCanonicalWorkState(github, next)) rolled.push(issue.number);
   }
