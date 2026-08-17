@@ -30,17 +30,14 @@ export const workMetadataSchema = z.object({
 export type WorkMetadata = z.infer<typeof workMetadataSchema>;
 export type WorkSpec = z.infer<typeof workSpecSchema>;
 
-const START = "<!-- fugue-work";
+const START = "<!-- fugue-work\n";
+const LOOSE_START = "<!-- fugue-work";
 const END = "-->";
 
 export function parseWorkMetadata(issueBody: string): WorkMetadata | null {
-  const start = issueBody.indexOf(START);
-  if (start < 0) return null;
-
-  const end = issueBody.indexOf(END, start + START.length);
-  if (end < 0) throw new Error("Unterminated fugue-work metadata block.");
-
-  const yaml = issueBody.slice(start + START.length, end).trim();
+  const range = trailingMetadataRange(issueBody);
+  if (!range) return null;
+  const yaml = issueBody.slice(range.start + START.length, range.end).trim();
   return workMetadataSchema.parse(parseYaml(yaml));
 }
 
@@ -54,32 +51,34 @@ export function assertWorkMetadataForIssue(metadata: WorkMetadata, issueNumber: 
 }
 
 export function stripWorkMetadata(issueBody: string): string {
-  const start = issueBody.indexOf(START);
-  if (start < 0) return normalizeRequirements(issueBody);
-
-  const end = issueBody.indexOf(END, start + START.length);
-  if (end < 0) throw new Error("Unterminated fugue-work metadata block.");
-
-  return normalizeRequirements(`${issueBody.slice(0, start)}${issueBody.slice(end + END.length)}`);
+  const range = trailingMetadataRange(issueBody);
+  if (!range) return normalizeRequirements(issueBody);
+  return normalizeRequirements(issueBody.slice(0, range.start));
 }
 
 export function upsertWorkMetadata(issueBody: string, metadata: WorkMetadata): string {
-  const block = `${START}\n${stringifyYaml(metadata).trim()}\n${END}`;
-  const start = issueBody.indexOf(START);
-
-  if (start < 0) {
-    return `${issueBody.trimEnd()}\n\n${block}\n`;
+  const block = `${START}${stringifyYaml(metadata).trim()}\n${END}`;
+  const range = trailingMetadataRange(issueBody);
+  if (range) {
+    return `${issueBody.slice(0, range.start).trimEnd()}\n\n${block}\n`;
   }
 
-  const end = issueBody.indexOf(END, start + START.length);
-  if (end < 0) throw new Error("Unterminated fugue-work metadata block.");
-
-  return `${issueBody.slice(0, start)}${block}${issueBody.slice(end + END.length)}`;
+  // A malformed loose trailing marker is presentation corruption; discard that suffix before
+  // writing the protected mirror rather than allowing it to shadow the canonical trailing block.
+  const loose = issueBody.lastIndexOf(LOOSE_START);
+  const base = loose >= 0 && !issueBody.slice(loose).includes(END)
+    ? issueBody.slice(0, loose).trimEnd()
+    : issueBody.trimEnd();
+  return `${base}${base ? "\n\n" : ""}${block}\n`;
 }
 
 export function workSpecDigest(issueBody: string, metadata: WorkMetadata): string {
+  return workSpecDigestFromRequirements(stripWorkMetadata(issueBody), metadata);
+}
+
+export function workSpecDigestFromRequirements(requirements: string, metadata: WorkMetadata): string {
   return digestCanonical({
-    requirements: stripWorkMetadata(issueBody),
+    requirements: normalizeRequirements(requirements),
     spec: metadata.spec,
   });
 }
@@ -89,6 +88,15 @@ export function createWorkId(issueNumber: number): string {
     throw new Error(`Invalid issue number: ${issueNumber}`);
   }
   return `work-${issueNumber}`;
+}
+
+function trailingMetadataRange(issueBody: string): { start: number; end: number } | null {
+  const start = issueBody.lastIndexOf(START);
+  if (start < 0) return null;
+  const end = issueBody.indexOf(END, start + START.length);
+  if (end < 0) throw new Error("Unterminated trailing fugue-work metadata block.");
+  if (issueBody.slice(end + END.length).trim()) return null;
+  return { start, end };
 }
 
 function normalizeRequirements(value: string): string {

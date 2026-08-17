@@ -94,8 +94,6 @@ export async function currentIntegrationState(
     return { state: "pending", request };
   }
 
-  // A signed durable request with no matching protected-base workflow run after the recovery
-  // grace period is eligible for redispatch. Returning none lets the deterministic planner retry.
   return { state: "none", request };
 }
 
@@ -122,6 +120,8 @@ export async function findIntegrationWorkflowRun(
   request: IntegrationRequest,
 ): Promise<IntegrationWorkflowRun | undefined> {
   const { owner, repo } = github.repository;
+  const requestCreated = Date.parse(request.created_at);
+  if (!Number.isFinite(requestCreated)) return undefined;
   const runs = await github.octokit.rest.actions.listWorkflowRuns({
     owner,
     repo,
@@ -130,12 +130,15 @@ export async function findIntegrationWorkflowRun(
     head_sha: request.identity.baseSha,
     per_page: 100,
   });
-  const match = runs.data.workflow_runs.find((run) =>
-    isTrustedProtocolWorkflowRun(run) &&
-    run.event === "workflow_dispatch" &&
-    run.head_sha === request.identity.baseSha &&
-    run.display_title === integrationRunTitle(request.request_id, request.identity.prNumber),
-  );
+  const match = runs.data.workflow_runs.find((run) => {
+    const runCreated = Date.parse(run.created_at ?? "");
+    return isTrustedProtocolWorkflowRun(run) &&
+      run.event === "workflow_dispatch" &&
+      run.head_sha === request.identity.baseSha &&
+      run.display_title === integrationRunTitle(request.request_id, request.identity.prNumber) &&
+      Number.isFinite(runCreated) &&
+      runCreated >= requestCreated;
+  });
   if (!match) return undefined;
   return {
     status: match.status,

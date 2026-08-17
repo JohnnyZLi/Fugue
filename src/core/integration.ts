@@ -26,10 +26,13 @@ import {
 } from "./integration-plan.js";
 import { assertOwnership } from "./ownership.js";
 import { FUGUE_CLI_VERSION } from "./protocol.js";
-import { createProtocolComment, isTrustedProtocolComment } from "./provenance.js";
+import { createProtocolComment, escapeProtocolMarkers, isTrustedProtocolComment } from "./provenance.js";
 import { currentQaAttestations } from "./reviews.js";
 import { runValidation } from "./validation.js";
 import { withCleanWorktree } from "./worktree.js";
+
+const INTEGRATION_FAILURE_START = "<!-- fugue-integration-failure";
+const MARKER_END = "-->";
 
 export interface IntegrationResult {
   snapshot: EvaluationSnapshot;
@@ -181,6 +184,15 @@ export async function finalizeIntegration(
   return { snapshot, attestation, url: comment.data.html_url };
 }
 
+export function renderIntegrationFailureComment(
+  identity: IntegrationPlan["identity"],
+  label: "FAILED" | "ERROR",
+  detail: string,
+): string {
+  const marker = `${INTEGRATION_FAILURE_START}\nversion: 1\npr: ${identity.prNumber}\nhead: ${identity.headSha}\n${MARKER_END}`;
+  return `${marker}\n\nINTEGRATION — ${label}\n\nHead: \`${identity.headSha}\`\nBase: \`${identity.baseBranch}@${identity.baseSha}\`\n\n${escapeProtocolMarkers(detail)}`;
+}
+
 export async function publishIntegrationFailure(
   github: FugueGitHub,
   identity: IntegrationPlan["identity"],
@@ -190,6 +202,7 @@ export async function publishIntegrationFailure(
   const state = gateFailure ? "failure" : "error";
   const label = gateFailure ? "FAILED" : "ERROR";
   const detail = message(error);
+  const safeDetail = escapeProtocolMarkers(detail);
   const { owner, repo } = github.repository;
 
   let targetUrl: string | undefined;
@@ -197,7 +210,7 @@ export async function publishIntegrationFailure(
     const comment = await createProtocolComment(
       github,
       identity.prNumber,
-      `INTEGRATION — ${label}\n\nHead: \`${identity.headSha}\`\nBase: \`${identity.baseBranch}@${identity.baseSha}\`\n\n${detail}`,
+      renderIntegrationFailureComment(identity, label, detail),
     );
     targetUrl = comment.data.html_url;
   } catch {
@@ -210,7 +223,7 @@ export async function publishIntegrationFailure(
     sha: identity.headSha,
     state,
     context: "fugue/integration",
-    description: truncate(`Fugue Integration ${label.toLowerCase()}: ${detail}`, 140),
+    description: truncate(`Fugue Integration ${label.toLowerCase()}: ${safeDetail}`, 140),
     ...(targetUrl ? { target_url: targetUrl } : {}),
   });
 }

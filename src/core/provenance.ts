@@ -55,6 +55,7 @@ interface OidcClaims {
   workflow_ref?: string;
   workflow_sha?: string;
   event_name?: string;
+  run_attempt?: string | number;
   iat?: number;
   nbf?: number;
   exp?: number;
@@ -93,11 +94,7 @@ export function isTrustedProtocolCommitStatus(status: GitHubCommitStatusLike): b
   return isTrustedProtocolActor(status.creator);
 }
 
-/**
- * Canonical publication has exactly one Fugue protocol marker before the publisher proof is
- * attached. This keeps untrusted prose/YAML fields from smuggling a second parseable marker into
- * a body that protected Actions would otherwise sign as a whole.
- */
+/** Canonical publication has exactly one writer-owned Fugue protocol marker. */
 export function hasCanonicalProtocolBoundary(body: string): boolean {
   const start = body.indexOf(PROTOCOL_MARKER_PREFIX);
   if (start < 0) return false;
@@ -106,38 +103,51 @@ export function hasCanonicalProtocolBoundary(body: string): boolean {
   return body.indexOf(PROOF_END, start + PROTOCOL_MARKER_PREFIX.length) >= 0;
 }
 
+/** Escape reflected text before placing it beside a writer-owned canonical marker. */
+export function escapeProtocolMarkers(value: string): string {
+  return value.replaceAll(PROTOCOL_MARKER_PREFIX, "&lt;!-- fugue-");
+}
+
 export async function isTrustedProtocolComment(
   github: FugueGitHub,
   comment: GitHubCommentLike,
 ): Promise<boolean> {
-  if (!isTrustedProtocolActor(comment.user)) return false;
-  const body = comment.body ?? "";
-  const proof = parsePublisherProof(body);
-  if (!proof) return false;
+  const context = await protocolCommentVerificationContext(github, comment);
+  if (!context) return false;
+  return verifyPublisherToken(
+    context.proof,
+    context.audience,
+    github.repository.fullName,
+    context.protectedBase.branch,
+    context.protectedBase.sha,
+    context.timestamp,
+    context.jwks,
+  );
+}
 
-  const canonicalBody = stripProtocolPublisherProof(body);
-  if (!hasCanonicalProtocolBoundary(canonicalBody)) return false;
-  const audience = protocolAudience(github.repository.fullName, canonicalBody);
-  const timestamp = Date.parse(comment.updated_at ?? comment.created_at ?? "");
-  if (!Number.isFinite(timestamp)) return false;
-
-  try {
-    const [jwks, protectedBase] = await Promise.all([
-      loadGitHubOidcJwks(),
-      repositoryDefaultBranchIdentity(github),
-    ]);
-    return verifyPublisherToken(
-      proof,
-      audience,
-      github.repository.fullName,
-      protectedBase.branch,
-      protectedBase.sha,
-      timestamp,
-      jwks,
-    );
-  } catch {
-    return false;
-  }
+/**
+ * Verify that a comment was genuinely content-bound to an approved Fugue workflow revision,
+ * without treating that historical revision as current protocol authority. This is ONLY for
+ * locating a historical protocol object that current protected code may safely roll forward or
+ * overwrite. Historical proofs are accepted only from the first attempt of a default-branch run,
+ * so a revoked workflow revision cannot regain authority by re-running after protection changes.
+ * Immutable QA, Integration, and acknowledgement readers still use isTrustedProtocolComment.
+ */
+export async function isReusableProtocolComment(
+  github: FugueGitHub,
+  comment: GitHubCommentLike,
+): Promise<boolean> {
+  const context = await protocolCommentVerificationContext(github, comment);
+  if (!context) return false;
+  return verifyPublisherTokenInternal(
+    context.proof,
+    context.audience,
+    github.repository.fullName,
+    context.protectedBase.branch,
+    undefined,
+    context.timestamp,
+    context.jwks,
+  );
 }
 
 export async function createProtocolComment(
@@ -195,6 +205,26 @@ export function verifyPublisherToken(
   commentTimestampMs: number,
   jwks: JwkSet,
 ): boolean {
+  return verifyPublisherTokenInternal(
+    token,
+    expectedAudience,
+    repository,
+    defaultBranch,
+    protectedWorkflowSha,
+    commentTimestampMs,
+    jwks,
+  );
+}
+
+function verifyPublisherTokenInternal(
+  token: string,
+  expectedAudience: string,
+  repository: string,
+  defaultBranch: string,
+  protectedWorkflowSha: string | undefined,
+  commentTimestampMs: number,
+  jwks: JwkSet,
+): boolean {
   const parts = token.split(".");
   if (parts.length !== 3) return false;
   const [encodedHeader, encodedPayload, encodedSignature] = parts;
@@ -224,9 +254,12 @@ export function verifyPublisherToken(
   if (claims.iss !== FUGUE_OIDC_ISSUER) return false;
   if (!audienceContains(claims.aud, expectedAudience)) return false;
   if (claims.repository !== repository) return false;
+  if (normalizedRunAttempt(claims.run_attempt) !== 1) return false;
   if (!claims.workflow_sha || !/^[0-9a-f]{40}$/i.test(claims.workflow_sha)) return false;
-  if (!/^[0-9a-f]{40}$/i.test(protectedWorkflowSha)) return false;
-  if (claims.workflow_sha.toLowerCase() !== protectedWorkflowSha.toLowerCase()) return false;
+  if (protectedWorkflowSha !== undefined) {
+    if (!/^[0-9a-f]{40}$/i.test(protectedWorkflowSha)) return false;
+    if (claims.workflow_sha.toLowerCase() !== protectedWorkflowSha.toLowerCase()) return false;
+  }
 
   const workflow = trustedWorkflowPath(repository, claims.workflow_ref, defaultBranch);
   if (!workflow) return false;
@@ -241,6 +274,41 @@ export function verifyPublisherToken(
   if (timestamp < claims.iat! - CLOCK_SKEW_SECONDS) return false;
   if (timestamp > claims.exp! + CLOCK_SKEW_SECONDS) return false;
   return true;
+}
+
+async function protocolCommentVerificationContext(
+  github: FugueGitHub,
+  comment: GitHubCommentLike,
+): Promise<{
+  proof: string;
+  audience: string;
+  timestamp: number;
+  jwks: JwkSet;
+  protectedBase: { branch: string; sha: string };
+} | null> {
+  if (!isTrustedProtocolActor(comment.user)) return null;
+  const body = comment.body ?? "";
+  const proof = parsePublisherProof(body);
+  if (!proof) return null;
+  const canonicalBody = stripProtocolPublisherProof(body);
+  if (!hasCanonicalProtocolBoundary(canonicalBody)) return null;
+  const timestamp = Date.parse(comment.updated_at ?? comment.created_at ?? "");
+  if (!Number.isFinite(timestamp)) return null;
+  try {
+    const [jwks, protectedBase] = await Promise.all([
+      loadGitHubOidcJwks(),
+      repositoryDefaultBranchIdentity(github),
+    ]);
+    return {
+      proof,
+      audience: protocolAudience(github.repository.fullName, canonicalBody),
+      timestamp,
+      jwks,
+      protectedBase,
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function attachPublisherProof(repository: string, body: string): Promise<string> {
@@ -314,6 +382,12 @@ function parsePublisherProof(body: string): string | null {
     /^\n\n<!-- fugue-publisher-proof\nversion: 1\ntoken: ([A-Za-z0-9._-]+)\n-->\s*$/,
   );
   return match?.[1] ?? null;
+}
+
+function normalizedRunAttempt(value: OidcClaims["run_attempt"]): number | null {
+  if (typeof value === "number" && Number.isInteger(value)) return value;
+  if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
+  return null;
 }
 
 function audienceContains(aud: OidcClaims["aud"], expected: string): boolean {

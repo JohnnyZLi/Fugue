@@ -1,7 +1,7 @@
 import type { FugueGitHub } from "./github.js";
 import {
   createProtocolComment,
-  isTrustedProtocolComment,
+  isTrustedProtocolActor,
   stripProtocolPublisherProof,
   updateProtocolComment,
 } from "./provenance.js";
@@ -72,22 +72,39 @@ export async function upsertStateComment(
     per_page: 100,
   });
 
-  let current: typeof comments[number] | undefined;
+  const reusable: typeof comments = [];
   for (const comment of comments) {
-    if (!(await isTrustedProtocolComment(github, comment))) continue;
+    // This lookup is locator-only: the dashboard is presentation state and is overwritten by the
+    // current protected writer before use. Actor + strict state marker lets one stable comment ID
+    // survive publisher-revision rollover without making an old proof current protocol authority.
+    if (!isTrustedProtocolActor(comment.user)) continue;
     const canonical = stripProtocolPublisherProof(comment.body ?? "");
-    if (!canonical.includes(START) || !canonical.includes(`work_id: ${work.metadata.work_id}`)) continue;
-    current = comment;
-    break;
+    const marker = canonical.match(/^<!-- fugue-state\nversion: 1\nwork_id: ([^\n]+)\n-->/);
+    if (marker?.[1] !== work.metadata.work_id) continue;
+    reusable.push(comment);
   }
+  reusable.sort((a, b) => {
+    const left = Date.parse(a.created_at ?? "");
+    const right = Date.parse(b.created_at ?? "");
+    if (Number.isFinite(left) && Number.isFinite(right) && left !== right) return left - right;
+    return a.id - b.id;
+  });
 
+  const current = reusable[0];
   if (!current) {
     await createProtocolComment(github, work.issueNumber, body);
     return;
   }
-  if (stripProtocolPublisherProof(current.body ?? "") === body) return;
+  if (stripProtocolPublisherProof(current.body ?? "") !== body) {
+    await updateProtocolComment(github, current.id, body);
+  }
 
-  await updateProtocolComment(github, current.id, body);
+  // Historical protected-base revisions may have left duplicate state dashboards. They are
+  // presentation only; current trusted reconciliation keeps the oldest stable comment ID and
+  // removes later signed duplicates after refreshing it under the current publisher revision.
+  for (const duplicate of reusable.slice(1)) {
+    await github.octokit.rest.issues.deleteComment({ owner, repo, comment_id: duplicate.id });
+  }
 }
 
 export function externalInstruction(

@@ -43,5 +43,10 @@ jobs:
       - run: npm run build
       - name: Reconcile durable Fugue state
         env:
+          FUGUE_EVENT_NAME: ${{ github.event_name }}
+          FUGUE_EVENT_ACTION: ${{ github.event.action }}
+          FUGUE_EVENT_ACTOR: ${{ github.event.sender.login }}
+          FUGUE_EVENT_ISSUE: ${{ github.event.issue.number }}
+          FUGUE_EVENT_LABEL: ${{ github.event.label.name }}
           GITHUB_TOKEN: ${{ github.token }}
         run: node dist/cli.js reconcile

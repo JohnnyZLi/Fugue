@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { z } from "zod";
 import { evaluationIdentitySchema } from "./attestations.js";
@@ -6,7 +7,7 @@ import { digestCanonical } from "./hash.js";
 export const integrationRequestSchema = z.object({
   version: z.literal(1),
   kind: z.literal("integration_request"),
-  request_id: z.string().min(1),
+  request_id: z.string().regex(/^int-[0-9a-f]{16}-[0-9a-f]{16}$/),
   identity: evaluationIdentitySchema,
   created_at: z.string().min(1),
 });
@@ -54,14 +55,18 @@ const REQUEST_END = "-->";
 export function createIntegrationRequest(
   identity: z.infer<typeof evaluationIdentitySchema>,
   createdAt = new Date().toISOString(),
+  nonce = randomBytes(8).toString("hex"),
 ): IntegrationRequest {
+  const timestamp = Date.parse(createdAt);
+  if (!Number.isFinite(timestamp)) throw new Error("Invalid Integration request creation time.");
+  const canonicalCreatedAt = new Date(Math.floor(timestamp / 1000) * 1000).toISOString();
   const digest = digestCanonical(identity).slice("sha256:".length, "sha256:".length + 16);
   return integrationRequestSchema.parse({
     version: 1,
     kind: "integration_request",
-    request_id: `int-${digest}`,
+    request_id: `int-${digest}-${nonce}`,
     identity,
-    created_at: createdAt,
+    created_at: canonicalCreatedAt,
   });
 }
 

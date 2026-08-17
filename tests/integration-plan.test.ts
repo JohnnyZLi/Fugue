@@ -2,8 +2,8 @@ import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import {
   assertValidationMatchesPlan,
+  createIntegrationRequest,
   integrationPlanSchema,
-  integrationRunTitle,
   integrationValidationSchema,
 } from "../src/core/integration-plan.js";
 
@@ -40,9 +40,12 @@ describe("GitHub-hosted Integration plan", () => {
     expect(value.validation.checks).toEqual(["npm test"]);
   });
 
-  it("binds workflow-run identity to both request ID and PR number", () => {
-    expect(integrationRunTitle("int-1234", 21)).toBe("Fugue Integration PR #21 int-1234");
-    expect(integrationRunTitle("int-1234", 22)).not.toBe(integrationRunTitle("int-1234", 21));
+  it("uses an unpredictable request nonce so a future exact request cannot be preplayed", () => {
+    const first = createIntegrationRequest(identity, "2026-08-16T20:00:00.500Z", "0123456789abcdef");
+    const second = createIntegrationRequest(identity, "2026-08-16T20:00:00.500Z", "fedcba9876543210");
+    expect(first.request_id).not.toBe(second.request_id);
+    expect(first.request_id).toMatch(/^int-[0-9a-f]{16}-0123456789abcdef$/);
+    expect(first.created_at).toBe("2026-08-16T20:00:00.000Z");
   });
 
   it("rejects validation evidence for a different identity shape", () => {
@@ -65,14 +68,12 @@ describe("GitHub-hosted Integration plan", () => {
       created_at: new Date().toISOString(),
     });
     expect(() => assertValidationMatchesPlan(value, valid)).not.toThrow();
-
     const tampered = { ...valid, commands: ["npm ci", "npm test -- --skip-critical"] };
     expect(() => assertValidationMatchesPlan(value, tampered)).toThrow(/protected-base command plan/);
   });
 
   it("keeps candidate validation credential-separated and shell inputs quoted", async () => {
     const workflow = await readFile(".github/workflows/fugue-integration.yml", "utf8");
-    expect(workflow).toContain('run-name: "Fugue Integration PR #${{ inputs.pr }} ${{ inputs.request_id }}"');
     expect(workflow).toContain("permissions:\n      contents: read");
     expect(workflow).toContain("persist-credentials: false");
     expect(workflow).toContain('GITHUB_TOKEN: ""');
@@ -83,21 +84,28 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).not.toContain('integration-runtime prepare "${{ inputs.pr }}"');
   });
 
-  it("uses base-trusted PR reconciliation instead of candidate workflow execution", async () => {
+  it("uses base-trusted PR reconciliation and binds issue canonicalization to the event sender", async () => {
     const workflow = await readFile(".github/workflows/fugue-control-plane.yml", "utf8");
     expect(workflow).toContain("pull_request_target:");
     expect(workflow).not.toContain("pull_request:\n");
     expect(workflow).toContain("ref: ${{ github.event.repository.default_branch }}");
+    expect(workflow).toContain("FUGUE_EVENT_ACTOR: ${{ github.event.sender.login }}");
   });
 
-  it("keeps every security-critical identity, session, gate, state, and planner module under conditional Security QA", async () => {
+  it("covers every direct security trust primitive in conditional Security QA policy", async () => {
     const config = await readFile(".fugue/config.yml", "utf8");
     for (const path of [
-      "src/core/workflow.ts",
+      "src/core/qa.ts",
+      "src/core/metadata.ts",
+      "src/core/pr-metadata.ts",
+      "src/core/hash.ts",
+      "src/core/state.ts",
       "src/core/evaluation.ts",
       "src/core/review-activity.ts",
       "src/core/gates.ts",
-      "src/core/state.ts",
+      "src/core/workflow.ts",
+      "src/core/provenance.ts",
+      "src/core/ci.ts",
     ]) {
       expect(config).toContain(`- "${path}"`);
     }
