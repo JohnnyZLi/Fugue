@@ -295,6 +295,7 @@ export async function ingestCoordinatorIssueEvent(
       metadata: existing.metadata,
       pr: existing.pr,
       baseSha: policy.identity.baseSha,
+      predecessor: existing,
     }));
   }
 
@@ -318,6 +319,7 @@ export async function ingestCoordinatorIssueEvent(
     metadata: acceptedMetadata,
     pr: existing?.pr ?? null,
     baseSha: policy.identity.baseSha,
+    ...(existing ? { predecessor: existing } : { logicalRoot: true }),
   }));
 }
 
@@ -334,6 +336,7 @@ export async function allocateWorker(github: FugueGitHub, policy: ActivePolicy, 
     metadata: claim.metadata,
     pr: work.canonical.pr,
     baseSha: policy.identity.baseSha,
+    predecessor: work.canonical,
   }));
 }
 
@@ -378,6 +381,7 @@ export async function adoptAssignedPullRequests(github: FugueGitHub, suppliedPol
       metadata: work.metadata,
       pr: { number: pull.number, metadata: expected, draft: true },
       baseSha: policy.identity.baseSha,
+      predecessor: work.canonical,
     }));
     adopted.push(pull.number);
   }
@@ -429,6 +433,7 @@ async function markPrReady(github: FugueGitHub, policy: ActivePolicy, work: Work
       metadata: work.metadata,
       pr: { ...work.canonical.pr, draft: false },
       baseSha: policy.identity.baseSha,
+      predecessor: work.canonical,
     }));
   }
   await syncPrDraft(github, prNumber, false);
