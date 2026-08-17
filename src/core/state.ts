@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
+import { gzipSync, gunzipSync } from "node:zlib";
 import { z } from "zod";
 import type { FugueGitHub } from "./github.js";
 import { assertAcyclicDependencies } from "./dependencies.js";
@@ -13,16 +14,21 @@ import {
 import { parsePrMetadata, prMetadataSchema, samePrMetadata, type PrMetadata } from "./pr-metadata.js";
 import { resolveActivePolicy, type ActivePolicy } from "./policy.js";
 import {
+  assertRepositoryDefaultBranchRevision,
   createProtocolComment,
-  isReusableProtocolComment,
   isTrustedProtocolComment,
+  readRepositoryDefaultBranchIdentity,
+  verifyProtocolPublicationBodyAtRevision,
 } from "./provenance.js";
 
 const WORK_STATE_START = "<!-- fugue-work-state";
 const END = "-->";
-const WORK_STATE_HEAD_CONTEXT_PREFIX = "fugue/work-state/";
-const WORK_STATE_STAGE_CONTEXT_PREFIX = "fugue/work-state-stage/";
-const CHECKPOINT_PATTERN = /^stage=(\d+);comment=(\d+);digest=([0-9a-f]{64})$/;
+const WORK_STATE_BUNDLE_PREFIX = "fugue/ws2/";
+const BUNDLE_KEY_BYTES = 16;
+const BUNDLE_CHUNK_SIZE = 120;
+const BUNDLE_MAX_CHUNKS = 999;
+const BUNDLE_WRITE_ATTEMPTS = 4;
+const BUNDLE_MANIFEST_PATTERN = /^n=(\d+);d=([0-9a-f]{64})$/;
 
 const stateLabelSchema = z.enum(["state:ready", "state:working", "state:blocked"]);
 const canonicalPrSchema = z.object({
@@ -42,7 +48,6 @@ export const canonicalWorkStateSchema = z.object({
   metadata: workMetadataSchema,
   pr: canonicalPrSchema.nullable(),
   base_sha: z.string().regex(/^[0-9a-f]{40}$/i),
-  checkpoint_id: z.number().int().positive().optional(),
   created_at: z.string().min(1),
 });
 
@@ -92,18 +97,15 @@ interface CommitStatusRecord {
   description?: string | null;
 }
 
-interface CheckpointPointer {
-  stageId: number;
-  commentId: number;
-  digest: string;
+interface WorkStateBundleRecord {
+  context: string;
+  description: string;
 }
 
-export function workStateHeadContext(issueNumber: number): string {
-  return `${WORK_STATE_HEAD_CONTEXT_PREFIX}${issueNumber}`;
-}
-
-export function workStateStageContext(issueNumber: number): string {
-  return `${WORK_STATE_STAGE_CONTEXT_PREFIX}${issueNumber}`;
+interface LoadedBundle {
+  state: CanonicalWorkState;
+  body: string;
+  manifestId: number;
 }
 
 export function createCanonicalWorkState(input: {
@@ -115,7 +117,6 @@ export function createCanonicalWorkState(input: {
   metadata: WorkMetadata;
   pr?: CanonicalPrState | null;
   baseSha: string;
-  checkpointId?: number;
   createdAt?: string;
 }): CanonicalWorkState {
   assertWorkMetadataForIssue(input.metadata, input.issue);
@@ -130,7 +131,6 @@ export function createCanonicalWorkState(input: {
     metadata: input.metadata,
     pr: input.pr ?? null,
     base_sha: input.baseSha,
-    ...(input.checkpointId ? { checkpoint_id: input.checkpointId } : {}),
     created_at: input.createdAt ?? new Date().toISOString(),
   });
 }
@@ -180,48 +180,94 @@ export function sameCanonicalWorkState(left: CanonicalWorkState, right: Canonica
     JSON.stringify(left.pr) === JSON.stringify(right.pr);
 }
 
+function exactCanonicalWorkState(left: CanonicalWorkState, right: CanonicalWorkState): boolean {
+  return sameCanonicalWorkState(left, right) && left.created_at === right.created_at;
+}
+
 /**
- * Publish a canonical work-state transaction. The staging and head commit statuses are append-only
- * server-assigned checkpoints on the protected base. The signed comment embeds the staging ID;
- * the head status commits that exact comment ID and digest. Readers always validate the newest
- * head and never fall back, so deletion/tampering or forged later pointers fail closed instead of
- * rolling authority backward.
+ * Data contexts are secret-derived and written before the manifest reveals the bundle key. A
+ * candidate can append to a revealed context later, but the earliest server-assigned status in
+ * that exact unpredictable context is already the protected writer's immutable chunk.
+ */
+export function workStateDataContext(issueNumber: number, bundleKey: string, index: number): string {
+  const digest = createHmac("sha256", Buffer.from(bundleKey, "hex"))
+    .update(String(index), "utf8")
+    .digest("hex")
+    .slice(0, 32);
+  return `${WORK_STATE_BUNDLE_PREFIX}${issueNumber}/d/${digest}`;
+}
+
+export function workStateManifestContext(issueNumber: number, bundleKey: string): string {
+  return `${WORK_STATE_BUNDLE_PREFIX}${issueNumber}/m/${bundleKey}`;
+}
+
+export function encodeWorkStateBundle(
+  issueNumber: number,
+  bundleKey: string,
+  signedBody: string,
+): { data: WorkStateBundleRecord[]; manifest: WorkStateBundleRecord } {
+  if (!/^[0-9a-f]{32}$/i.test(bundleKey)) throw new Error("Invalid work-state bundle key.");
+  const encoded = gzipSync(Buffer.from(signedBody, "utf8")).toString("base64url");
+  const chunks: string[] = [];
+  for (let offset = 0; offset < encoded.length; offset += BUNDLE_CHUNK_SIZE) {
+    chunks.push(encoded.slice(offset, offset + BUNDLE_CHUNK_SIZE));
+  }
+  if (!chunks.length || chunks.length > BUNDLE_MAX_CHUNKS) {
+    throw new Error(`Canonical work-state bundle requires unsupported chunk count ${chunks.length}.`);
+  }
+  const digest = createHash("sha256").update(encoded, "utf8").digest("hex");
+  return {
+    data: chunks.map((chunk, index) => ({
+      context: workStateDataContext(issueNumber, bundleKey, index),
+      description: chunk,
+    })),
+    manifest: {
+      context: workStateManifestContext(issueNumber, bundleKey),
+      description: `n=${chunks.length};d=${digest}`,
+    },
+  };
+}
+
+/**
+ * Canonical state authority is a cryptographically signed status bundle, not an ordinary issue
+ * comment and not a fixed append-only status head. Invalid/forged bundles are inert; each genuine
+ * publication uses fresh unpredictable contexts, so poisoning or exhausting an old context cannot
+ * wedge the protected writer. The comment is only a regenerable Human-facing mirror.
  */
 export async function publishCanonicalWorkState(
   github: FugueGitHub,
   state: CanonicalWorkState,
 ): Promise<boolean> {
-  const parsed = canonicalWorkStateSchema.parse(state);
+  let parsed = canonicalWorkStateSchema.parse(state);
   assertWorkMetadataForIssue(parsed.metadata, parsed.issue);
-  const current = await loadCanonicalWorkStateAtBase(github, parsed.issue, parsed.base_sha, "current");
-  if (current && sameCanonicalWorkState(current, parsed)) return false;
+  const current = await loadCanonicalWorkStateAtBase(github, parsed.issue, parsed.base_sha);
+  if (current && sameCanonicalWorkState(current, parsed)) {
+    await ensureCanonicalWorkStateComment(github, current);
+    return false;
+  }
 
-  const { owner, repo } = github.repository;
-  const stage = await github.octokit.rest.repos.createCommitStatus({
-    owner,
-    repo,
-    sha: parsed.base_sha,
-    state: "success",
-    context: workStateStageContext(parsed.issue),
-    description: `Fugue work-state staging generation for Issue #${parsed.issue}`,
-  });
-  const stageId = stage.data.id;
-  const staged = canonicalWorkStateSchema.parse({ ...parsed, checkpoint_id: stageId });
-  const comment = await createProtocolComment(
+  await assertRepositoryDefaultBranchRevision(github, parsed.base_sha);
+  const minimumCreated = current ? Date.parse(current.created_at) + 1 : 0;
+  const requestedCreated = Date.parse(parsed.created_at);
+  const createdMs = Math.max(Date.now(), minimumCreated, Number.isFinite(requestedCreated) ? requestedCreated : 0);
+  parsed = canonicalWorkStateSchema.parse({ ...parsed, created_at: new Date(createdMs).toISOString() });
+
+  const unsignedBody = renderCanonicalWorkStateComment(parsed);
+  const comment = await createProtocolComment(github, parsed.issue, unsignedBody);
+  const proofValid = await verifyProtocolPublicationBodyAtRevision(
     github,
-    staged.issue,
-    `${serializeCanonicalWorkState(staged)}\n\nFUGUE WORK STATE — CANONICAL\n\nWork: \`${staged.metadata.work_id}\`\nIssue: #${staged.issue}`,
+    comment.data.body,
+    parsed.base_sha,
+    Date.parse(parsed.created_at),
   );
-  const digest = createHash("sha256").update(comment.data.body, "utf8").digest("hex");
-  await github.octokit.rest.repos.createCommitStatus({
-    owner,
-    repo,
-    sha: staged.base_sha,
-    state: "success",
-    context: workStateHeadContext(staged.issue),
-    description: checkpointDescription(stageId, comment.data.id, digest),
-    target_url: comment.data.html_url,
-  });
+  if (!proofValid) {
+    throw new CanonicalWorkStateIntegrityError(
+      `Issue #${parsed.issue} protected publisher proof does not match base ${parsed.base_sha.slice(0, 8)}; refusing authority commit.`,
+    );
+  }
+
+  await assertRepositoryDefaultBranchRevision(github, parsed.base_sha);
+  await writeWorkStateBundle(github, parsed, comment.data.body, comment.data.html_url);
   return true;
 }
 
@@ -230,14 +276,10 @@ export async function loadCurrentCanonicalWorkState(
   issueNumber: number,
   baseSha: string,
 ): Promise<CanonicalWorkState | undefined> {
-  return loadCanonicalWorkStateAtBase(github, issueNumber, baseSha, "current");
+  return loadCanonicalWorkStateAtBase(github, issueNumber, baseSha);
 }
 
-/**
- * Locate the nearest historical canonical checkpoint on the protected branch and verify that its
- * signed publisher proof was minted by that exact historical base SHA. Newer invalid checkpoints
- * are fatal; rollover never skips backward to older evidence.
- */
+/** Locate the nearest historical base containing a valid exact-base signed work-state bundle. */
 export async function loadReusableCanonicalWorkState(
   github: FugueGitHub,
   issueNumber: number,
@@ -254,9 +296,8 @@ export async function loadReusableCanonicalWorkState(
   for (const commit of commits) {
     const sha = commit.sha;
     if (sha.toLowerCase() === currentBaseSha.toLowerCase()) continue;
-    const hasHead = (await listStatuses(github, sha, workStateHeadContext(issueNumber))).length > 0;
-    if (!hasHead) continue;
-    return loadCanonicalWorkStateAtBase(github, issueNumber, sha, "reusable");
+    const state = await loadCanonicalWorkStateAtBase(github, issueNumber, sha);
+    if (state) return state;
   }
   return undefined;
 }
@@ -275,12 +316,7 @@ export async function rollCanonicalWorkStatesToCurrentBase(
   const rolled: number[] = [];
   for (const issue of issues) {
     if (issue.pull_request) continue;
-    const current = await loadCanonicalWorkStateAtBase(
-      github,
-      issue.number,
-      policy.identity.baseSha,
-      "current",
-    );
+    const current = await loadCanonicalWorkStateAtBase(github, issue.number, policy.identity.baseSha);
     if (current) continue;
     const previous = await loadReusableCanonicalWorkState(
       github,
@@ -304,86 +340,203 @@ export async function rollCanonicalWorkStatesToCurrentBase(
   return rolled;
 }
 
+/** Recreate deleted/tampered canonical-state comments from status-bundle authority. */
+export async function repairCanonicalWorkStateComments(
+  github: FugueGitHub,
+  policy: ActivePolicy,
+): Promise<number[]> {
+  const { owner, repo } = github.repository;
+  const issues = await github.octokit.paginate(github.octokit.rest.issues.listForRepo, {
+    owner,
+    repo,
+    state: "all",
+    per_page: 100,
+  });
+  const repaired: number[] = [];
+  for (const issue of issues) {
+    if (issue.pull_request) continue;
+    const state = await loadCanonicalWorkStateAtBase(github, issue.number, policy.identity.baseSha);
+    if (!state) continue;
+    if (await ensureCanonicalWorkStateComment(github, state)) repaired.push(issue.number);
+  }
+  return repaired;
+}
+
+async function ensureCanonicalWorkStateComment(
+  github: FugueGitHub,
+  state: CanonicalWorkState,
+): Promise<boolean> {
+  const { owner, repo } = github.repository;
+  const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
+    owner,
+    repo,
+    issue_number: state.issue,
+    per_page: 100,
+  });
+  for (const comment of comments) {
+    if (!(await isTrustedProtocolComment(github, comment))) continue;
+    try {
+      const parsed = parseCanonicalWorkState(comment.body ?? "");
+      if (parsed && exactCanonicalWorkState(parsed, state)) return false;
+    } catch {
+      // A damaged mirror is presentation only; a fresh protected mirror is created below.
+    }
+  }
+  await createProtocolComment(github, state.issue, renderCanonicalWorkStateComment(state));
+  return true;
+}
+
+function renderCanonicalWorkStateComment(state: CanonicalWorkState): string {
+  return `${serializeCanonicalWorkState(state)}\n\nFUGUE WORK STATE — CANONICAL\n\nWork: \`${state.metadata.work_id}\`\nIssue: #${state.issue}`;
+}
+
+async function writeWorkStateBundle(
+  github: FugueGitHub,
+  state: CanonicalWorkState,
+  signedBody: string,
+  targetUrl: string,
+): Promise<void> {
+  const { owner, repo } = github.repository;
+  let lastValidationError: unknown;
+  for (let attempt = 0; attempt < BUNDLE_WRITE_ATTEMPTS; attempt += 1) {
+    const key = randomBytes(BUNDLE_KEY_BYTES).toString("hex");
+    const bundle = encodeWorkStateBundle(state.issue, key, signedBody);
+    try {
+      for (const record of bundle.data) {
+        await github.octokit.rest.repos.createCommitStatus({
+          owner,
+          repo,
+          sha: state.base_sha,
+          state: "success",
+          context: record.context,
+          description: record.description,
+          target_url: targetUrl,
+        });
+      }
+      // The manifest is the only discoverable commit point. If the base advanced or this stale
+      // workflow cannot prove the exact base, all prior chunks stay inert and a fresh run recovers.
+      await assertRepositoryDefaultBranchRevision(github, state.base_sha);
+      const proofStillValid = await verifyProtocolPublicationBodyAtRevision(
+        github,
+        signedBody,
+        state.base_sha,
+        Date.parse(state.created_at),
+      );
+      if (!proofStillValid) {
+        throw new CanonicalWorkStateIntegrityError(
+          `Issue #${state.issue} publisher identity changed before canonical bundle commit.`,
+        );
+      }
+      await github.octokit.rest.repos.createCommitStatus({
+        owner,
+        repo,
+        sha: state.base_sha,
+        state: "success",
+        context: bundle.manifest.context,
+        description: bundle.manifest.description,
+        target_url: targetUrl,
+      });
+      return;
+    } catch (error) {
+      if (httpStatus(error) !== 422) throw error;
+      lastValidationError = error;
+      // A partial random-key bundle has no manifest or remains independently verifiable; retrying
+      // under a fresh secret key is safe and avoids any exhausted/poisoned context.
+      await assertRepositoryDefaultBranchRevision(github, state.base_sha);
+    }
+  }
+  throw new Error(`Unable to allocate a fresh canonical work-state status bundle: ${message(lastValidationError)}`);
+}
+
 async function loadCanonicalWorkStateAtBase(
   github: FugueGitHub,
   issueNumber: number,
   baseSha: string,
-  mode: "current" | "reusable",
 ): Promise<CanonicalWorkState | undefined> {
-  const heads = await listStatuses(github, baseSha, workStateHeadContext(issueNumber));
-  const head = heads[0];
-  if (!head) return undefined;
-  const pointer = parseCheckpointPointer(head.description, issueNumber, baseSha);
-
-  const stages = (await listStatuses(github, baseSha, workStateStageContext(issueNumber)))
-    .filter((status) => status.id < head.id);
-  const latestStage = stages[0];
-  if (!latestStage || latestStage.id !== pointer.stageId) {
-    throw new CanonicalWorkStateIntegrityError(
-      `Issue #${issueNumber} canonical work-state head at ${baseSha.slice(0, 8)} does not commit the latest staging generation before it.`,
-    );
+  const statuses = await listStatuses(github, baseSha);
+  const identity = await readRepositoryDefaultBranchIdentity(github);
+  const loaded: LoadedBundle[] = [];
+  const manifestPattern = new RegExp(`^${escapeRegex(WORK_STATE_BUNDLE_PREFIX)}${issueNumber}/m/([0-9a-f]{32})$`, "i");
+  const byContext = new Map<string, CommitStatusRecord[]>();
+  for (const status of statuses) {
+    const list = byContext.get(status.context) ?? [];
+    list.push(status);
+    byContext.set(status.context, list);
   }
+  for (const list of byContext.values()) list.sort((a, b) => a.id - b.id);
 
-  const { owner, repo } = github.repository;
-  let comment;
-  try {
-    comment = await github.octokit.rest.issues.getComment({ owner, repo, comment_id: pointer.commentId });
-  } catch (error) {
-    if (isNotFound(error)) {
-      throw new CanonicalWorkStateIntegrityError(
-        `Issue #${issueNumber} canonical work-state checkpoint points to deleted comment ${pointer.commentId}; state is non-current.`,
-      );
+  for (const status of statuses) {
+    const keyMatch = status.context.match(manifestPattern);
+    const key = keyMatch?.[1]?.toLowerCase();
+    if (!key) continue;
+    const earliestManifest = byContext.get(status.context)?.[0];
+    if (!earliestManifest || earliestManifest.id !== status.id) continue;
+    const manifest = status.description?.match(BUNDLE_MANIFEST_PATTERN);
+    if (!manifest?.[1] || !manifest[2]) continue;
+    const count = Number(manifest[1]);
+    if (!Number.isInteger(count) || count <= 0 || count > BUNDLE_MAX_CHUNKS) continue;
+
+    const chunks: string[] = [];
+    let complete = true;
+    for (let index = 0; index < count; index += 1) {
+      const context = workStateDataContext(issueNumber, key, index);
+      const first = byContext.get(context)?.[0];
+      const chunk = first?.description ?? "";
+      if (!chunk || !/^[A-Za-z0-9_-]+$/.test(chunk)) {
+        complete = false;
+        break;
+      }
+      chunks.push(chunk);
     }
-    throw error;
-  }
-  const body = comment.data.body ?? "";
-  const digest = createHash("sha256").update(body, "utf8").digest("hex");
-  if (digest !== pointer.digest) {
-    throw new CanonicalWorkStateIntegrityError(
-      `Issue #${issueNumber} canonical work-state comment ${pointer.commentId} no longer matches its immutable checkpoint digest.`,
-    );
+    if (!complete) continue;
+
+    const encoded = chunks.join("");
+    if (createHash("sha256").update(encoded, "utf8").digest("hex") !== manifest[2]) continue;
+    let body: string;
+    try {
+      body = gunzipSync(Buffer.from(encoded, "base64url")).toString("utf8");
+    } catch {
+      continue;
+    }
+    let parsed: CanonicalWorkState | null;
+    try {
+      parsed = parseCanonicalWorkState(body);
+    } catch {
+      continue;
+    }
+    if (!parsed || parsed.issue !== issueNumber) continue;
+    if (parsed.base_sha.toLowerCase() !== baseSha.toLowerCase()) continue;
+    const timestamp = Date.parse(parsed.created_at);
+    if (!Number.isFinite(timestamp)) continue;
+    let trusted = false;
+    try {
+      trusted = await verifyProtocolPublicationBodyAtRevision(
+        github,
+        body,
+        baseSha,
+        timestamp,
+        identity.branch,
+      );
+    } catch {
+      trusted = false;
+    }
+    if (!trusted) continue;
+    loaded.push({ state: parsed, body, manifestId: status.id });
   }
 
-  const trusted = mode === "current"
-    ? await isTrustedProtocolComment(github, comment.data)
-    : await isReusableProtocolComment(github, comment.data, baseSha);
-  if (!trusted) {
-    throw new CanonicalWorkStateIntegrityError(
-      `Issue #${issueNumber} canonical work-state checkpoint does not have publisher proof for protected base ${baseSha.slice(0, 8)}.`,
-    );
-  }
-
-  let parsed: CanonicalWorkState | null;
-  try {
-    parsed = parseCanonicalWorkState(body);
-  } catch (error) {
-    throw new CanonicalWorkStateIntegrityError(
-      `Issue #${issueNumber} canonical work-state checkpoint is malformed (${message(error)}).`,
-    );
-  }
-  if (!parsed || parsed.issue !== issueNumber) {
-    throw new CanonicalWorkStateIntegrityError(
-      `Issue #${issueNumber} canonical checkpoint does not contain its work-state record.`,
-    );
-  }
-  if (parsed.base_sha.toLowerCase() !== baseSha.toLowerCase()) {
-    throw new CanonicalWorkStateIntegrityError(
-      `Issue #${issueNumber} canonical work-state claims base ${parsed.base_sha.slice(0, 8)} but checkpoint is on ${baseSha.slice(0, 8)}.`,
-    );
-  }
-  if (parsed.checkpoint_id !== pointer.stageId) {
-    throw new CanonicalWorkStateIntegrityError(
-      `Issue #${issueNumber} canonical work-state generation does not match its immutable checkpoint.`,
-    );
-  }
-  return parsed;
+  return loaded
+    .sort((a, b) => {
+      const time = Date.parse(a.state.created_at) - Date.parse(b.state.created_at);
+      if (time !== 0) return time;
+      const digest = createHash("sha256").update(a.body).digest("hex")
+        .localeCompare(createHash("sha256").update(b.body).digest("hex"));
+      if (digest !== 0) return digest;
+      return a.manifestId - b.manifestId;
+    })
+    .at(-1)?.state;
 }
 
-async function listStatuses(
-  github: FugueGitHub,
-  sha: string,
-  context: string,
-): Promise<CommitStatusRecord[]> {
+async function listStatuses(github: FugueGitHub, sha: string): Promise<CommitStatusRecord[]> {
   const { owner, repo } = github.repository;
   const statuses = await github.octokit.paginate(github.octokit.rest.repos.listCommitStatusesForRef, {
     owner,
@@ -391,33 +544,11 @@ async function listStatuses(
     ref: sha,
     per_page: 100,
   });
-  return statuses
-    .filter((status) => status.context === context)
-    .map((status) => ({ id: status.id, context: status.context, description: status.description }))
-    .sort((a, b) => b.id - a.id);
-}
-
-function checkpointDescription(stageId: number, commentId: number, digest: string): string {
-  return `stage=${stageId};comment=${commentId};digest=${digest}`;
-}
-
-function parseCheckpointPointer(
-  description: string | null | undefined,
-  issueNumber: number,
-  baseSha: string,
-): CheckpointPointer {
-  const match = description?.match(CHECKPOINT_PATTERN);
-  if (!match?.[1] || !match[2] || !match[3]) {
-    throw new CanonicalWorkStateIntegrityError(
-      `Issue #${issueNumber} latest canonical work-state head at ${baseSha.slice(0, 8)} is not a valid protected checkpoint.`,
-    );
-  }
-  const stageId = Number(match[1]);
-  const commentId = Number(match[2]);
-  if (!Number.isSafeInteger(stageId) || stageId <= 0 || !Number.isSafeInteger(commentId) || commentId <= 0) {
-    throw new CanonicalWorkStateIntegrityError(`Issue #${issueNumber} canonical work-state checkpoint IDs are invalid.`);
-  }
-  return { stageId, commentId, digest: match[3] };
+  return statuses.map((status) => ({
+    id: status.id,
+    context: status.context,
+    description: status.description,
+  }));
 }
 
 export async function reconstructState(github: FugueGitHub): Promise<RepositoryState> {
@@ -452,7 +583,7 @@ export async function reconstructState(github: FugueGitHub): Promise<RepositoryS
         label === "state:ready" || label === "state:working" || label === "state:blocked" || label === "agent:ready"
       );
       if (looksManaged) {
-        repositoryDrift.push(`Issue #${issue.number}: presentation state exists without a current protected canonical work-state checkpoint`);
+        repositoryDrift.push(`Issue #${issue.number}: presentation state exists without a current protected canonical work-state bundle`);
       }
       continue;
     }
@@ -496,9 +627,7 @@ export async function reconstructState(github: FugueGitHub): Promise<RepositoryS
       } else {
         if (pull.state !== "open") {
           const detail = await github.octokit.rest.pulls.get({ owner, repo, pull_number: pull.number });
-          if (detail.data.merged) {
-            continue;
-          }
+          if (detail.data.merged) continue;
           presentationDrift.push(`canonical PR #${pull.number} is closed`);
         }
         if (pull.base.ref !== policy.identity.baseBranch) presentationDrift.push(`PR #${pull.number} base differs from protected base`);
@@ -545,10 +674,7 @@ export async function reconstructState(github: FugueGitHub): Promise<RepositoryS
   }
 
   assertAcyclicDependencies(
-    works.map((work) => ({
-      issueNumber: work.issueNumber,
-      dependencies: work.metadata.spec.dependencies,
-    })),
+    works.map((work) => ({ issueNumber: work.issueNumber, dependencies: work.metadata.spec.dependencies })),
   );
 
   const activeManagedIssues = new Set(works.map((work) => work.issueNumber));
@@ -557,25 +683,16 @@ export async function reconstructState(github: FugueGitHub): Promise<RepositoryS
   for (const work of works) {
     for (const dependency of work.metadata.spec.dependencies) {
       if (activeManagedIssues.has(dependency)) continue;
-
       let problem = dependencyCache.get(dependency);
       if (problem === undefined) {
-        const canonicalDependency = await loadCurrentCanonicalWorkState(
-          github,
-          dependency,
-          policy.identity.baseSha,
-        );
+        const canonicalDependency = await loadCurrentCanonicalWorkState(github, dependency, policy.identity.baseSha);
         if (!canonicalDependency) {
           problem = "has no current protected canonical Fugue work state";
         } else if (!canonicalDependency.pr) {
           problem = "has no protected canonical PR linkage";
         } else {
           try {
-            const pull = await github.octokit.rest.pulls.get({
-              owner,
-              repo,
-              pull_number: canonicalDependency.pr.number,
-            });
+            const pull = await github.octokit.rest.pulls.get({ owner, repo, pull_number: canonicalDependency.pr.number });
             if (pull.data.head.ref !== canonicalDependency.pr.metadata.branch) {
               problem = `canonical PR #${canonicalDependency.pr.number} no longer matches its protected branch identity`;
             } else if (!pull.data.merged) {
@@ -590,7 +707,6 @@ export async function reconstructState(github: FugueGitHub): Promise<RepositoryS
         }
         dependencyCache.set(dependency, problem);
       }
-
       if (problem) work.drift.push(`dependency #${dependency} ${problem}`);
     }
   }
@@ -604,6 +720,16 @@ function labelName(label: string | { name?: string | null }): string {
 
 function isNotFound(error: unknown): boolean {
   return typeof error === "object" && error !== null && "status" in error && (error as { status?: number }).status === 404;
+}
+
+function httpStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object" || !("status" in error)) return undefined;
+  const status = (error as { status?: unknown }).status;
+  return typeof status === "number" ? status : undefined;
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function message(error: unknown): string {

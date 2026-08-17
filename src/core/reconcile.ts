@@ -14,6 +14,7 @@ import {
   loadCurrentCanonicalWorkState,
   publishCanonicalWorkState,
   reconstructState,
+  repairCanonicalWorkStateComments,
   rollCanonicalWorkStatesToCurrentBase,
   type WorkState,
 } from "./state.js";
@@ -66,7 +67,9 @@ export async function reconcileRepository(
   if (options.issue && options.pr) throw new Error("Choose at most one of issue or PR reconciliation filters.");
 
   const policy = await resolveActivePolicy(github);
+  assertProtectedWorkflowRuntimeCurrent(policy);
   await rollCanonicalWorkStatesToCurrentBase(github, policy);
+  await repairCanonicalWorkStateComments(github, policy);
   await ingestCoordinatorIssueEvent(github, policy, coordinatorIssueEventFromEnvironment());
   await adoptAssignedPullRequests(github, policy);
   await repairCanonicalMirrors(github, policy);
@@ -75,17 +78,16 @@ export async function reconcileRepository(
   const selected = selectWorks(initial.works, options);
   const issueNumbers = selected.map((work) => work.issueNumber);
 
-  for (const issueNumber of issueNumbers) {
-    await reconcileWork(github, issueNumber);
-  }
-
+  for (const issueNumber of issueNumbers) await reconcileWork(github, issueNumber);
   return { processed: issueNumbers };
 }
 
 export async function reconcileWork(github: FugueGitHub, issueNumber: number): Promise<void> {
   for (let transition = 0; transition < MAX_TRANSITIONS_PER_WORK; transition += 1) {
     const policy = await resolveActivePolicy(github);
+    assertProtectedWorkflowRuntimeCurrent(policy);
     await rollCanonicalWorkStatesToCurrentBase(github, policy);
+    await repairCanonicalWorkStateComments(github, policy);
     await adoptAssignedPullRequests(github, policy);
     await repairCanonicalMirrors(github, policy, issueNumber);
 
@@ -132,6 +134,19 @@ export async function reconcileWork(github: FugueGitHub, issueNumber: number): P
   }
 }
 
+export function assertProtectedWorkflowRuntimeCurrent(
+  policy: ActivePolicy,
+  runtimeSha = process.env.FUGUE_WORKFLOW_SHA ?? process.env.GITHUB_WORKFLOW_SHA,
+): void {
+  if (!runtimeSha) return;
+  if (!/^[0-9a-f]{40}$/i.test(runtimeSha)) throw new Error("Protected Fugue runtime SHA is malformed.");
+  if (runtimeSha.toLowerCase() !== policy.identity.baseSha.toLowerCase()) {
+    throw new Error(
+      `Stale protected Fugue invocation ${runtimeSha.slice(0, 8)} cannot mutate current base ${policy.identity.baseSha.slice(0, 8)}.`,
+    );
+  }
+}
+
 async function applyAction(
   github: FugueGitHub,
   policy: ActivePolicy,
@@ -166,11 +181,7 @@ async function applyAction(
   }
 }
 
-/**
- * Convert an authorized Coordinator issue event snapshot into protected canonical Fugue state.
- * The body/title/labels used here come from GITHUB_EVENT_PATH, not a later mutable issue fetch, so
- * Human authorization cannot be paired with Actions-authored contents substituted after the event.
- */
+/** Canonicalize the exact immutable GitHub Actions issue-event snapshot, never a later fetch. */
 export async function ingestCoordinatorIssueEvent(
   github: FugueGitHub,
   policy: ActivePolicy,

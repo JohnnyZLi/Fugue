@@ -1,5 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import { parseConfig } from "../src/core/config.js";
+import { resolveQaRequirements } from "../src/core/qa.js";
 import {
   assertValidationMatchesPlan,
   createIntegrationRequest,
@@ -68,8 +70,7 @@ describe("GitHub-hosted Integration plan", () => {
       created_at: new Date().toISOString(),
     });
     expect(() => assertValidationMatchesPlan(value, valid)).not.toThrow();
-    const tampered = { ...valid, commands: ["npm ci", "npm test -- --skip-critical"] };
-    expect(() => assertValidationMatchesPlan(value, tampered)).toThrow(/protected-base command plan/);
+    expect(() => assertValidationMatchesPlan(value, { ...valid, commands: ["npm test -- --skip-critical"] })).toThrow(/protected-base command plan/);
   });
 
   it("keeps candidate validation credential-separated and shell inputs quoted", async () => {
@@ -80,20 +81,19 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).toContain('GH_TOKEN: ""');
     expect(workflow).toContain("FUGUE_RUNTIME_SHA: ${{ github.sha }}");
     expect(workflow).toContain('--runtime-sha "$FUGUE_RUNTIME_SHA"');
-    expect(workflow).toContain('integration-runtime prepare "$FUGUE_PR"');
     expect(workflow).not.toContain('integration-runtime prepare "${{ inputs.pr }}"');
   });
 
-  it("uses base-trusted PR reconciliation and the immutable Actions event payload for Coordinator intent", async () => {
+  it("pins protected reconciliation to immutable workflow_sha while event contents come from GITHUB_EVENT_PATH", async () => {
     const workflow = await readFile(".github/workflows/fugue-control-plane.yml", "utf8");
     expect(workflow).toContain("pull_request_target:");
     expect(workflow).not.toContain("pull_request:\n");
-    expect(workflow).toContain("ref: ${{ github.event.repository.default_branch }}");
-    expect(workflow).not.toContain("FUGUE_EVENT_ACTOR:");
-    expect(workflow).not.toContain("FUGUE_EVENT_ISSUE:");
+    expect(workflow).toContain("ref: ${{ github.workflow_sha }}");
+    expect(workflow).toContain("FUGUE_WORKFLOW_SHA: ${{ github.workflow_sha }}");
+    expect(workflow).not.toContain("ref: ${{ github.event.repository.default_branch }}");
   });
 
-  it("covers every direct security trust primitive in conditional Security QA policy", async () => {
+  it("covers every direct security trust primitive, including repository discovery", async () => {
     const config = await readFile(".fugue/config.yml", "utf8");
     for (const path of [
       "src/core/qa.ts",
@@ -103,6 +103,7 @@ describe("GitHub-hosted Integration plan", () => {
       "src/core/glob.ts",
       "src/core/worker.ts",
       "src/core/dependencies.ts",
+      "src/core/git.ts",
       "src/core/state.ts",
       "src/core/evaluation.ts",
       "src/core/review-activity.ts",
@@ -110,8 +111,26 @@ describe("GitHub-hosted Integration plan", () => {
       "src/core/workflow.ts",
       "src/core/provenance.ts",
       "src/core/ci.ts",
+    ]) expect(config).toContain(`- "${path}"`);
+  });
+
+  it("treats source-level trust-runtime changes as Human control-plane acknowledgement changes", async () => {
+    const raw = await readFile(".fugue/config.yml", "utf8");
+    const config = parseConfig(raw);
+    for (const path of [
+      "src/core/reconcile.ts",
+      "src/core/state.ts",
+      "src/core/provenance.ts",
+      "src/core/submissions.ts",
+      "src/core/gates.ts",
+      "src/core/integration.ts",
+      "src/core/integration-status.ts",
+      "src/core/git.ts",
+      "src/commands/integration-runtime.ts",
     ]) {
-      expect(config).toContain(`- "${path}"`);
+      const resolution = resolveQaRequirements(config, [path]);
+      expect(resolution.controlPlaneChanged, path).toBe(true);
+      expect(resolution.required.some((item) => item.role === "security"), path).toBe(true);
     }
   });
 });

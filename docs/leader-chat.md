@@ -20,13 +20,13 @@ The Leader:
 
 The Leader must distinguish **Coordinator input/presentation** from **canonical Fugue state**.
 
-- The authoritative work specification, lifecycle, Worker ID/branch, and PR linkage are the signed `fugue-work-state` record committed by the protected-base work-state checkpoint transaction.
-- Issue title/body/labels, `fugue-work` metadata, PR body, and `fugue-pr` metadata are repairable mirrors. They are useful UX and Coordinator input, but they are not sufficient proof of current work identity.
+- The authoritative work specification, lifecycle, Worker ID/branch, and PR linkage are reconstructed from the protected-base OIDC-signed work-state status bundle.
+- The ordinary `fugue-work-state` issue comment, issue title/body/labels, `fugue-work` metadata, PR body, and `fugue-pr` metadata are repairable mirrors. They are useful UX and Coordinator input, but they are not sufficient proof of current work identity.
 - A Coordinator issue edit is canonicalized from the exact immutable GitHub Actions event payload for that Human-authorized event. Fugue does not authenticate the actor and then fetch a later mutable issue body.
-- If the newest canonical checkpoint points to a missing/tampered signed comment, or a newer invalid checkpoint exists, state is non-current. Do not infer authority from an older surviving comment or from the mirrors; surface the blocked integrity state.
-- When protected base advances, current protected reconciliation may roll work state forward only from the nearest historical checkpoint whose OIDC proof is bound to that exact historical workflow/base SHA.
+- Invalid, interleaved, incomplete, or forged status bundles are inert. Protected reconciliation can write a fresh secret-sharded bundle even after old contexts are poisoned/exhausted, and it can recreate a deleted/tampered canonical comment from bundle authority. Do not ask the Human to perform repository surgery.
+- When protected base advances, current protected reconciliation may roll work state forward only from the nearest valid historical bundle whose OIDC proof is bound to that exact historical workflow/base SHA.
 
-This means a replacement Leader should read the current reconstructed Fugue state first, not treat whatever happens to be visible in issue/PR metadata as the Worker contract.
+This means a replacement Leader should read the current reconstructed Fugue state first, not treat whatever happens to be visible in issue/PR metadata or state comments as the Worker contract.
 
 ## Normal check-in
 
@@ -59,7 +59,7 @@ Address only the blocking findings within the existing ownership contract.
 #123 passed current Integration. PR #456 is ready to merge.
 ```
 
-If canonical work-state integrity is non-current, do not silently reconstruct from issue labels/body or PR metadata. Report that protected reconciliation is blocked on durable-state integrity instead.
+If no valid current bundle exists yet, do not infer authority from issue labels/body or PR metadata. Report the missing canonical state while protected reconciliation performs its normal recovery path; permanent fail-closed status poisoning is not a Human repair workflow.
 
 ## Worker prompt
 
@@ -134,7 +134,7 @@ Do not ask the Human to diagnose stale-review state. If QA requests changes, the
 
 ## Control-plane acknowledgement
 
-When protected paths change, explain the material policy/workflow change to the Human and request an explicit acknowledgement of the **current exact evaluation identity**. The Human only says whether they acknowledge it; they do not copy or type the identity fields.
+When any configured `control_plane.paths` change—including source-level reconciliation, state/provenance, submissions/gates, repository discovery, or Integration trust runtime—explain the material change to the Human and request an explicit acknowledgement of the **current exact evaluation identity**. The Human only says whether they acknowledge it; they do not copy or type the identity fields.
 
 After the Human agrees, the Leader re-fetches the current PR evaluation identity from GitHub and posts a request like this through GitHub:
 
@@ -161,11 +161,11 @@ The Human does not run `fugue acknowledge` or carry these identity fields during
 
 ## Integration recovery
 
-A signed Integration request is durable. A matching protected workflow run must be causally later than that request and bound to its PR/request ID. If a same-repository workflow with shared Actions authority merely cancels or aborts the protected Integration run, Fugue treats that run as recoverable transport failure rather than a terminal verdict. After the recovery grace period, the same signed request may be dispatched again. A genuine protected `failure` remains a failure, and a current signed Integration PASS remains authoritative even if a later duplicate run is cancelled.
+A signed Integration request is durable. A matching protected workflow run must be causally later than that request and bound to its PR/request ID. Fugue resolves attempt 1 explicitly for each matching workflow-run ID. Re-running the same GitHub run ID cannot replace a genuine first-attempt PASS/failure with the rerun's current conclusion. A first attempt that was cancelled/aborted is recoverable transport failure; after the recovery grace period the same signed request may be dispatched again.
 
 ## Final merge
 
-Only ask after Fugue reconstructs a current exact-identity Integration PASS from the signed durable Integration request, its matching protected workflow run, and the signed Integration attestation. `fugue/integration = success` remains the GitHub branch-protection/UI signal but is not authoritative durable Fugue evidence by itself. Re-fetch mutable PR/head/evidence/status state immediately before merging. Merge only after the Human says to merge.
+Only ask after Fugue reconstructs a current exact-identity Integration PASS from the signed durable Integration request, its matching protected first-attempt workflow run, and the signed Integration attestation. `fugue/integration = success` remains the GitHub branch-protection/UI signal but is not authoritative durable Fugue evidence by itself. Re-fetch mutable PR/head/evidence/status state immediately before merging. Merge only after the Human says to merge.
 
 ## Local CLI
 

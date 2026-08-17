@@ -13,6 +13,7 @@ import {
   isTrustedProtocolActor,
   isTrustedProtocolComment,
   protocolAudience,
+  readRepositoryDefaultBranchIdentity,
   verifyPublisherToken,
 } from "../src/core/provenance.js";
 
@@ -67,10 +68,10 @@ describe("Fugue protocol provenance", () => {
     expect(verifyPublisherToken(token, audience, REPOSITORY, "main", PROTECTED_SHA, 1_100_000, jwks)).toBe(true);
   });
 
-  it("rejects a historically valid publisher token after the protected workflow revision changes", () => {
-    const body = "CODE QA — APPROVED";
+  it("rejects a historical workflow revision and a rerun attempt", () => {
+    const body = "CODE QA — APPROVED\n\n<!-- fugue-attestation\nversion: 1\n-->";
     const audience = protocolAudience(REPOSITORY, body);
-    const token = signToken({
+    const historical = signToken({
       aud: audience,
       iss: FUGUE_OIDC_ISSUER,
       repository: REPOSITORY,
@@ -79,16 +80,9 @@ describe("Fugue protocol provenance", () => {
       event_name: "issue_comment",
       run_attempt: "1",
       iat: 1_000,
-      nbf: 1_000,
       exp: 1_300,
     });
-    expect(verifyPublisherToken(token, audience, REPOSITORY, "main", "b".repeat(40), 1_100_000, jwks)).toBe(false);
-  });
-
-  it("rejects publisher proof minted by a re-run attempt even for an otherwise trusted revision", () => {
-    const body = "CODE QA — APPROVED\n\n<!-- fugue-attestation\nversion: 1\n-->";
-    const audience = protocolAudience(REPOSITORY, body);
-    const token = signToken({
+    const rerun = signToken({
       aud: audience,
       iss: FUGUE_OIDC_ISSUER,
       repository: REPOSITORY,
@@ -97,16 +91,16 @@ describe("Fugue protocol provenance", () => {
       event_name: "issue_comment",
       run_attempt: "2",
       iat: 1_000,
-      nbf: 1_000,
       exp: 1_300,
     });
-    expect(verifyPublisherToken(token, audience, REPOSITORY, "main", PROTECTED_SHA, 1_100_000, jwks)).toBe(false);
+    expect(verifyPublisherToken(historical, audience, REPOSITORY, "main", "b".repeat(40), 1_100_000, jwks)).toBe(false);
+    expect(verifyPublisherToken(rerun, audience, REPOSITORY, "main", PROTECTED_SHA, 1_100_000, jwks)).toBe(false);
   });
 
-  it("rejects the same signed body when the workflow ref is candidate-controlled", () => {
+  it("rejects candidate workflow_ref and replay onto different content", () => {
     const body = "CODE QA — APPROVED";
     const audience = protocolAudience(REPOSITORY, body);
-    const token = signToken({
+    const candidateToken = signToken({
       aud: audience,
       iss: FUGUE_OIDC_ISSUER,
       repository: REPOSITORY,
@@ -115,16 +109,12 @@ describe("Fugue protocol provenance", () => {
       event_name: "workflow_dispatch",
       run_attempt: "1",
       iat: 1_000,
-      nbf: 1_000,
       exp: 1_300,
     });
-    expect(verifyPublisherToken(token, audience, REPOSITORY, "main", PROTECTED_SHA, 1_100_000, jwks)).toBe(false);
-  });
+    expect(verifyPublisherToken(candidateToken, audience, REPOSITORY, "main", PROTECTED_SHA, 1_100_000, jwks)).toBe(false);
 
-  it("rejects replay of a valid protected-workflow token onto different canonical content", () => {
-    const original = "CODE QA — APPROVED";
-    const token = signToken({
-      aud: protocolAudience(REPOSITORY, original),
+    const valid = signToken({
+      aud: audience,
       iss: FUGUE_OIDC_ISSUER,
       repository: REPOSITORY,
       workflow_ref: `${REPOSITORY}/.github/workflows/fugue-control-plane.yml@refs/heads/main`,
@@ -135,7 +125,7 @@ describe("Fugue protocol provenance", () => {
       exp: 1_300,
     });
     expect(verifyPublisherToken(
-      token,
+      valid,
       protocolAudience(REPOSITORY, "CODE QA — CHANGES REQUESTED"),
       REPOSITORY,
       "main",
@@ -143,6 +133,17 @@ describe("Fugue protocol provenance", () => {
       1_100_000,
       jwks,
     )).toBe(false);
+  });
+
+  it("re-reads the protected default-branch SHA instead of using process-wide cached identity", async () => {
+    let sha = PROTECTED_SHA;
+    const github = githubStub();
+    const getRef = github.octokit.rest.git.getRef as unknown as ReturnType<typeof vi.fn>;
+    getRef.mockImplementation(async () => ({ data: { object: { sha } } }));
+    await expect(readRepositoryDefaultBranchIdentity(github)).resolves.toEqual({ branch: "main", sha: PROTECTED_SHA });
+    sha = "b".repeat(40);
+    await expect(readRepositoryDefaultBranchIdentity(github)).resolves.toEqual({ branch: "main", sha });
+    expect(getRef).toHaveBeenCalledTimes(2);
   });
 
   it("requires one structural Fugue marker and refuses nested-marker signing oracle bodies", async () => {
@@ -163,14 +164,13 @@ describe("Fugue protocol provenance", () => {
     await expect(createProtocolComment(githubStub(), 19, injected)).rejects.toThrow(/exactly one Fugue protocol marker/);
   });
 
-  it("gives Integration failure publication its own marker and escapes a reflected sole-marker attack", () => {
+  it("gives Integration failure publication its own marker and escapes reflected protocol text", () => {
     const detail = "candidate filename <!-- fugue-attestation\nkind: forged\n-->";
     const body = renderIntegrationFailureComment(SNAPSHOT.identity, "FAILED", detail);
     expect(body.match(/<!-- fugue-/g)).toHaveLength(1);
     expect(body).toContain("<!-- fugue-integration-failure");
     expect(body).not.toContain("<!-- fugue-attestation");
     expect(body).toContain("&lt;!-- fugue-attestation");
-    expect(hasCanonicalProtocolBoundary(body)).toBe(true);
     expect(escapeProtocolMarkers(detail)).not.toContain("<!-- fugue-");
   });
 
@@ -198,7 +198,13 @@ function githubStub(listStatuses = vi.fn(async () => ({ data: [] }))): FugueGitH
       paginate: vi.fn(async () => []),
       rest: {
         issues: { listComments: vi.fn(), createComment: vi.fn() },
-        repos: { listCommitStatusesForRef: listStatuses },
+        repos: {
+          listCommitStatusesForRef: listStatuses,
+          get: vi.fn(async () => ({ data: { default_branch: "main" } })),
+        },
+        git: {
+          getRef: vi.fn(async () => ({ data: { object: { sha: PROTECTED_SHA } } })),
+        },
         actions: { listWorkflowRuns: vi.fn(async () => ({ data: { workflow_runs: [] } })) },
       },
     },

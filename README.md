@@ -63,9 +63,12 @@ AGENTS.md
 .fugue/VERSION
     protocol / runtime compatibility
 
-Signed canonical fugue-work-state transaction
+Signed canonical fugue-work-state status bundle
     authoritative work specification, lifecycle, dependencies/ownership,
     Worker claim, assigned branch, and PR linkage
+
+Canonical fugue-work-state issue comment
+    repairable Human-facing mirror of the signed bundle
 
 GitHub issue body/labels + fugue-work metadata
     Coordinator input and repairable presentation mirror only
@@ -78,18 +81,20 @@ PR comments + canonical Fugue attestations
     Integration requests/results
 
 commit statuses
-    immutable work-state transaction checkpoints plus UI/branch signals:
+    cryptographically reconstructable work-state bundle chunks plus UI signals:
     fugue/code-qa
     fugue/security-qa
     fugue/visual-qa
     fugue/integration
 ```
 
-Canonical work-state publication is a two-phase protected-base transaction. Fugue first appends an immutable staging status with a server-assigned generation, signs a `fugue-work-state` comment that embeds that generation, then appends an immutable head status containing the exact comment ID and digest. Readers validate the newest head only. If the committed comment is deleted or modified, or if an untrusted workflow appends a forged newer head, work state becomes detectably non-current; Fugue never falls back to an older surviving state.
+Canonical work-state authority does not use one fixed append-only status context. Protected Fugue signs the complete work-state body with GitHub OIDC, compresses that signed body into status chunks whose contexts are derived from a fresh secret, writes those data chunks first, and reveals the secret only in a manifest status written last. The secret makes future chunk contexts unpredictable while a transaction is being written. Readers take the earliest server-assigned status in each exact secret-derived context, reconstruct the body, and verify its OIDC proof, issue, base SHA, and signed timestamp. A candidate may append forged statuses after contexts become visible, exhaust old contexts, or publish arbitrary fake manifests, but those writes cannot replace an already-written protected chunk or prevent the next protected publication from using a fresh secret.
 
-Canonical durable Fugue comments have one structural Fugue protocol marker and are content-bound using GitHub Actions OIDC proof to an approved Fugue workflow on the repository default branch at the required protected workflow revision. Historical work-state rollover additionally requires the proof's `workflow_sha` and the signed state's `base_sha` to equal the exact historical protected-base checkpoint being reused. The shared `github-actions[bot]` login, a re-run attempt, a stale workflow revision, or a matching status context is not authority by itself.
+The ordinary canonical work-state comment is not part of that authority chain. If it is deleted or tampered, scheduled protected reconciliation reconstructs the signed body from the status bundle and writes a new current comment mirror. Invalid or incomplete bundles are ignored rather than becoming a permanent newest-head poison, and replaying an older valid signed body cannot outrank a newer signed work-state timestamp.
 
-Candidate control-plane changes are proposed future policy. They do not weaken the protected-base rules or workflow code used to evaluate their own PR.
+Canonical durable Fugue comments have one structural Fugue protocol marker and are content-bound using GitHub Actions OIDC proof to an approved Fugue workflow on the repository default branch at the required protected workflow revision. Historical work-state rollover additionally requires the proof's `workflow_sha` and the signed state's `base_sha` to equal the exact historical protected base being reused. The control-plane workflow checks out its immutable `github.workflow_sha`, reconciliation compares that SHA with freshly resolved current policy before mutation, and work-state publication verifies the just-minted OIDC proof against the exact base again before its manifest can commit. No process-wide cached default-branch SHA is authoritative.
+
+Candidate control-plane changes are proposed future policy. They do not weaken the protected-base rules or workflow code used to evaluate their own PR. Source-level changes to reconciliation, state/provenance, submissions/gates, repository discovery, and Integration trust runtime are classified as control-plane changes and therefore require the same explicit Human acknowledgement as workflow/policy changes.
 
 ## Protected GitHub control plane
 
@@ -100,7 +105,7 @@ Coordinator issue edits are accepted only from the immutable GitHub Actions even
 It automatically handles:
 
 - ready-work allocation and Worker branch creation;
-- signed checkpointed work-state publication and mirror repair;
+- recoverable signed work-state bundle publication and comment/mirror repair;
 - Worker PR adoption;
 - central changed-file ownership enforcement;
 - exact-head CI gating before QA;
@@ -173,7 +178,7 @@ A current QA `changes_requested` verdict moves the work back to **NEEDS WORKER C
 
 ## Human control-plane acknowledgement
 
-Control-plane changes remain an explicit Human boundary. The Leader explains the material protected-policy/workflow change and asks the Human whether they acknowledge the **current exact evaluation identity**. The Human only answers the decision; they do not copy SHAs, digests, or protocol fields.
+Control-plane changes remain an explicit Human boundary. This includes source-level trust-runtime changes matched by `control_plane.paths`, not just workflow/policy file edits. The Leader explains the material protected-policy/runtime change and asks the Human whether they acknowledge the **current exact evaluation identity**. The Human only answers the decision; they do not copy SHAs, digests, or protocol fields.
 
 After approval, the Leader re-fetches the current evaluation from GitHub and posts an identity-bound request such as:
 
@@ -234,7 +239,7 @@ FINALIZE (write-capable trusted Fugue)
 
 The candidate is never used as the source of the workflow code that judges it, and candidate validation does not receive Fugue publication authority.
 
-Authoritative Integration state is reconstructed from the signed exact-identity Integration request, its causally later protected workflow run bound to both `request_id` and the expected PR input, and the signed Integration attestation. Completed workflow runs that were merely cancelled/aborted are treated as recoverable transport failures: they are ignored for authoritative result selection and the durable request becomes eligible for redispatch instead of becoming terminal. `fugue/integration` remains the GitHub branch-protection/UI signal, but the shared Actions status context is not treated as durable Fugue truth by itself.
+Authoritative Integration state is reconstructed from the signed exact-identity Integration request, its causally later protected workflow run bound to both `request_id` and the expected PR input, and the signed Integration attestation. Fugue resolves **attempt 1** explicitly for a matching workflow-run ID; re-running that same ID cannot erase or replace a genuine first-attempt PASS/failure. A first attempt that was cancelled/aborted remains recoverable transport failure and the durable request becomes eligible for redispatch. `fugue/integration` remains the GitHub branch-protection/UI signal, but the shared Actions status context is not treated as durable Fugue truth by itself.
 
 ## Repository bootstrap
 

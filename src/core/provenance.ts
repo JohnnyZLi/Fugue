@@ -16,7 +16,6 @@ const TRUSTED_WORKFLOWS = new Map<string, ReadonlySet<string>>([
   ],
   [".github/workflows/fugue-integration.yml", new Set(["workflow_dispatch"])],
 ]);
-const defaultBranchCache = new Map<string, { branch: string; sha: string }>();
 
 export interface GitHubActorLike {
   login?: string | null;
@@ -39,7 +38,7 @@ export interface GitHubCommitStatusLike {
 }
 
 export interface ProtocolCommentResponse {
-  data: { id: number; html_url: string; body: string };
+  data: { id: number; html_url: string; body: string; created_at?: string };
 }
 
 interface OidcHeader {
@@ -76,20 +75,12 @@ export function isTrustedProtocolActor(actor: GitHubActorLike | null | undefined
   return actor.type == null || actor.type === "Bot";
 }
 
-/**
- * Workflow-run actor identity alone is not canonical protocol provenance. This predicate is
- * retained only as a cheap prefilter for workflow-run discovery; callers must also bind runs
- * to the protected workflow file/ref and a trusted durable request.
- */
+/** Actor identity is only a cheap workflow-run prefilter; exact protected identity is bound elsewhere. */
 export function isTrustedProtocolWorkflowRun(run: GitHubWorkflowRunLike): boolean {
   return isTrustedProtocolActor(run.actor);
 }
 
-/**
- * Commit-status actor identity alone is not canonical protocol provenance. Commit statuses are
- * presentation/merge-gate signals unless a protocol reader gives them an explicit fail-closed
- * transaction role, as canonical work-state does.
- */
+/** Commit-status actor identity alone is never canonical Fugue authority. */
 export function isTrustedProtocolCommitStatus(status: GitHubCommitStatusLike): boolean {
   return isTrustedProtocolActor(status.creator);
 }
@@ -112,41 +103,96 @@ export async function isTrustedProtocolComment(
   github: FugueGitHub,
   comment: GitHubCommentLike,
 ): Promise<boolean> {
-  const context = await protocolCommentVerificationContext(github, comment);
-  if (!context) return false;
-  return verifyPublisherToken(
-    context.proof,
-    context.audience,
-    github.repository.fullName,
-    context.protectedBase.branch,
-    context.protectedBase.sha,
-    context.timestamp,
-    context.jwks,
-  );
+  if (!isTrustedProtocolActor(comment.user)) return false;
+  const body = comment.body ?? "";
+  const timestamp = Date.parse(comment.updated_at ?? comment.created_at ?? "");
+  if (!Number.isFinite(timestamp)) return false;
+  try {
+    const protectedBase = await readRepositoryDefaultBranchIdentity(github);
+    return verifyProtocolPublicationBodyAtRevision(github, body, protectedBase.sha, timestamp, protectedBase.branch);
+  } catch {
+    return false;
+  }
 }
 
-/**
- * Verify that a historical protocol comment was originally published by the protected Fugue
- * workflow revision named by the caller. This is ONLY for state rollover performed by current
- * protected code. The explicit SHA binding prevents a stale workflow revision from publishing
- * state for a later base and then being re-authorized by rollover.
- */
+/** Historical comment verification for current protected rollover code only. */
 export async function isReusableProtocolComment(
   github: FugueGitHub,
   comment: GitHubCommentLike,
   protectedWorkflowSha: string,
 ): Promise<boolean> {
-  const context = await protocolCommentVerificationContext(github, comment);
-  if (!context) return false;
+  if (!isTrustedProtocolActor(comment.user)) return false;
+  const timestamp = Date.parse(comment.updated_at ?? comment.created_at ?? "");
+  if (!Number.isFinite(timestamp)) return false;
+  try {
+    const identity = await readRepositoryDefaultBranchIdentity(github);
+    return verifyProtocolPublicationBodyAtRevision(
+      github,
+      comment.body ?? "",
+      protectedWorkflowSha,
+      timestamp,
+      identity.branch,
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verify a stored canonical publication body independently of an ordinary issue comment. This is
+ * used by the work-state status bundle so deleting the Human-facing comment cannot delete truth.
+ */
+export async function verifyProtocolPublicationBodyAtRevision(
+  github: FugueGitHub,
+  body: string,
+  protectedWorkflowSha: string,
+  publicationTimestampMs: number,
+  suppliedDefaultBranch?: string,
+): Promise<boolean> {
+  const proof = parsePublisherProof(body);
+  if (!proof) return false;
+  const canonicalBody = stripProtocolPublisherProof(body);
+  if (!hasCanonicalProtocolBoundary(canonicalBody)) return false;
+  if (!Number.isFinite(publicationTimestampMs)) return false;
+  const defaultBranch = suppliedDefaultBranch ?? (await readRepositoryDefaultBranchIdentity(github)).branch;
+  const jwks = await loadGitHubOidcJwks();
   return verifyPublisherTokenInternal(
-    context.proof,
-    context.audience,
+    proof,
+    protocolAudience(github.repository.fullName, canonicalBody),
     github.repository.fullName,
-    context.protectedBase.branch,
+    defaultBranch,
     protectedWorkflowSha,
-    context.timestamp,
-    context.jwks,
+    publicationTimestampMs,
+    jwks,
   );
+}
+
+/** Read the default branch identity fresh. Never cache this mutable revocation boundary. */
+export async function readRepositoryDefaultBranchIdentity(
+  github: FugueGitHub,
+): Promise<{ branch: string; sha: string }> {
+  const { owner, repo } = github.repository;
+  const response = await github.octokit.rest.repos.get({ owner, repo });
+  const branch = response.data.default_branch;
+  if (!branch) throw new Error(`Repository ${github.repository.fullName} has no default branch.`);
+  const ref = await github.octokit.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+  const sha = ref.data.object.sha;
+  if (!/^[0-9a-f]{40}$/i.test(sha)) {
+    throw new Error(`Repository ${github.repository.fullName} default branch has an invalid head SHA.`);
+  }
+  return { branch, sha };
+}
+
+export async function assertRepositoryDefaultBranchRevision(
+  github: FugueGitHub,
+  expectedSha: string,
+): Promise<void> {
+  const current = await readRepositoryDefaultBranchIdentity(github);
+  if (current.sha.toLowerCase() !== expectedSha.toLowerCase()) {
+    throw new Error(
+      `Protected default branch advanced from ${expectedSha.slice(0, 8)} to ${current.sha.slice(0, 8)}; stale Fugue publication is refused.`,
+    );
+  }
 }
 
 export async function createProtocolComment(
@@ -167,6 +213,7 @@ export async function createProtocolComment(
       id: response.data.id,
       html_url: response.data.html_url,
       body: response.data.body ?? signed,
+      created_at: response.data.created_at,
     },
   };
 }
@@ -189,6 +236,7 @@ export async function updateProtocolComment(
       id: response.data.id,
       html_url: response.data.html_url,
       body: response.data.body ?? signed,
+      created_at: response.data.created_at,
     },
   };
 }
@@ -287,41 +335,6 @@ function verifyPublisherTokenInternal(
   return true;
 }
 
-async function protocolCommentVerificationContext(
-  github: FugueGitHub,
-  comment: GitHubCommentLike,
-): Promise<{
-  proof: string;
-  audience: string;
-  timestamp: number;
-  jwks: JwkSet;
-  protectedBase: { branch: string; sha: string };
-} | null> {
-  if (!isTrustedProtocolActor(comment.user)) return null;
-  const body = comment.body ?? "";
-  const proof = parsePublisherProof(body);
-  if (!proof) return null;
-  const canonicalBody = stripProtocolPublisherProof(body);
-  if (!hasCanonicalProtocolBoundary(canonicalBody)) return null;
-  const timestamp = Date.parse(comment.updated_at ?? comment.created_at ?? "");
-  if (!Number.isFinite(timestamp)) return null;
-  try {
-    const [jwks, protectedBase] = await Promise.all([
-      loadGitHubOidcJwks(),
-      repositoryDefaultBranchIdentity(github),
-    ]);
-    return {
-      proof,
-      audience: protocolAudience(github.repository.fullName, canonicalBody),
-      timestamp,
-      jwks,
-      protectedBase,
-    };
-  } catch {
-    return null;
-  }
-}
-
 async function attachPublisherProof(repository: string, body: string): Promise<string> {
   if (body.includes(PROOF_START)) {
     throw new Error("Canonical Fugue comment body contains a reserved publisher-proof marker.");
@@ -337,9 +350,7 @@ async function requestGitHubOidcToken(audience: string): Promise<string> {
   const requestUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
   const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
   if (!requestUrl || !requestToken) {
-    throw new Error(
-      "Canonical Fugue publication requires protected GitHub Actions OIDC (id-token: write).",
-    );
+    throw new Error("Canonical Fugue publication requires protected GitHub Actions OIDC (id-token: write).");
   }
 
   const url = new URL(requestUrl);
@@ -365,24 +376,6 @@ async function loadGitHubOidcJwks(): Promise<JwkSet> {
   if (!Array.isArray(jwks.keys) || !jwks.keys.length) throw new Error("GitHub OIDC JWKS is empty.");
   jwksCache = jwks;
   return jwks;
-}
-
-async function repositoryDefaultBranchIdentity(
-  github: FugueGitHub,
-): Promise<{ branch: string; sha: string }> {
-  const key = github.repository.fullName;
-  const cached = defaultBranchCache.get(key);
-  if (cached) return cached;
-  const { owner, repo } = github.repository;
-  const response = await github.octokit.rest.repos.get({ owner, repo });
-  const branch = response.data.default_branch;
-  if (!branch) throw new Error(`Repository ${key} has no default branch.`);
-  const ref = await github.octokit.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
-  const sha = ref.data.object.sha;
-  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error(`Repository ${key} default branch has an invalid head SHA.`);
-  const identity = { branch, sha };
-  defaultBranchCache.set(key, identity);
-  return identity;
 }
 
 function parsePublisherProof(body: string): string | null {
