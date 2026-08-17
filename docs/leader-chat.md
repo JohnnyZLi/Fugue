@@ -25,7 +25,7 @@ The Leader must distinguish **presentation** from **authority**.
 - A Human Coordinator edit is captured from the exact immutable GitHub Actions event payload. Issue-event runs have non-replacing concurrency identities so GitHub's single-pending replacement cannot discard that event before execution.
 - Before canonicalizing work state, protected Fugue commits the full authorized event snapshot to d3 durable authority. Scheduled reconciliation can recover and replay the latest protected issue revision after a crash or comment deletion.
 - The d3 authority commit uses an OIDC-signed random bundle key plus independent commit nonce that are both hidden from every pre-commit chunk and revealed only by the protected final manifest. Candidate `statuses:write` code cannot finish an aborted prospective publication.
-- Fake manifests are processed through bounded status-ID recovery slices. Progress is persisted as an OIDC-signed same-tree commit behind a deterministic fast-forward-only `refs/fugue/recovery/*` ref, not an issue comment. Deleting every presentation comment plus continuously appending statuses therefore cannot reset recovery to page 1, create unbounded chunk API lookups, make an older record authoritative, or require Human repository surgery.
+- Fake manifests are processed through bounded status-ID recovery slices. Progress is persisted as write-once OIDC-signed repository Actions Variables created by the dedicated Fugue Authority GitHub App, not in issue comments or `refs/fugue/**`. Candidate `GITHUB_TOKEN` permissions do not include repository Variables, and readers choose greatest validated progress, so deleting/moving custom refs and presentation comments while appending statuses cannot reset recovery to page 1, make an older record authoritative, or require Human repository surgery.
 - Authorized Coordinator snapshots are totally ordered by immutable issue revision, protected workflow delivery sequence, and a content-bound event ID, so distinct same-second/same-action Human edits cannot collide or be reordered by a slower run.
 
 A replacement Leader should read reconstructed Fugue state first, never infer authority from whatever issue/PR comments happen to remain visible.
@@ -108,11 +108,11 @@ The Human only says whether they acknowledge it. The Leader re-fetches the curre
 
 ## Integration recovery
 
-Integration authority is a d3 durable record plus protected one-use dispatch/run-start Git evidence, not a request/result comment or the mutable workflow-run list.
+Integration authority is a d3 durable record plus protected one-use dispatch/run-start authority-variable evidence, not a request/result comment, custom Git ref, or the mutable workflow-run list.
 
 - An unpredictable signed request ID and fresh 256-bit one-use dispatch capability are created first; only the capability digest is stored durably.
-- Protected Fugue creates an OIDC-signed dispatch-anchor ref for that digest before dispatch.
-- Before repository checkout/setup/build, attempt 1 proves the capability and fast-forwards that ref once to an OIDC-signed run-start record carrying the exact `GITHUB_RUN_ID` and attempt 1.
+- The dedicated Fugue Authority GitHub App creates an OIDC-signed dispatch-anchor repository variable for that digest; its Variables permission is not available to candidate `GITHUB_TOKEN`.
+- Before repository checkout/setup/build, attempt 1 proves the capability and transitions that same protected variable once to an OIDC-signed run-start value carrying the exact `GITHUB_RUN_ID` and attempt 1.
 - Filtered workflow-run search is not used to select the bound run, so arbitrary later same-request run flooding cannot change first-run identity.
 - PASS/failure/error is committed to the durable record before its presentation comment/status.
 - A terminal PASS embeds the full Integration attestation plus request ID, run ID, and attempt 1.

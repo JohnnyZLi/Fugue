@@ -782,50 +782,176 @@ async function statusPage(github: FugueGitHub, sha: string, page: number): Promi
   }));
 }
 
+interface FugueAuthorityVariable {
+  name: string;
+  value: string;
+}
+
+function injectedAuthorityVariables(github: FugueGitHub): Map<string, string> | undefined {
+  return (github as FugueGitHub & { __authorityVariables?: Map<string, string> }).__authorityVariables;
+}
+
+function requireAuthorityToken(): string {
+  const token = process.env.FUGUE_AUTHORITY_TOKEN?.trim();
+  if (!token) {
+    throw new CanonicalWorkStateIntegrityError(
+      "Protected Fugue authority token is unavailable; refusing to use candidate-writable GitHub state as recovery authority.",
+    );
+  }
+  return token;
+}
+
+async function authorityRequest(
+  github: FugueGitHub,
+  path: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const token = requireAuthorityToken();
+  return fetch(`https://api.github.com/repos/${github.repository.owner}/${github.repository.repo}${path}`, {
+    ...init,
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type": "application/json",
+      ...(init.headers ?? {}),
+    },
+  });
+}
+
+export async function listFugueAuthorityVariables(
+  github: FugueGitHub,
+  prefix: string,
+): Promise<FugueAuthorityVariable[]> {
+  const injected = injectedAuthorityVariables(github);
+  if (injected) {
+    return [...injected.entries()]
+      .filter(([name]) => name.startsWith(prefix))
+      .map(([name, value]) => ({ name, value }));
+  }
+  const variables: FugueAuthorityVariable[] = [];
+  for (let page = 1; ; page += 1) {
+    const response = await authorityRequest(github, `/actions/variables?per_page=30&page=${page}`);
+    if (!response.ok) {
+      throw new CanonicalWorkStateIntegrityError(`Unable to list protected Fugue authority variables (${response.status}).`);
+    }
+    const payload = await response.json() as { variables?: Array<{ name?: unknown; value?: unknown }> };
+    const pageVariables = payload.variables ?? [];
+    for (const variable of pageVariables) {
+      if (typeof variable.name === "string" && typeof variable.value === "string" && variable.name.startsWith(prefix)) {
+        variables.push({ name: variable.name, value: variable.value });
+      }
+    }
+    if (pageVariables.length < 30) break;
+  }
+  return variables;
+}
+
+export async function getFugueAuthorityVariable(github: FugueGitHub, name: string): Promise<string | undefined> {
+  const injected = injectedAuthorityVariables(github);
+  if (injected) return injected.get(name);
+  const response = await authorityRequest(github, `/actions/variables/${encodeURIComponent(name)}`);
+  if (response.status === 404) return undefined;
+  if (!response.ok) {
+    throw new CanonicalWorkStateIntegrityError(`Unable to read protected Fugue authority variable ${name} (${response.status}).`);
+  }
+  const payload = await response.json() as { value?: unknown };
+  if (typeof payload.value !== "string") {
+    throw new CanonicalWorkStateIntegrityError(`Protected Fugue authority variable ${name} has no string value.`);
+  }
+  return payload.value;
+}
+
+export async function createFugueAuthorityVariable(github: FugueGitHub, name: string, value: string): Promise<boolean> {
+  const injected = injectedAuthorityVariables(github);
+  if (injected) {
+    if (injected.has(name)) return false;
+    injected.set(name, value);
+    return true;
+  }
+  const response = await authorityRequest(github, "/actions/variables", {
+    method: "POST",
+    body: JSON.stringify({ name, value }),
+  });
+  if (response.status === 201) return true;
+  if (response.status === 409 || response.status === 422) return false;
+  throw new CanonicalWorkStateIntegrityError(`Unable to create protected Fugue authority variable ${name} (${response.status}).`);
+}
+
+export async function updateFugueAuthorityVariable(github: FugueGitHub, name: string, value: string): Promise<void> {
+  const injected = injectedAuthorityVariables(github);
+  if (injected) {
+    if (!injected.has(name)) throw new CanonicalWorkStateIntegrityError(`Protected Fugue authority variable ${name} is missing.`);
+    injected.set(name, value);
+    return;
+  }
+  const response = await authorityRequest(github, `/actions/variables/${encodeURIComponent(name)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name, value }),
+  });
+  if (!response.ok) {
+    throw new CanonicalWorkStateIntegrityError(`Unable to update protected Fugue authority variable ${name} (${response.status}).`);
+  }
+}
+
+async function deleteFugueAuthorityVariable(github: FugueGitHub, name: string): Promise<void> {
+  const injected = injectedAuthorityVariables(github);
+  if (injected) {
+    injected.delete(name);
+    return;
+  }
+  const response = await authorityRequest(github, `/actions/variables/${encodeURIComponent(name)}`, { method: "DELETE" });
+  if (!response.ok && response.status !== 404) {
+    throw new CanonicalWorkStateIntegrityError(`Unable to delete stale Fugue authority variable ${name} (${response.status}).`);
+  }
+}
+
 async function findRecoveryCursor<T>(
   github: FugueGitHub,
   options: DurableRecordOptions<T>,
-): Promise<{ commitSha: string; cursor: RecoveryCursor } | undefined> {
-  const { owner, repo } = github.repository;
-  const ref = recoveryRefName(options);
-  let headSha: string;
-  try {
-    const response = await github.octokit.rest.git.getRef({ owner, repo, ref });
-    headSha = response.data.object.sha;
-  } catch (error) {
-    if (httpStatus(error) === 404) return undefined;
-    throw error;
+): Promise<{ variableName: string; cursor: RecoveryCursor } | undefined> {
+  let best: { variableName: string; cursor: RecoveryCursor } | undefined;
+  for (const variable of await listFugueAuthorityVariables(github, recoveryVariablePrefix(options))) {
+    let cursor: RecoveryCursor | null;
+    try {
+      cursor = parsePayloadBlock(variable.value, RECOVERY_START, recoveryCursorSchema);
+    } catch {
+      continue;
+    }
+    if (!cursor || cursor.scope !== options.scope || cursor.storage_sha !== options.storageSha ||
+        cursor.publisher_sha !== options.publisherSha) continue;
+    const timestamp = Date.parse(cursor.checkpoint_at);
+    if (!Number.isFinite(timestamp)) continue;
+    try {
+      if (!(await verifyProtocolPublicationBodyAtRevision(
+        github,
+        variable.value,
+        options.publisherSha,
+        timestamp,
+      ))) continue;
+    } catch {
+      continue;
+    }
+    if (!best || compareRecoveryProgress(cursor, best.cursor) > 0 ||
+        (compareRecoveryProgress(cursor, best.cursor) === 0 && cursor.checkpoint_at > best.cursor.checkpoint_at)) {
+      best = { variableName: variable.name, cursor };
+    }
   }
-  const commit = await github.octokit.rest.git.getCommit({ owner, repo, commit_sha: headSha });
-  const body = commit.data.message ?? "";
-  let cursor: RecoveryCursor | null;
-  try {
-    cursor = parsePayloadBlock(body, RECOVERY_START, recoveryCursorSchema);
-  } catch (error) {
-    throw new CanonicalWorkStateIntegrityError(`Durable recovery checkpoint ${ref} is malformed: ${message(error)}`);
-  }
-  if (!cursor || cursor.scope !== options.scope || cursor.storage_sha !== options.storageSha ||
-      cursor.publisher_sha !== options.publisherSha) {
-    throw new CanonicalWorkStateIntegrityError(`Durable recovery checkpoint ${ref} does not match its protected scope.`);
-  }
-  const timestamp = Date.parse(cursor.checkpoint_at);
-  if (!Number.isFinite(timestamp) || !(await verifyProtocolPublicationBodyAtRevision(
-    github,
-    body,
-    options.publisherSha,
-    timestamp,
-  ))) {
-    throw new CanonicalWorkStateIntegrityError(`Durable recovery checkpoint ${ref} lacks current protected provenance.`);
-  }
-  return { commitSha: headSha, cursor };
+  return best;
 }
 
-function recoveryRefName<T>(options: DurableRecordOptions<T>): string {
+function recoveryVariablePrefix<T>(options: DurableRecordOptions<T>): string {
   const digest = createHash("sha256")
     .update(`${options.storageSha.toLowerCase()}\0${options.publisherSha.toLowerCase()}\0${options.scope}`, "utf8")
     .digest("hex")
-    .slice(0, 40);
-  return `fugue/recovery/${digest}`;
+    .slice(0, 16)
+    .toUpperCase();
+  return `FUGUE_D3_${digest}_`;
+}
+
+function recoveryVariableName<T>(options: DurableRecordOptions<T>, signedBody: string): string {
+  const checkpoint = createHash("sha256").update(signedBody, "utf8").digest("hex").slice(0, 16).toUpperCase();
+  return `${recoveryVariablePrefix(options)}${checkpoint}`;
 }
 
 function compareRecoveryProgress(left: RecoveryCursor, right: RecoveryCursor): number {
@@ -844,42 +970,44 @@ async function writeRecoveryCursor<T>(
   options: DurableRecordOptions<T>,
   supplied: RecoveryCursor,
 ): Promise<void> {
-  const { owner, repo } = github.repository;
-  const ref = recoveryRefName(options);
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const current = await findRecoveryCursor(github, options);
-    if (current && compareRecoveryProgress(current.cursor, supplied) >= 0) return;
-    const cursor = recoveryCursorSchema.parse({ ...supplied, checkpoint_at: new Date().toISOString() });
-    const payload = Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
-    const unsigned = `${RECOVERY_START}\nversion: 1\npayload: ${payload}\n${END}\n\nDurable Fugue recovery checkpoint: ${options.scope}`;
-    const signed = await signProtocolBody(github, unsigned);
-    const timestamp = Date.parse(cursor.checkpoint_at);
-    if (!(await verifyProtocolPublicationBodyAtRevision(github, signed, options.publisherSha, timestamp))) {
-      throw new CanonicalWorkStateIntegrityError(`Durable recovery checkpoint ${ref} failed protected provenance self-check.`);
-    }
-    const parentSha = current?.commitSha ?? options.publisherSha;
-    const parent = await github.octokit.rest.git.getCommit({ owner, repo, commit_sha: parentSha });
-    const commit = await github.octokit.rest.git.createCommit({
-      owner,
-      repo,
-      message: signed,
-      tree: parent.data.tree.sha,
-      parents: [parentSha],
-    });
-    try {
-      if (current) {
-        await github.octokit.rest.git.updateRef({ owner, repo, ref, sha: commit.data.sha, force: false });
-      } else {
-        await github.octokit.rest.git.createRef({ owner, repo, ref: `refs/${ref}`, sha: commit.data.sha });
-      }
-      return;
-    } catch (error) {
-      if (httpStatus(error) !== 422) throw error;
-      lastError = error;
+  const current = await findRecoveryCursor(github, options);
+  if (current && compareRecoveryProgress(current.cursor, supplied) >= 0) return;
+
+  const cursor = recoveryCursorSchema.parse({ ...supplied, checkpoint_at: new Date().toISOString() });
+  const payload = Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+  const unsigned = `${RECOVERY_START}\nversion: 1\npayload: ${payload}\n${END}\n\nDurable Fugue recovery checkpoint: ${options.scope}`;
+  const signed = await signProtocolBody(github, unsigned);
+  const timestamp = Date.parse(cursor.checkpoint_at);
+  if (!(await verifyProtocolPublicationBodyAtRevision(github, signed, options.publisherSha, timestamp))) {
+    throw new CanonicalWorkStateIntegrityError("Durable recovery checkpoint failed protected provenance self-check.");
+  }
+
+  const name = recoveryVariableName(options, signed);
+  const created = await createFugueAuthorityVariable(github, name, signed);
+  if (!created) {
+    const existing = await getFugueAuthorityVariable(github, name);
+    if (existing !== signed) {
+      throw new CanonicalWorkStateIntegrityError(`Protected Fugue authority variable collision at ${name}.`);
     }
   }
-  throw new CanonicalWorkStateIntegrityError(`Unable to advance durable recovery checkpoint ${ref}: ${message(lastError)}`);
+
+  const durable = await findRecoveryCursor(github, options);
+  if (!durable || compareRecoveryProgress(durable.cursor, cursor) < 0) {
+    throw new CanonicalWorkStateIntegrityError("Protected Fugue recovery progress did not become durable.");
+  }
+
+  // Cleanup is presentation/space maintenance only: the new checkpoint already exists, and a
+  // concurrent stale protected writer can at worst leave an older write-once variable behind.
+  for (const variable of await listFugueAuthorityVariables(github, recoveryVariablePrefix(options))) {
+    if (variable.name === durable.variableName) continue;
+    let candidate: RecoveryCursor | null;
+    try { candidate = parsePayloadBlock(variable.value, RECOVERY_START, recoveryCursorSchema); }
+    catch { continue; }
+    if (!candidate) continue;
+    if (compareRecoveryProgress(candidate, durable.cursor) <= 0) {
+      await deleteFugueAuthorityVariable(github, variable.name);
+    }
+  }
 }
 
 async function recentIssueComments(github: FugueGitHub, issueNumber: number) {

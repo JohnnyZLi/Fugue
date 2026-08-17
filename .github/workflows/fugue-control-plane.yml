@@ -32,7 +32,51 @@ concurrency:
 jobs:
   reconcile:
     runs-on: ubuntu-latest
+    # This environment must allow only the protected base branch. Its private App key is the
+    # authority boundary: candidate GITHUB_TOKEN permissions do not include repository Variables.
+    environment: fugue-authority
     steps:
+      - name: Verify Fugue Authority environment boundary
+        env:
+          FUGUE_PROTECTED_BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+          const branch = process.env.FUGUE_PROTECTED_BRANCH;
+          if (!branch) throw new Error('Repository default branch is unavailable.');
+          const headers = {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+          };
+          const base = `https://api.github.com/repos/${owner}/${repo}/environments/fugue-authority`;
+          const environmentResponse = await fetch(base, { headers });
+          if (!environmentResponse.ok) {
+            throw new Error(`fugue-authority environment is unavailable (${environmentResponse.status}); authority remains fail-closed.`);
+          }
+          const environment = await environmentResponse.json();
+          const deployment = environment.deployment_branch_policy;
+          if (!deployment || deployment.protected_branches !== false || deployment.custom_branch_policies !== true) {
+            throw new Error('fugue-authority must use an explicit custom deployment branch policy.');
+          }
+          const policiesResponse = await fetch(`${base}/deployment-branch-policies?per_page=100`, { headers });
+          if (!policiesResponse.ok) throw new Error(`Unable to verify fugue-authority branch policy (${policiesResponse.status}).`);
+          const policies = await policiesResponse.json();
+          const names = (policies.branch_policies ?? []).map((policy) => policy.name).sort();
+          if (names.length !== 1 || names[0] !== branch) {
+            throw new Error(`fugue-authority must allow exactly protected branch ${branch}; found ${names.join(', ') || 'none'}.`);
+          }
+          NODE
+      - name: Mint narrow Fugue Authority token
+        id: fugue-authority
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FUGUE_AUTHORITY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FUGUE_AUTHORITY_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-variables: write
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.workflow_sha }}
@@ -46,5 +90,6 @@ jobs:
       - name: Reconcile durable Fugue state
         env:
           FUGUE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}
           GITHUB_TOKEN: ${{ github.token }}
         run: node dist/cli.js reconcile

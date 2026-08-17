@@ -89,9 +89,9 @@ A candidate that observes or copies pre-commit statuses cannot finish an aborted
 
 ### Bounded recovery
 
-Fake manifests must not create unbounded read amplification, and an attacker with `issues:write` plus `statuses:write` must not be able to erase recovery progress. Locator comments are presentation hints only. Recovery processes fixed-size status pages and bounded manifest/chunk work under a frozen status-ID ceiling, then checkpoints its low-water/materialization state as an OIDC-signed same-tree Git commit behind a deterministic `refs/fugue/recovery/*` ref. That ref advances only by fast-forward, so deleting every issue comment or continuously appending statuses cannot reset the scan to page 1 or starve older valid authority.
+Fake manifests must not create unbounded read amplification, and an attacker with `issues:write`, `statuses:write`, or `contents:write` must not be able to erase recovery progress. Locator comments and every `refs/fugue/**` custom Git ref are presentation/untrusted only. Recovery processes fixed-size status pages and bounded manifest/chunk work under a frozen status-ID ceiling, then writes each OIDC-signed progress checkpoint through a dedicated Fugue Authority GitHub App into repository Actions Variables. The normal workflow `GITHUB_TOKEN` permission set has no Variables permission; the App credential is exposed only through the protected-base `fugue-authority` environment. Checkpoints are write-once, readers validate them and select greatest progress, and older checkpoints are cleaned only after newer progress exists.
 
-The same durable-record primitive backs work-state, Coordinator snapshots, and Integration state. Ordinary locator/result comments can therefore be recreated after `issues:write` deletion, while recovery progress itself lives outside the Issues/Statuses mutation plane.
+The same durable-record primitive backs work-state, Coordinator snapshots, and Integration state. Ordinary locator/result comments and all custom Fugue refs can therefore be deleted or redirected without rolling authority backward; protected recovery recreates presentation from d3 plus the separate authority-variable checkpoint plane.
 
 ## Protected Coordinator intent
 
@@ -153,12 +153,12 @@ The durable lifecycle is:
 REQUEST
     protected Fugue creates an unpredictable signed request ID plus a fresh
     one-use 256-bit dispatch capability; only its digest is durable in d3
-    and an OIDC-signed dispatch-anchor Git ref
+    and a signed dispatch anchor is stored through the Fugue Authority App
 
 RUN START
     before checkout/setup/build, attempt 1 proves the one-use capability
-    and fast-forwards that exact ref to an OIDC-signed run-start commit
-    carrying GITHUB_RUN_ID + attempt 1
+    and transitions the protected authority variable once to an OIDC-signed
+    run-start value carrying GITHUB_RUN_ID + attempt 1
 
 VALIDATE
     candidate checkout is read-only and credential-separated
@@ -169,7 +169,7 @@ TERMINAL
     then writes presentation attestation comment / fugue/integration status
 ```
 
-Filtered workflow-run search is not binding authority. Same-request flood runs do not know the one-use capability and cannot advance its evidence ref, while reruns are rejected because only attempt 1 may consume it. The exact run ID comes from the protected run-start commit, so GitHub list caps do not affect first-run identity.
+Filtered workflow-run search and custom Git refs are not binding authority. Same-request flood runs do not know the one-use capability and cannot transition the App-owned authority variable, while reruns are rejected because only attempt 1 may consume it. The exact run ID comes from the signed run-start value, so GitHub list caps and hostile ref movement do not affect first-run identity.
 
 If transport never crosses the run-start boundary, protected recovery may abort that unused request and create a fresh one. Once run-start is durable, however, deletion of the exact Actions run cannot become a retry: after the recovery grace period Fugue seals terminal failure unless it already has durable PASS/failure/error or an actually observed cancellation/abortion. A `workflow_run` consumer can seal outcomes promptly, but cancelling or deleting that consumer cannot erase the run-start evidence or turn a possible genuine failure into retryable transport.
 
@@ -224,6 +224,8 @@ fugue status
 ```
 
 Normal work after bootstrap is coordinated through the Leader/GitHub control plane.
+
+The hosted control plane additionally requires a dedicated **Fugue Authority** GitHub App installed only on the governed repository with repository **Variables: write** (and metadata read) permission. Its private key is an environment secret in `fugue-authority`; that environment must restrict deployment branches/tags to the protected base branch. `FUGUE_AUTHORITY_APP_CLIENT_ID` is provided through the environment/repository `vars` context and `FUGUE_AUTHORITY_APP_PRIVATE_KEY` through the environment `secrets` context. The protected workflows mint short-lived installation tokens and pass them only to authority-variable operations; candidate jobs never receive that credential.
 
 ## First proving grounds
 

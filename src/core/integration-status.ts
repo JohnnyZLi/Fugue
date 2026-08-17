@@ -24,7 +24,9 @@ import {
   verifyProtocolPublicationBodyAtRevision,
 } from "./provenance.js";
 import {
+  createFugueAuthorityVariable,
   DurableProtocolRecoveryPendingError,
+  getFugueAuthorityVariable,
   publishDurableProtocolRecord,
   recoverDurableProtocolRecord,
 } from "./state.js";
@@ -109,9 +111,9 @@ function parseIntegrationEvidence<T>(body: string, marker: string, schema: z.Zod
   return schema.parse(JSON.parse(Buffer.from(match[1], "base64url").toString("utf8")) as unknown);
 }
 
-export function integrationEvidenceRefName(secretDigest: string): string {
+export function integrationEvidenceVariableName(secretDigest: string): string {
   if (!/^[0-9a-f]{64}$/i.test(secretDigest)) throw new Error("Invalid Integration dispatch digest.");
-  return `fugue/integration/${secretDigest.toLowerCase()}`;
+  return `FUGUE_INT_${secretDigest.slice(0, 32).toUpperCase()}`;
 }
 
 export function serializeIntegrationRunStartEvidence(value: IntegrationRunStartEvidence): string {
@@ -158,56 +160,23 @@ async function createIntegrationDispatchAnchor(
   request: IntegrationRequest,
   anchor: IntegrationDispatchAnchor,
 ): Promise<void> {
-  const { owner, repo } = github.repository;
   await assertRepositoryDefaultBranchRevision(github, request.identity.baseSha);
   const signed = await signProtocolBody(github, serializeIntegrationDispatchAnchor(anchor));
   const timestamp = Date.parse(anchor.authorized_at);
   if (!(await verifyProtocolPublicationBodyAtRevision(github, signed, request.identity.baseSha, timestamp))) {
     throw new Error("Protected Integration dispatch anchor failed publisher self-check.");
   }
-  const parent = await github.octokit.rest.git.getCommit({ owner, repo, commit_sha: request.identity.baseSha });
-  const commit = await github.octokit.rest.git.createCommit({
-    owner,
-    repo,
-    message: signed,
-    tree: parent.data.tree.sha,
-    parents: [request.identity.baseSha],
-  });
   await assertRepositoryDefaultBranchRevision(github, request.identity.baseSha);
-  const ref = integrationEvidenceRefName(anchor.secret_digest);
-  try {
-    await github.octokit.rest.git.createRef({ owner, repo, ref: `refs/${ref}`, sha: commit.data.sha });
-  } catch (error) {
-    if (httpStatus(error) !== 422) throw error;
-    const existing = await readIntegrationEvidenceHead(github, ref);
-    const parsed = existing ? parseIntegrationDispatchAnchor(existing.message) : null;
-    if (!parsed || JSON.stringify(parsed) !== JSON.stringify(anchor) ||
-        !(await verifyProtocolPublicationBodyAtRevision(github, existing!.message, request.identity.baseSha, timestamp))) {
-      throw new Error(`Integration dispatch evidence ref ${ref} already exists with different authority.`);
+  const name = integrationEvidenceVariableName(anchor.secret_digest);
+  const created = await createFugueAuthorityVariable(github, name, signed);
+  if (!created) {
+    const existing = await getFugueAuthorityVariable(github, name);
+    const parsed = existing ? parseIntegrationDispatchAnchor(existing) : null;
+    if (!existing || !parsed || JSON.stringify(parsed) !== JSON.stringify(anchor) ||
+        !(await verifyProtocolPublicationBodyAtRevision(github, existing, request.identity.baseSha, timestamp))) {
+      throw new Error(`Integration dispatch authority variable ${name} already exists with different authority.`);
     }
   }
-}
-
-async function readIntegrationEvidenceHead(
-  github: FugueGitHub,
-  ref: string,
-): Promise<{ sha: string; message: string; treeSha: string; parents: string[] } | undefined> {
-  const { owner, repo } = github.repository;
-  let sha: string;
-  try {
-    const response = await github.octokit.rest.git.getRef({ owner, repo, ref });
-    sha = response.data.object.sha;
-  } catch (error) {
-    if (httpStatus(error) === 404) return undefined;
-    throw error;
-  }
-  const commit = await github.octokit.rest.git.getCommit({ owner, repo, commit_sha: sha });
-  return {
-    sha,
-    message: commit.data.message ?? "",
-    treeSha: commit.data.tree.sha,
-    parents: commit.data.parents.map((parent) => parent.sha),
-  };
 }
 
 async function verifyIntegrationDispatchAnchor(
@@ -232,33 +201,26 @@ export async function getIntegrationRunStartEvidence(
   record: IntegrationRecord,
 ): Promise<IntegrationRunStartEvidence | undefined> {
   if (!record.dispatch) return undefined;
-  const ref = integrationEvidenceRefName(record.dispatch.secret_digest);
-  const head = await readIntegrationEvidenceHead(github, ref);
-  if (!head) throw new Error(`Durable Integration dispatch evidence ref ${ref} is missing.`);
+  const name = integrationEvidenceVariableName(record.dispatch.secret_digest);
+  const body = await getFugueAuthorityVariable(github, name);
+  if (!body) throw new Error(`Protected Integration authority variable ${name} is missing.`);
   let start: IntegrationRunStartEvidence | null;
-  try { start = parseIntegrationRunStart(head.message); } catch { start = null; }
+  try { start = parseIntegrationRunStart(body); } catch { start = null; }
   if (!start) {
-    if (!(await verifyIntegrationDispatchAnchor(github, record, head.message))) {
-      throw new Error(`Durable Integration dispatch evidence ref ${ref} is not a valid protected anchor.`);
+    if (!(await verifyIntegrationDispatchAnchor(github, record, body))) {
+      throw new Error(`Protected Integration authority variable ${name} is not a valid dispatch anchor.`);
     }
     return undefined;
   }
   if (start.request_id !== record.request.request_id || start.pr_number !== record.identity.prNumber ||
       start.head_sha !== record.identity.headSha || start.base_sha !== record.identity.baseSha ||
       start.secret_digest !== record.dispatch.secret_digest || start.run_attempt !== 1) {
-    throw new Error(`Protected Integration run-start evidence ${ref} does not match its durable request.`);
+    throw new Error(`Protected Integration run-start evidence ${name} does not match its durable request.`);
   }
   const timestamp = Date.parse(start.created_at);
   if (!Number.isFinite(timestamp) ||
-      !(await verifyProtocolPublicationBodyAtRevision(github, head.message, record.identity.baseSha, timestamp))) {
-    throw new Error(`Protected Integration run-start evidence ${ref} has invalid provenance.`);
-  }
-  const parentSha = head.parents[0];
-  if (!parentSha) throw new Error(`Protected Integration run-start evidence ${ref} has no dispatch-anchor parent.`);
-  const { owner, repo } = github.repository;
-  const parent = await github.octokit.rest.git.getCommit({ owner, repo, commit_sha: parentSha });
-  if (!(await verifyIntegrationDispatchAnchor(github, record, parent.data.message ?? ""))) {
-    throw new Error(`Protected Integration run-start evidence ${ref} is not descended from its authorized dispatch anchor.`);
+      !(await verifyProtocolPublicationBodyAtRevision(github, body, record.identity.baseSha, timestamp))) {
+    throw new Error(`Protected Integration run-start evidence ${name} has invalid provenance.`);
   }
   return start;
 }

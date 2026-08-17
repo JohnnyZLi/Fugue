@@ -15,7 +15,7 @@ import {
   ensureIntegrationDispatch,
   getCurrentIntegrationRecord,
   getIntegrationRunStartEvidence,
-  integrationEvidenceRefName,
+  integrationEvidenceVariableName,
   integrationRunStartSchema,
   publishIntegrationRecord,
   sealIntegrationWorkflowRunEvent,
@@ -230,8 +230,9 @@ describe("d3 protected durable authority", () => {
     expect(first.exhausted).toBe(false);
     expect(github.__listStatus).toHaveBeenCalledTimes(2);
     expect(vi.mocked(verifyDurableManifestProof)).toHaveBeenCalledTimes(8);
-    expect(vi.mocked(verifyProtocolPublicationBodyAtRevision)).toHaveBeenCalledTimes(1);
-    expect([...github.__refs.keys()].some((ref) => ref.startsWith("fugue/recovery/"))).toBe(true);
+    expect(vi.mocked(verifyProtocolPublicationBodyAtRevision)).toHaveBeenCalledTimes(2);
+    expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3_"))).toBe(true);
+    expect([...github.__refs.keys()].some((ref) => ref.startsWith("fugue/recovery/"))).toBe(false);
     expect(github.__comments.some((comment) => comment.body.includes("fugue-durable-recovery"))).toBe(false);
   });
 
@@ -276,7 +277,42 @@ describe("d3 protected durable authority", () => {
     }
     expect(recovered?.record).toBeDefined();
     expect(canonicalRequirements(recovered!.record!.value)).toBe("older-valid-authority");
-    expect([...github.__refs.keys()].some((ref) => ref.startsWith("fugue/recovery/"))).toBe(true);
+    expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3_"))).toBe(true);
+    expect([...github.__refs.keys()].some((ref) => ref.startsWith("fugue/recovery/"))).toBe(false);
+  });
+
+  it("ignores pre-created, deleted, rewound, fast-forwarded, and replayed custom recovery refs after presentation loss", async () => {
+    const github = makeGithub();
+    await publishCanonicalWorkState(github, canonicalWork("ref-independent-authority"));
+    github.__comments.splice(0);
+    for (let index = 0; index < 3400; index += 1) {
+      github.__statuses.push({ id: ++github.__nextStatusId, sha: BASE, context: `ref-hostile/${index}`, description: "noise" });
+    }
+    const first = await recoverDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: "work/18", issueNumber: 18,
+      parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
+    });
+    expect(first.exhausted).toBe(false);
+    expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3_"))).toBe(true);
+
+    // Candidate contents:write may create/delete/move arbitrary refs, including replaying an old valid signed commit.
+    const replayBody = await signProtocolBody(github, "old-valid-signed-but-not-authority");
+    const replayCommit = await github.octokit.rest.git.createCommit({ owner: "JohnnyZLi", repo: "Fugue", message: replayBody, tree: "1".repeat(40), parents: [BASE] });
+    github.__refs.set("fugue/recovery/precreated", HEAD);
+    github.__refs.set("fugue/recovery/fast-forward", replayCommit.data.sha);
+    github.__refs.set("fugue/recovery/rewound", BASE);
+    github.__refs.delete("fugue/recovery/precreated");
+    github.__comments.splice(0);
+
+    let recovered = first;
+    for (let attempt = 0; attempt < 8 && !recovered.record; attempt += 1) {
+      recovered = await recoverDurableProtocolRecord(github, {
+        storageSha: BASE, publisherSha: BASE, scope: "work/18", issueNumber: 18,
+        parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
+      });
+    }
+    expect(recovered.record).toBeDefined();
+    expect(canonicalRequirements(recovered.record!.value)).toBe("ref-independent-authority");
   });
 
   it("treats replayed work locator comments as hints and repairs them from newer d3 authority", async () => {
@@ -382,6 +418,32 @@ describe("durable Integration one-request/one-run/result authority", () => {
     expect(bound.run?.id).toBe(101);
     await expect(bindIntegrationRun(github, snapshot(), record.request.request_id, 102)).rejects.toThrow(/already bound/);
     expect(github.__listWorkflowRuns).not.toHaveBeenCalled();
+  });
+
+  it("keeps Integration binding independent of hostile custom-ref replacement and old signed-commit replay", async () => {
+    const github = makeGithub();
+    const record = await publishAuthorizedRecord(github, 151);
+    await installRunStartEvidence(github, record, 151, "2026-08-17T03:20:01.000Z");
+
+    const stale = integrationRunStartSchema.parse({
+      version: 1, kind: "integration_run_start", request_id: record.request.request_id,
+      pr_number: record.identity.prNumber, head_sha: record.identity.headSha, base_sha: record.identity.baseSha,
+      secret_digest: record.dispatch!.secret_digest, run_id: 999, run_attempt: 1, created_at: "2026-08-17T03:19:59.000Z",
+    });
+    const staleSigned = await signProtocolBody(github, serializeIntegrationRunStartEvidence(stale));
+    const staleCommit = await github.octokit.rest.git.createCommit({ owner: "JohnnyZLi", repo: "Fugue", message: staleSigned, tree: "1".repeat(40), parents: [BASE] });
+    const hostileRef = `fugue/integration/${record.dispatch!.secret_digest}`;
+    github.__refs.set(hostileRef, HEAD);                  // pre-create / arbitrary replacement
+    github.__refs.set(hostileRef, staleCommit.data.sha); // old-valid replay / fast-forward-like update
+    github.__refs.set(hostileRef, BASE);                 // rewind
+    github.__refs.delete(hostileRef);                    // pointer deletion
+    github.__comments.splice(0);                         // presentation evidence gone too
+
+    const evidence = await getIntegrationRunStartEvidence(github, record);
+    expect(evidence?.run_id).toBe(151);
+    const bound = await bindIntegrationRun(github, snapshot(), record.request.request_id, 151);
+    expect(bound.run?.id).toBe(151);
+    expect(github.__refs.has(hostileRef)).toBe(false);
   });
 
   it("preserves terminal PASS after comments and the exact Actions run are deleted", async () => {
@@ -518,6 +580,7 @@ interface TestGithub extends FugueGitHub {
   __attempts: Map<number, TestRun>;
   __refs: Map<string, string>;
   __gitCommits: Map<string, TestGitCommit>;
+  __authorityVariables: Map<string, string>;
   __nextStatusId: number;
   __listStatus: ReturnType<typeof vi.fn>;
   __listWorkflowRuns: ReturnType<typeof vi.fn>;
@@ -529,6 +592,7 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
   const runs: TestRun[] = [];
   const attempts = new Map<number, TestRun>();
   const refs = new Map<string, string>();
+  const authorityVariables = new Map<string, string>();
   const gitCommits = new Map<string, TestGitCommit>();
   gitCommits.set(BASE, { sha: BASE, message: "protected base", tree: { sha: "1".repeat(40) }, parents: [] });
   gitCommits.set(HEAD, { sha: HEAD, message: "candidate", tree: { sha: "2".repeat(40) }, parents: [{ sha: BASE }] });
@@ -592,6 +656,7 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
     __attempts: attempts,
     __refs: refs,
     __gitCommits: gitCommits,
+    __authorityVariables: authorityVariables,
     get __nextStatusId() { return nextStatusId; },
     set __nextStatusId(value: number) { nextStatusId = value; },
     __listStatus: listCommitStatusesForRef,
@@ -702,20 +767,13 @@ async function installRunStartEvidence(
   createdAt: string,
 ): Promise<void> {
   if (!record.dispatch) throw new Error("test Integration record lacks dispatch authorization");
-  const ref = integrationEvidenceRefName(record.dispatch.secret_digest);
-  const refData = await github.octokit.rest.git.getRef({ owner: "JohnnyZLi", repo: "Fugue", ref });
-  const anchorSha = refData.data.object.sha;
-  const anchor = await github.octokit.rest.git.getCommit({ owner: "JohnnyZLi", repo: "Fugue", commit_sha: anchorSha });
   const evidence = integrationRunStartSchema.parse({
     version: 1, kind: "integration_run_start", request_id: record.request.request_id,
     pr_number: record.identity.prNumber, head_sha: record.identity.headSha, base_sha: record.identity.baseSha,
     secret_digest: record.dispatch.secret_digest, run_id: runId, run_attempt: 1, created_at: createdAt,
   });
   const signed = await signProtocolBody(github, serializeIntegrationRunStartEvidence(evidence));
-  const commit = await github.octokit.rest.git.createCommit({
-    owner: "JohnnyZLi", repo: "Fugue", message: signed, tree: anchor.data.tree.sha, parents: [anchorSha],
-  });
-  await github.octokit.rest.git.updateRef({ owner: "JohnnyZLi", repo: "Fugue", ref, sha: commit.data.sha, force: false });
+  github.__authorityVariables.set(integrationEvidenceVariableName(record.dispatch.secret_digest), signed);
   expect((await getIntegrationRunStartEvidence(github, record))?.run_id).toBe(runId);
 }
 
