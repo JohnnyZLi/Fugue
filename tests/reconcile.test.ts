@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { integrationAttestationSchema } from "../src/core/attestations.js";
 import type { EvaluationSnapshot } from "../src/core/evaluation.js";
@@ -154,6 +155,56 @@ function policy(): ActivePolicy {
     identity: { baseBranch: "main", baseSha: BASE, policyDigest: "sha256:policy", protocolVersion: 1 },
     config: { branches: { worker_pattern: "agent/{issue}-{slug}" } },
   } as unknown as ActivePolicy;
+}
+
+
+function recoveryCursorBody(body: string): Record<string, unknown> | undefined {
+  const payload = body.match(/<!-- fugue-durable-recovery\nversion: 1\npayload: ([A-Za-z0-9_-]+)/)?.[1];
+  if (!payload) return undefined;
+  try { return JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>; }
+  catch { return undefined; }
+}
+
+function recoveryCheckpointBodies(github: TestGithub): string[] {
+  const bodies: string[] = [];
+  for (const [name, value] of github.__authorityVariables) {
+    if (name.startsWith("FUGUE_D3_")) {
+      bodies.push(value);
+      continue;
+    }
+    if (!name.startsWith("FUGUE_D3P_")) continue;
+    try {
+      const parsed = JSON.parse(value) as { kind?: string; entries?: unknown[] };
+      if (parsed.kind === "durable_recovery_pack" && Array.isArray(parsed.entries)) {
+        for (const body of parsed.entries) if (typeof body === "string") bodies.push(body);
+      }
+    } catch { /* malformed packs are intentionally ignored by readers */ }
+  }
+  return bodies;
+}
+
+function recoveryScopes(github: TestGithub): Set<string> {
+  return new Set(recoveryCheckpointBodies(github)
+    .map((body) => recoveryCursorBody(body)?.scope)
+    .filter((scope): scope is string => typeof scope === "string"));
+}
+
+function explodeRecoveryPacksToLeaves(github: TestGithub): void {
+  const packs = [...github.__authorityVariables.entries()].filter(([name]) => name.startsWith("FUGUE_D3P_"));
+  for (const [packName, value] of packs) {
+    const parsed = JSON.parse(value) as { kind?: string; entries?: unknown[] };
+    if (parsed.kind !== "durable_recovery_pack" || !Array.isArray(parsed.entries)) continue;
+    github.__authorityVariables.delete(packName);
+    for (const [index, raw] of parsed.entries.entries()) {
+      if (typeof raw !== "string") continue;
+      const cursor = recoveryCursorBody(raw);
+      if (!cursor || typeof cursor.storage_sha !== "string" || typeof cursor.publisher_sha !== "string" || typeof cursor.scope !== "string") continue;
+      const identity = `${cursor.storage_sha.toLowerCase()}\0${cursor.publisher_sha.toLowerCase()}\0${cursor.scope}`;
+      const digest = createHash("sha256").update(identity, "utf8").digest("hex").slice(0, 16).toUpperCase();
+      const suffix = createHash("sha256").update(`${raw}\0${index}\0${packName}`, "utf8").digest("hex").slice(0, 16).toUpperCase();
+      github.__authorityVariables.set(`FUGUE_D3_${digest}_${suffix}`, raw);
+    }
+  }
 }
 
 describe("d3 protected durable authority", () => {
@@ -368,18 +419,83 @@ describe("d3 protected durable authority", () => {
       });
       expect(result.exhausted).toBe(false);
     }
-    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_D3_"))).toHaveLength(30);
+    expect(recoveryScopes(github)).toEqual(new Set(Array.from({ length: 30 }, (_, index) => `many/${index}`)));
     await Promise.all([
       compactFugueRecoveryAuthorityVariables(github),
       compactFugueRecoveryAuthorityVariables(github),
       compactFugueRecoveryAuthorityVariables(github),
     ]);
-    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_D3_"))).toHaveLength(30);
+    expect(recoveryScopes(github)).toEqual(new Set(Array.from({ length: 30 }, (_, index) => `many/${index}`)));
     github.__listStatus.mockClear();
     await recoverDurableProtocolRecord(github, {
       storageSha: BASE, publisherSha: BASE, scope: "many/29", issueNumber: 129,
       parse: () => null, timestamp: () => 0, order: () => "",
     });
+    const pages = github.__listStatus.mock.calls.map((call) => call[0]?.page ?? 1);
+    expect(pages.some((page) => page > 1)).toBe(true);
+  });
+
+  it("keeps a caught-up scope resumable through hard-cap packing and concurrent capacity compactors", async () => {
+    const github = makeGithub();
+    await publishCanonicalWorkState(github, canonicalWork("packed-resume-authority"));
+    github.__comments.splice(0);
+
+    let caughtUp = await recoverDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: "work/18", issueNumber: 18,
+      parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
+    });
+    for (let attempt = 0; attempt < 4 && !caughtUp.record; attempt += 1) {
+      caughtUp = await recoverDurableProtocolRecord(github, {
+        storageSha: BASE, publisherSha: BASE, scope: "work/18", issueNumber: 18,
+        parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
+      });
+    }
+    expect(caughtUp.record).toBeDefined();
+    const frozenTop = github.__nextStatusId;
+
+    for (let scope = 0; scope < 180; scope += 1) {
+      await recoverDurableProtocolRecord(github, {
+        storageSha: BASE, publisherSha: BASE, scope: `capacity/${scope}`, issueNumber: 1000 + scope,
+        parse: () => null, timestamp: () => 0, order: () => "",
+      });
+    }
+    expect(recoveryScopes(github).has("work/18")).toBe(true);
+    explodeRecoveryPacksToLeaves(github);
+    for (let index = 0; github.__authorityVariables.size < 500; index += 1) {
+      github.__authorityVariables.set(`UNRELATED_${index.toString().padStart(4, "0")}`, "unrelated");
+    }
+    expect(github.__authorityVariables.size).toBe(500);
+
+    await Promise.all([
+      compactFugueRecoveryAuthorityVariables(github),
+      compactFugueRecoveryAuthorityVariables(github),
+      compactFugueRecoveryAuthorityVariables(github),
+    ]);
+    expect(recoveryScopes(github).has("work/18")).toBe(true);
+
+    for (let index = 0; index < 3400; index += 1) {
+      github.__statuses.push({ id: ++github.__nextStatusId, sha: BASE, context: `post-pack-hostile/${index}`, description: "new-noise" });
+    }
+    github.__listStatus.mockClear();
+    let resumed;
+    for (let attempt = 0; attempt < 8 && !resumed?.record; attempt += 1) {
+      resumed = await recoverDurableProtocolRecord(github, {
+        storageSha: BASE, publisherSha: BASE, scope: "work/18", issueNumber: 18,
+        parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
+      });
+      if (!resumed.record) {
+        for (let index = 0; index < 300; index += 1) {
+          github.__statuses.push({ id: ++github.__nextStatusId, sha: BASE, context: `post-pack-continuous/${attempt}/${index}`, description: "continuous-noise" });
+        }
+      }
+    }
+    expect(resumed?.record).toBeDefined();
+    expect(canonicalRequirements(resumed!.record!.value)).toBe("packed-resume-authority");
+    expect(recoveryScopes(github).has("work/18")).toBe(true);
+    const cursor = recoveryCheckpointBodies(github)
+      .map(recoveryCursorBody)
+      .find((entry) => entry?.scope === "work/18");
+    expect(Number(cursor?.complete_top_id ?? 0)).toBeGreaterThanOrEqual(frozenTop);
     const pages = github.__listStatus.mock.calls.map((call) => call[0]?.page ?? 1);
     expect(pages.some((page) => page > 1)).toBe(true);
   });

@@ -44,6 +44,13 @@ const MANIFEST_PROOFS_PER_RECOVERY_SLICE = 8;
 const STATUS_PAGES_PER_RECOVERY_SLICE = 32;
 const REPOSITORY_AUTHORITY_VARIABLE_CAPACITY = 500;
 const RECOVERY_AUTHORITY_PREFIX = "FUGUE_D3_";
+const RECOVERY_PACK_PREFIX = "FUGUE_D3P_";
+const RECOVERY_RESERVE_PREFIX = "FUGUE_D3R_";
+const RECOVERY_RESERVE_COUNT = 8;
+const RECOVERY_PACK_MAX_ENTRIES = 16;
+// GitHub configuration variables are limited to 48 KB. Keep immutable recovery packs below
+// that ceiling so the signed cursor bodies and JSON framing always have safety margin.
+const RECOVERY_PACK_VALUE_LIMIT = 44 * 1024;
 const MANIFEST_PATTERN = /^n=(\d+);c=([0-9a-f]{32});b=([0-9a-f]{64});a=(\d+);z=(\d+)$/i;
 const DURABLE_MANIFEST_URL = "https://token.actions.githubusercontent.com/fugue/d3";
 
@@ -113,6 +120,12 @@ const recoveryCursorSchema = z.object({
   best_body_b64: z.string().optional(),
   best_manifest: recoveryManifestSchema.optional(),
   chunks: z.array(z.string().nullable()).max(DURABLE_MAX_CHUNKS).optional(),
+});
+
+const recoveryPackSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("durable_recovery_pack"),
+  entries: z.array(z.string().min(1)).min(1).max(RECOVERY_PACK_MAX_ENTRIES),
 });
 
 export type CanonicalWorkState = z.infer<typeof canonicalWorkStateSchema>;
@@ -949,43 +962,39 @@ export async function deleteFugueAuthorityVariable(github: FugueGitHub, name: st
   }
 }
 
-async function findRecoveryCursor<T>(
-  github: FugueGitHub,
-  options: DurableRecordOptions<T>,
-): Promise<{ variableName: string; cursor: RecoveryCursor } | undefined> {
-  let best: { variableName: string; cursor: RecoveryCursor } | undefined;
-  for (const variable of await listFugueAuthorityVariables(github, recoveryVariablePrefix(options))) {
-    let cursor: RecoveryCursor | null;
-    try {
-      cursor = parsePayloadBlock(variable.value, RECOVERY_START, recoveryCursorSchema);
-    } catch {
-      continue;
-    }
-    if (!cursor || cursor.scope !== options.scope || cursor.storage_sha !== options.storageSha ||
-        cursor.publisher_sha !== options.publisherSha) continue;
-    const timestamp = Date.parse(cursor.checkpoint_at);
-    if (!Number.isFinite(timestamp)) continue;
-    try {
-      if (!(await verifyProtocolPublicationBodyAtRevision(
-        github,
-        variable.value,
-        options.publisherSha,
-        timestamp,
-      ))) continue;
-    } catch {
-      continue;
-    }
-    if (!best || compareRecoveryProgress(cursor, best.cursor) > 0 ||
-        (compareRecoveryProgress(cursor, best.cursor) === 0 && variable.name < best.variableName)) {
-      best = { variableName: variable.name, cursor };
-    }
-  }
-  return best;
+interface VerifiedRecoveryEntry {
+  sourceVariableName: string;
+  signedBody: string;
+  cursor: RecoveryCursor;
+}
+
+function recoveryIdentity(cursor: RecoveryCursor): string {
+  return `${cursor.storage_sha.toLowerCase()}\0${cursor.publisher_sha.toLowerCase()}\0${cursor.scope}`;
+}
+
+function recoveryOptionsIdentity<T>(options: DurableRecordOptions<T>): string {
+  return `${options.storageSha.toLowerCase()}\0${options.publisherSha.toLowerCase()}\0${options.scope}`;
+}
+
+function recoveryBucket(identity: string): string {
+  return createHash("sha256").update(identity, "utf8").digest("hex").slice(0, 2).toUpperCase();
+}
+
+function recoveryCursorBucket(cursor: RecoveryCursor): string {
+  return recoveryBucket(recoveryIdentity(cursor));
+}
+
+function recoveryOptionsBucket<T>(options: DurableRecordOptions<T>): string {
+  return recoveryBucket(recoveryOptionsIdentity(options));
+}
+
+function recoveryPackPrefix(bucket: string): string {
+  return `${RECOVERY_PACK_PREFIX}${bucket}_`;
 }
 
 function recoveryVariablePrefix<T>(options: DurableRecordOptions<T>): string {
   const digest = createHash("sha256")
-    .update(`${options.storageSha.toLowerCase()}\0${options.publisherSha.toLowerCase()}\0${options.scope}`, "utf8")
+    .update(recoveryOptionsIdentity(options), "utf8")
     .digest("hex")
     .slice(0, 16)
     .toUpperCase();
@@ -1008,87 +1017,255 @@ function compareRecoveryProgress(left: RecoveryCursor, right: RecoveryCursor): n
   return leftChunks - rightChunks;
 }
 
-function recoveryIdentity(cursor: RecoveryCursor): string {
-  return `${cursor.storage_sha.toLowerCase()}\0${cursor.publisher_sha.toLowerCase()}\0${cursor.scope}`;
+function recoveryBodyTieBreak(body: string): string {
+  return createHash("sha256").update(body, "utf8").digest("hex");
 }
 
-function recoveryOptionsIdentity<T>(options: DurableRecordOptions<T>): string {
-  return `${options.storageSha.toLowerCase()}\0${options.publisherSha.toLowerCase()}\0${options.scope}`;
+function parseRecoveryCursorBody(body: string): RecoveryCursor | undefined {
+  try {
+    return parsePayloadBlock(body, RECOVERY_START, recoveryCursorSchema) ?? undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-async function verifiedRecoveryAuthorityVariables(github: FugueGitHub): Promise<Array<{ variableName: string; cursor: RecoveryCursor }>> {
-  const verified: Array<{ variableName: string; cursor: RecoveryCursor }> = [];
-  for (const variable of await listFugueAuthorityVariables(github, RECOVERY_AUTHORITY_PREFIX)) {
-    let cursor: RecoveryCursor | null;
-    try { cursor = parsePayloadBlock(variable.value, RECOVERY_START, recoveryCursorSchema); }
-    catch { cursor = null; }
-    if (!cursor) {
+async function verifyRecoveryCursorBody(github: FugueGitHub, body: string): Promise<RecoveryCursor | undefined> {
+  const cursor = parseRecoveryCursorBody(body);
+  if (!cursor) return undefined;
+  const timestamp = Date.parse(cursor.checkpoint_at);
+  if (!Number.isFinite(timestamp)) return undefined;
+  try {
+    if (!(await verifyProtocolPublicationBodyAtRevision(github, body, cursor.publisher_sha, timestamp))) return undefined;
+  } catch {
+    return undefined;
+  }
+  return cursor;
+}
+
+function parseRecoveryPack(value: string): string[] | undefined {
+  try {
+    const parsed = recoveryPackSchema.safeParse(JSON.parse(value) as unknown);
+    return parsed.success ? parsed.data.entries : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function serializeRecoveryPack(entries: readonly string[]): string {
+  return JSON.stringify(recoveryPackSchema.parse({ version: 1, kind: "durable_recovery_pack", entries }));
+}
+
+function recoveryPackName(bucket: string, value: string): string {
+  const digest = createHash("sha256").update(value, "utf8").digest("hex").slice(0, 24).toUpperCase();
+  return `${recoveryPackPrefix(bucket)}${digest}`;
+}
+
+function variableRecoveryBucket(name: string): string | undefined {
+  const leaf = name.match(/^FUGUE_D3_([0-9A-F]{2})[0-9A-F]{14}_/i)?.[1];
+  if (leaf) return leaf.toUpperCase();
+  return name.match(/^FUGUE_D3P_([0-9A-F]{2})_/i)?.[1]?.toUpperCase();
+}
+
+function recoveryReserveName(index: number): string {
+  return `${RECOVERY_RESERVE_PREFIX}${String(index).padStart(2, "0")}`;
+}
+
+async function ensureRecoveryReserveVariables(github: FugueGitHub): Promise<void> {
+  const existing = new Set((await listFugueAuthorityVariables(github, RECOVERY_RESERVE_PREFIX)).map((entry) => entry.name));
+  let allCount = (await listFugueAuthorityVariables(github, "")).length;
+  for (let index = 0; index < RECOVERY_RESERVE_COUNT; index += 1) {
+    const name = recoveryReserveName(index);
+    if (existing.has(name) || allCount >= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY) continue;
+    if (await createFugueAuthorityVariable(github, name, "reserved-for-fugue-recovery-compaction")) {
+      allCount += 1;
+    }
+  }
+}
+
+async function releaseRecoveryReserveSlots(github: FugueGitHub, slots: number): Promise<boolean> {
+  let all = await listFugueAuthorityVariables(github, "");
+  if (all.length + slots <= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY) return true;
+  const reserves = (await listFugueAuthorityVariables(github, RECOVERY_RESERVE_PREFIX))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  for (const reserve of reserves) {
+    await deleteFugueAuthorityVariable(github, reserve.name);
+    all = await listFugueAuthorityVariables(github, "");
+    if (all.length + slots <= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY) return true;
+  }
+  return all.length + slots <= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY;
+}
+
+async function verifiedRecoveryEntriesForBucket(
+  github: FugueGitHub,
+  bucket: string,
+  variables?: readonly FugueAuthorityVariable[],
+): Promise<VerifiedRecoveryEntry[]> {
+  const source = variables ?? await listFugueAuthorityVariables(github, "FUGUE_D3");
+  const verified: VerifiedRecoveryEntry[] = [];
+  for (const variable of source) {
+    if (variable.name.startsWith(RECOVERY_RESERVE_PREFIX)) continue;
+    if (variableRecoveryBucket(variable.name) !== bucket) continue;
+    if (variable.name.startsWith(RECOVERY_PACK_PREFIX)) {
+      const bodies = parseRecoveryPack(variable.value);
+      if (!bodies) continue; // Never delete an unreadable pack: it may be the sole surviving progress copy.
+      for (const signedBody of bodies) {
+        const parsed = parseRecoveryCursorBody(signedBody);
+        if (!parsed || recoveryCursorBucket(parsed) !== bucket) continue;
+        const cursor = await verifyRecoveryCursorBody(github, signedBody);
+        if (cursor) verified.push({ sourceVariableName: variable.name, signedBody, cursor });
+      }
+      continue;
+    }
+    const cursor = await verifyRecoveryCursorBody(github, variable.value);
+    if (!cursor || recoveryCursorBucket(cursor) !== bucket) {
       await deleteFugueAuthorityVariable(github, variable.name);
       continue;
     }
-    const timestamp = Date.parse(cursor.checkpoint_at);
-    let valid = Number.isFinite(timestamp);
-    if (valid) {
-      try { valid = await verifyProtocolPublicationBodyAtRevision(github, variable.value, cursor.publisher_sha, timestamp); }
-      catch { valid = false; }
-    }
-    if (!valid) {
-      await deleteFugueAuthorityVariable(github, variable.name);
-      continue;
-    }
-    verified.push({ variableName: variable.name, cursor });
+    verified.push({ sourceVariableName: variable.name, signedBody: variable.value, cursor });
   }
   return verified;
 }
 
+async function findRecoveryCursor<T>(
+  github: FugueGitHub,
+  options: DurableRecordOptions<T>,
+): Promise<{ variableName: string; cursor: RecoveryCursor } | undefined> {
+  const identity = recoveryOptionsIdentity(options);
+  let best: VerifiedRecoveryEntry | undefined;
+  const variables = await listFugueAuthorityVariables(github, "FUGUE_D3");
+  for (const entry of await verifiedRecoveryEntriesForBucket(github, recoveryOptionsBucket(options), variables)) {
+    if (recoveryIdentity(entry.cursor) !== identity) continue;
+    if (!best || compareRecoveryProgress(entry.cursor, best.cursor) > 0 ||
+        (compareRecoveryProgress(entry.cursor, best.cursor) === 0 &&
+          recoveryBodyTieBreak(entry.signedBody) < recoveryBodyTieBreak(best.signedBody))) {
+      best = entry;
+    }
+  }
+  return best ? { variableName: best.sourceVariableName, cursor: best.cursor } : undefined;
+}
+
+function buildRecoveryPackGroups(entries: readonly VerifiedRecoveryEntry[]): {
+  groups: string[][];
+  protectedSources: Set<string>;
+} {
+  const groups: string[][] = [];
+  const protectedSources = new Set<string>();
+  let current: string[] = [];
+  for (const entry of entries) {
+    const single = serializeRecoveryPack([entry.signedBody]);
+    if (Buffer.byteLength(single, "utf8") > RECOVERY_PACK_VALUE_LIMIT) {
+      protectedSources.add(entry.sourceVariableName);
+      continue;
+    }
+    const candidate = [...current, entry.signedBody];
+    if (current.length >= RECOVERY_PACK_MAX_ENTRIES ||
+        Buffer.byteLength(serializeRecoveryPack(candidate), "utf8") > RECOVERY_PACK_VALUE_LIMIT) {
+      if (current.length) groups.push(current);
+      current = [entry.signedBody];
+    } else {
+      current = candidate;
+    }
+  }
+  if (current.length) groups.push(current);
+  return { groups, protectedSources };
+}
+
+async function compactRecoveryBucket(
+  github: FugueGitHub,
+  bucket: string,
+  variables: readonly FugueAuthorityVariable[],
+): Promise<void> {
+  const entries = await verifiedRecoveryEntriesForBucket(github, bucket, variables);
+  if (!entries.length) return;
+  const grouped = new Map<string, VerifiedRecoveryEntry[]>();
+  const bySource = new Map<string, VerifiedRecoveryEntry[]>();
+  for (const entry of entries) {
+    const identity = recoveryIdentity(entry.cursor);
+    const group = grouped.get(identity) ?? [];
+    group.push(entry);
+    grouped.set(identity, group);
+    const sourceEntries = bySource.get(entry.sourceVariableName) ?? [];
+    sourceEntries.push(entry);
+    bySource.set(entry.sourceVariableName, sourceEntries);
+  }
+
+  const winners: VerifiedRecoveryEntry[] = [];
+  for (const [identity, group] of grouped) {
+    group.sort((left, right) => {
+      const progress = compareRecoveryProgress(right.cursor, left.cursor);
+      if (progress !== 0) return progress;
+      const bodyOrder = recoveryBodyTieBreak(left.signedBody).localeCompare(recoveryBodyTieBreak(right.signedBody));
+      if (bodyOrder !== 0) return bodyOrder;
+      return left.sourceVariableName.localeCompare(right.sourceVariableName);
+    });
+    winners.push(group[0]!);
+  }
+  winners.sort((left, right) => recoveryIdentity(left.cursor).localeCompare(recoveryIdentity(right.cursor)));
+
+  // Sources containing no greatest cursor are already redundant and can be removed before packing.
+  // This is same-identity deduplication only; no scope loses its sole monotonic checkpoint.
+  const winnerSources = new Set(winners.map((entry) => entry.sourceVariableName));
+  for (const sourceName of bySource.keys()) {
+    if (!winnerSources.has(sourceName)) {
+      await deleteFugueAuthorityVariable(github, sourceName);
+      bySource.delete(sourceName);
+    }
+  }
+
+  const liveSources = winnerSources;
+  if (liveSources.size <= 1 && winners.length <= 1) return;
+
+  const { groups: packGroups, protectedSources } = buildRecoveryPackGroups(winners);
+  const outputs = new Map<string, string>();
+  for (const group of packGroups) {
+    const value = serializeRecoveryPack(group);
+    outputs.set(recoveryPackName(bucket, value), value);
+  }
+
+  const missingOutputs: Array<[string, string]> = [];
+  for (const [name, value] of outputs) {
+    const existing = await getFugueAuthorityVariable(github, name);
+    if (existing === value) continue;
+    if (existing !== undefined) return; // Hash/name collision: fail closed without deleting a source.
+    missingOutputs.push([name, value]);
+  }
+  if (missingOutputs.length && !(await releaseRecoveryReserveSlots(github, missingOutputs.length))) return;
+  for (const [name, value] of missingOutputs) {
+    const created = await createFugueAuthorityVariable(github, name, value);
+    const durable = created ? value : await getFugueAuthorityVariable(github, name);
+    if (durable !== value) return; // Source deletion happens only after every replacement pack is durable.
+  }
+
+  const outputNames = new Set(outputs.keys());
+  for (const sourceName of liveSources) {
+    if (outputNames.has(sourceName) || protectedSources.has(sourceName)) continue;
+    await deleteFugueAuthorityVariable(github, sourceName);
+  }
+  await ensureRecoveryReserveVariables(github);
+}
+
 /**
- * Recovery checkpoints are performance state, never d3 authority. Compaction is strictly per
- * recovery identity: one deterministic greatest cursor survives for every active scope. A
- * different scope's sole in-progress cursor is never evicted. Under repository capacity pressure
- * only quiescent completed cursors are reclaimable, so many simultaneous recoveries retain
- * monotonic progress instead of restarting from page 1.
+ * Recovery checkpoints are performance state, never d3 authority. Every resumable identity keeps
+ * one greatest signed cursor. Capacity is reduced by packing greatest cursors into immutable,
+ * bucket-sharded Authority variables; a pack is created and re-read before any source containing
+ * its progress is deleted. No cross-scope cursor is ever reclaimed merely because it is caught up.
+ * Reserved empty Authority slots let a full Fugue-owned namespace publish a replacement pack first,
+ * and concurrent compactors converge because pack names are content-addressed and never mutated.
  */
 export async function compactFugueRecoveryAuthorityVariables(
   github: FugueGitHub,
   preserveIdentity?: string,
   reserveSlots = 0,
 ): Promise<void> {
-  const verified = await verifiedRecoveryAuthorityVariables(github);
-  const grouped = new Map<string, Array<{ variableName: string; cursor: RecoveryCursor }>>();
-  for (const entry of verified) {
-    const key = recoveryIdentity(entry.cursor);
-    const group = grouped.get(key) ?? [];
-    group.push(entry);
-    grouped.set(key, group);
+  await ensureRecoveryReserveVariables(github);
+  const variables = await listFugueAuthorityVariables(github, "FUGUE_D3");
+  const buckets = preserveIdentity
+    ? [recoveryBucket(preserveIdentity)]
+    : [...new Set(variables.map((entry) => variableRecoveryBucket(entry.name)).filter((value): value is string => Boolean(value)))].sort();
+  for (const bucket of buckets) {
+    await compactRecoveryBucket(github, bucket, variables.filter((entry) => variableRecoveryBucket(entry.name) === bucket));
   }
-
-  const survivors: Array<{ variableName: string; cursor: RecoveryCursor }> = [];
-  for (const group of grouped.values()) {
-    group.sort((left, right) => {
-      const progress = compareRecoveryProgress(right.cursor, left.cursor);
-      if (progress !== 0) return progress;
-      return left.variableName.localeCompare(right.variableName);
-    });
-    const winner = group[0]!;
-    survivors.push(winner);
-    for (const stale of group.slice(1)) await deleteFugueAuthorityVariable(github, stale.variableName);
-  }
-
-  let all = await listFugueAuthorityVariables(github, "");
-  if (all.length + reserveSlots <= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY) return;
-  const quiescent = survivors
-    .filter((entry) => recoveryIdentity(entry.cursor) !== preserveIdentity)
-    .filter((entry) => entry.cursor.phase === "discover" && entry.cursor.scan_top_id === entry.cursor.complete_top_id)
-    .sort((left, right) => {
-      const timestamp = Date.parse(left.cursor.checkpoint_at) - Date.parse(right.cursor.checkpoint_at);
-      if (timestamp !== 0) return timestamp;
-      return left.variableName.localeCompare(right.variableName);
-    });
-  for (const stale of quiescent) {
-    await deleteFugueAuthorityVariable(github, stale.variableName);
-    all = await listFugueAuthorityVariables(github, "");
-    if (all.length + reserveSlots <= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY) return;
-  }
+  if (reserveSlots > 0) await releaseRecoveryReserveSlots(github, reserveSlots);
 }
 
 async function writeRecoveryCursor<T>(
@@ -1124,7 +1301,7 @@ async function writeRecoveryCursor<T>(
   if (!created && existing !== signed) {
     throw new CanonicalWorkStateIntegrityError(
       existing === undefined
-        ? "Protected Fugue Authority-variable namespace is full with no reclaimable recovery checkpoint; refusing to corrupt unrelated repository variables."
+        ? "Protected Fugue Authority-variable namespace is full after immutable recovery packing/reserve reclamation; refusing to corrupt unrelated repository variables."
         : `Protected Fugue authority variable collision at ${name}.`,
     );
   }
