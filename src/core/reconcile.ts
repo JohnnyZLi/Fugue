@@ -10,12 +10,14 @@ import { beginReview } from "./reviews.js";
 import { resolveActivePolicy, type ActivePolicy } from "./policy.js";
 import {
   canonicalRequirements,
+  coordinatorSnapshotSchema,
   createCanonicalWorkState,
-  loadCurrentCanonicalWorkState,
-  publishCanonicalWorkState,
+  publishCoordinatorSnapshot,
   reconstructState,
+  recoverCoordinatorSnapshots,
   repairCanonicalWorkStateComments,
   rollCanonicalWorkStatesToCurrentBase,
+  type CoordinatorSnapshot,
   type WorkState,
 } from "./state.js";
 import { processCurrentSubmissions } from "./submissions.js";
@@ -23,18 +25,10 @@ import { upsertStateComment } from "./state-comment.js";
 import { actionLabel, observeWork, planWork, type WorkflowAction } from "./workflow.js";
 import { claimWorker } from "./worker.js";
 import type { FugueGitHub } from "./github.js";
-import {
-  createIntegrationRequest,
-  parseIntegrationRequest,
-  serializeIntegrationRequest,
-  type IntegrationRequest,
-} from "./integration-plan.js";
-import {
-  findIntegrationWorkflowRun,
-  INTEGRATION_REQUEST_RECOVERY_GRACE_MS,
-} from "./integration-status.js";
-import { createProtocolComment, FUGUE_PROTOCOL_ACTOR, isTrustedProtocolComment } from "./provenance.js";
-import { captureEvaluation, sameEvaluationIdentity } from "./evaluation.js";
+import { ensureIntegrationDispatch } from "./integration-status.js";
+import { FUGUE_PROTOCOL_ACTOR } from "./provenance.js";
+import { captureEvaluation } from "./evaluation.js";
+import { loadCurrentCanonicalWorkState, publishCanonicalWorkState } from "./state.js";
 
 export interface ReconcileOptions {
   issue?: number;
@@ -49,16 +43,19 @@ export interface CoordinatorIssueEvent {
   eventName: string;
   action: string;
   actor: string;
+  eventId?: string;
   issueNumber?: number;
   label?: string;
   issueTitle?: string;
   issueBody?: string;
   issueLabels?: string[];
+  issueUpdatedAt?: string;
   issueIsPullRequest?: boolean;
 }
 
 const MAX_TRANSITIONS_PER_WORK = 12;
 const STATE_LABELS = new Set(["state:ready", "state:working", "state:blocked"] as const);
+const COORDINATOR_ACTIONS = new Set(["opened", "edited", "labeled", "unlabeled"]);
 
 export async function reconcileRepository(
   github: FugueGitHub,
@@ -70,7 +67,11 @@ export async function reconcileRepository(
   assertProtectedWorkflowRuntimeCurrent(policy);
   await rollCanonicalWorkStatesToCurrentBase(github, policy);
   await repairCanonicalWorkStateComments(github, policy);
-  await ingestCoordinatorIssueEvent(github, policy, coordinatorIssueEventFromEnvironment());
+
+  const event = coordinatorIssueEventFromEnvironment();
+  await preserveCoordinatorIssueEvent(github, policy, event);
+  await replayCoordinatorSnapshots(github, policy);
+
   await adoptAssignedPullRequests(github, policy);
   await repairCanonicalMirrors(github, policy);
 
@@ -88,6 +89,7 @@ export async function reconcileWork(github: FugueGitHub, issueNumber: number): P
     assertProtectedWorkflowRuntimeCurrent(policy);
     await rollCanonicalWorkStatesToCurrentBase(github, policy);
     await repairCanonicalWorkStateComments(github, policy);
+    await replayCoordinatorSnapshots(github, policy, issueNumber);
     await adoptAssignedPullRequests(github, policy);
     await repairCanonicalMirrors(github, policy, issueNumber);
 
@@ -181,8 +183,7 @@ async function applyAction(
   }
 }
 
-/** Canonicalize the exact immutable GitHub Actions issue-event snapshot, never a later fetch. */
-export async function ingestCoordinatorIssueEvent(
+export async function preserveCoordinatorIssueEvent(
   github: FugueGitHub,
   policy: ActivePolicy,
   event: CoordinatorIssueEvent | undefined,
@@ -190,18 +191,88 @@ export async function ingestCoordinatorIssueEvent(
   if (!event || event.eventName !== "issues" || !event.issueNumber) return false;
   if (event.issueIsPullRequest) return false;
   if (!event.actor || event.actor === FUGUE_PROTOCOL_ACTOR) return false;
+  if (!COORDINATOR_ACTIONS.has(event.action)) return false;
   if (!(await canCanonicalizeCoordinatorEvent(github, event.actor))) return false;
-  const supported = new Set(["opened", "edited", "labeled", "unlabeled"]);
-  if (!supported.has(event.action)) return false;
+  if (event.issueTitle === undefined || event.issueBody === undefined || !event.issueLabels || !event.issueUpdatedAt) return false;
+
+  const capturedAt = new Date().toISOString();
+  const snapshot = coordinatorSnapshotSchema.parse({
+    version: 1,
+    kind: "coordinator_snapshot",
+    event_id: event.eventId ?? `${event.issueNumber}:${event.issueUpdatedAt}:${event.action}:${event.label ?? ""}`,
+    event_name: "issues",
+    action: event.action,
+    actor: event.actor,
+    issue: event.issueNumber,
+    ...(event.label ? { label: event.label } : {}),
+    title: event.issueTitle,
+    body: event.issueBody,
+    labels: event.issueLabels,
+    issue_updated_at: event.issueUpdatedAt,
+    captured_at: capturedAt,
+  });
+  await publishCoordinatorSnapshot(github, policy.identity.baseSha, snapshot);
+  return true;
+}
+
+export async function replayCoordinatorSnapshots(
+  github: FugueGitHub,
+  policy: ActivePolicy,
+  onlyIssue?: number,
+): Promise<number[]> {
+  const snapshots = await recoverCoordinatorSnapshots(github, policy);
+  const applied: number[] = [];
+  for (const snapshot of snapshots) {
+    if (onlyIssue && snapshot.issue !== onlyIssue) continue;
+    if (await ingestCoordinatorSnapshot(github, policy, snapshot)) applied.push(snapshot.issue);
+  }
+  return applied;
+}
+
+export async function ingestCoordinatorSnapshot(
+  github: FugueGitHub,
+  policy: ActivePolicy,
+  snapshot: CoordinatorSnapshot,
+): Promise<boolean> {
+  return ingestCoordinatorIssueEvent(github, policy, {
+    eventName: snapshot.event_name,
+    action: snapshot.action,
+    actor: snapshot.actor,
+    eventId: snapshot.event_id,
+    issueNumber: snapshot.issue,
+    ...(snapshot.label ? { label: snapshot.label } : {}),
+    issueTitle: snapshot.title,
+    issueBody: snapshot.body,
+    issueLabels: snapshot.labels,
+    issueUpdatedAt: snapshot.issue_updated_at,
+    issueIsPullRequest: false,
+  }, true);
+}
+
+/** Canonicalize an authorized immutable issue snapshot, never a later mutable fetch. */
+export async function ingestCoordinatorIssueEvent(
+  github: FugueGitHub,
+  policy: ActivePolicy,
+  event: CoordinatorIssueEvent | undefined,
+  alreadyAuthorized = false,
+): Promise<boolean> {
+  if (!event || event.eventName !== "issues" || !event.issueNumber) return false;
+  if (event.issueIsPullRequest) return false;
+  if (!event.actor || event.actor === FUGUE_PROTOCOL_ACTOR) return false;
+  if (!COORDINATOR_ACTIONS.has(event.action)) return false;
+  if (!alreadyAuthorized && !(await canCanonicalizeCoordinatorEvent(github, event.actor))) return false;
 
   const existing = await loadCurrentCanonicalWorkState(github, event.issueNumber, policy.identity.baseSha);
 
   if (event.action === "labeled" || event.action === "unlabeled") {
-    if (!existing || !event.label) return false;
+    if (!existing || !event.label || !event.issueLabels) return false;
+    const eventRevision = Date.parse(event.issueUpdatedAt ?? "");
+    const stateRevision = Date.parse(existing.created_at);
+    // Replaying an old Human label snapshot must not roll back a later protected lifecycle transition.
+    if (Number.isFinite(eventRevision) && Number.isFinite(stateRevision) && stateRevision > eventRevision) return false;
     let state = existing.state;
     let agentReady = existing.agent_ready;
     if (STATE_LABELS.has(event.label as WorkState["stateLabel"]) && event.action === "labeled") {
-      if (!event.issueLabels) return false;
       state = singleStateLabel(event.issueLabels, event.issueNumber);
     }
     if (event.label === "agent:ready") agentReady = event.action === "labeled";
@@ -364,45 +435,18 @@ async function updatePrBranch(github: FugueGitHub, work: WorkState): Promise<voi
 export async function dispatchIntegration(github: FugueGitHub, policy: ActivePolicy, work: WorkState, now = Date.now()): Promise<void> {
   const { owner, repo } = github.repository;
   const prNumber = requirePr(work);
-  const headSha = work.pr?.headSha;
-  if (!headSha) throw new Error(`Work #${work.issueNumber} has no PR head.`);
-  const identity = {
-    prNumber,
-    headSha,
-    baseBranch: policy.identity.baseBranch,
-    baseSha: policy.identity.baseSha,
-    policyDigest: policy.identity.policyDigest,
-    protocolVersion: policy.identity.protocolVersion,
-    issueNumber: work.issueNumber,
-    workId: work.metadata.work_id,
-    workSpecDigest: work.workSpecDigest,
-  };
-  const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
-  let existing: IntegrationRequest | undefined;
-  for (const comment of comments) {
-    if (!(await isTrustedProtocolComment(github, comment))) continue;
-    try {
-      const candidate = parseIntegrationRequest(comment.body ?? "");
-      if (candidate && sameEvaluationIdentity(candidate.identity, identity)) existing = candidate;
-    } catch {
-      // Malformed historical requests are inert.
-    }
+  const snapshot = await captureEvaluation(github, prNumber);
+  if (snapshot.identity.baseSha !== policy.identity.baseSha) {
+    throw new Error(`Integration dispatch base changed while reconciling PR #${prNumber}.`);
   }
-  let created = false;
-  if (!existing) {
-    const request = createIntegrationRequest(identity);
-    await createProtocolComment(github, prNumber, `INTEGRATION — REQUESTED\n\nHead: \`${headSha}\`\nRequest: \`${request.request_id}\`\n\n${serializeIntegrationRequest(request)}`);
-    existing = request;
-    created = true;
-  }
-  if (await findIntegrationWorkflowRun(github, existing)) return;
-  if (!created) {
-    const createdAt = Date.parse(existing.created_at);
-    if (Number.isFinite(createdAt) && now - createdAt < INTEGRATION_REQUEST_RECOVERY_GRACE_MS) return;
-  }
+  const next = await ensureIntegrationDispatch(github, snapshot, now);
+  if (!next.dispatch || !next.request) return;
   await github.octokit.rest.actions.createWorkflowDispatch({
-    owner, repo, workflow_id: "fugue-integration.yml", ref: policy.identity.baseBranch,
-    inputs: { pr: prNumber, request_id: existing.request_id },
+    owner,
+    repo,
+    workflow_id: "fugue-integration.yml",
+    ref: policy.identity.baseBranch,
+    inputs: { pr: prNumber, request_id: next.request.request_id },
   });
 }
 
@@ -450,9 +494,11 @@ export function coordinatorIssueEventFromEnvironment(): CoordinatorIssueEvent | 
     sender?: { login?: unknown };
     label?: { name?: unknown } | null;
     issue?: {
+      id?: unknown;
       number?: unknown;
       title?: unknown;
       body?: unknown;
+      updated_at?: unknown;
       labels?: Array<string | { name?: unknown }>;
       pull_request?: unknown;
     };
@@ -466,18 +512,23 @@ export function coordinatorIssueEventFromEnvironment(): CoordinatorIssueEvent | 
   const label = typeof value.label?.name === "string" ? value.label.name : undefined;
   const issueTitle = typeof issue?.title === "string" ? issue.title : undefined;
   const issueBody = typeof issue?.body === "string" ? issue.body : issue?.body === null ? "" : undefined;
+  const issueUpdatedAt = typeof issue?.updated_at === "string" ? issue.updated_at : undefined;
   const issueLabels = Array.isArray(issue?.labels)
     ? issue.labels.map((item) => typeof item === "string" ? item : typeof item.name === "string" ? item.name : "").filter(Boolean)
     : undefined;
+  const rawId = typeof issue?.id === "number" ? String(issue.id) : String(issueNumber ?? "issue");
+  const eventId = `${rawId}:${issueUpdatedAt ?? process.env.GITHUB_RUN_ID ?? "unknown"}:${action}:${label ?? ""}`;
   return {
     eventName,
     action,
     actor,
+    eventId,
     ...(issueNumber ? { issueNumber } : {}),
     ...(label ? { label } : {}),
     ...(issueTitle !== undefined ? { issueTitle } : {}),
     ...(issueBody !== undefined ? { issueBody } : {}),
     ...(issueLabels ? { issueLabels } : {}),
+    ...(issueUpdatedAt ? { issueUpdatedAt } : {}),
     issueIsPullRequest: Boolean(issue?.pull_request),
   };
 }

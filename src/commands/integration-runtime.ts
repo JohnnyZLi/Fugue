@@ -15,7 +15,7 @@ import {
   parseIntegrationPlan,
   parseIntegrationValidation,
 } from "../core/integration-plan.js";
-import { findCurrentIntegrationRequest } from "../core/integration-status.js";
+import { bindIntegrationRun, findCurrentIntegrationRequest } from "../core/integration-status.js";
 import { runValidation } from "../core/validation.js";
 
 export interface IntegrationPrepareOptions {
@@ -45,22 +45,39 @@ export async function runIntegrationPrepare(
   const repository = await discoverRepository();
   const github = await requireWritableGitHub(repository);
 
+  const runId = parsePositiveInteger(process.env.GITHUB_RUN_ID ?? "", "GitHub workflow run ID");
+  const runAttempt = parsePositiveInteger(process.env.GITHUB_RUN_ATTEMPT ?? "", "GitHub workflow run attempt");
+  if (runAttempt !== 1) {
+    throw new IntegrationGateFailure(
+      "request-run",
+      `Integration request ${options.requestId} can only bind workflow attempt 1, not attempt ${runAttempt}.`,
+    );
+  }
+
   const requestedSnapshot = await captureEvaluation(github, prNumber);
   const request = await findCurrentIntegrationRequest(github, requestedSnapshot);
   if (!request || request.request_id !== options.requestId) {
     throw new IntegrationGateFailure(
       "request",
-      `Integration dispatch ${options.requestId} is not the current signed request for PR #${prNumber}.`,
+      `Integration dispatch ${options.requestId} is not the current durable request for PR #${prNumber}.`,
     );
   }
 
-  const prepared = await prepareIntegration(github, prNumber);
+  const bound = await bindIntegrationRun(github, requestedSnapshot, request.request_id, runId);
+  if (!bound.run) throw new Error(`Integration request ${request.request_id} did not bind protected run ${runId}.`);
+  const integration = {
+    request_id: request.request_id,
+    run_id: bound.run.id,
+    run_attempt: 1 as const,
+  };
+
+  const prepared = await prepareIntegration(github, prNumber, integration);
   if (!sameEvaluationIdentity(request.identity, prepared.plan.identity)) {
     const error = new IntegrationGateFailure(
       "request",
-      "Integration evaluation identity changed after the signed dispatch request was accepted.",
+      "Integration evaluation identity changed after the durable dispatch request was bound.",
     );
-    await publishIntegrationFailure(github, prepared.plan.identity, error);
+    await publishIntegrationFailure(github, prepared.plan.identity, integration, error);
     throw error;
   }
 
@@ -69,7 +86,7 @@ export async function runIntegrationPrepare(
       "runtime-base",
       `Trusted Integration runtime ${options.runtimeSha.slice(0, 8)} does not match current protected base ${prepared.plan.identity.baseSha.slice(0, 8)}.`,
     );
-    await publishIntegrationFailure(github, prepared.plan.identity, error);
+    await publishIntegrationFailure(github, prepared.plan.identity, integration, error);
     throw error;
   }
 
@@ -92,12 +109,13 @@ export async function runIntegrationValidate(options: IntegrationValidateOptions
   const validation = integrationValidationSchema.parse({
     version: 1,
     identity: plan.identity,
+    integration: plan.integration,
     passed: true,
     commands: result.commands,
     created_at: new Date().toISOString(),
   });
   await writeFile(resolve(options.out), `${JSON.stringify(validation, null, 2)}\n`, "utf8");
-  console.log(`Validated exact head ${plan.identity.headSha.slice(0, 8)}.`);
+  console.log(`Validated exact head ${plan.identity.headSha.slice(0, 8)} for run ${plan.integration.run_id}.`);
 }
 
 export async function runIntegrationFinalize(options: IntegrationFinalizeOptions): Promise<void> {
@@ -110,7 +128,7 @@ export async function runIntegrationFinalize(options: IntegrationFinalizeOptions
       "validation",
       `GitHub-hosted candidate validation job finished with ${options.validationResult}.`,
     );
-    await publishIntegrationFailure(github, plan.identity, error);
+    await publishIntegrationFailure(github, plan.identity, plan.integration, error);
     throw error;
   }
   if (!options.validation) throw new Error("Successful Integration finalization requires --validation <path>.");
@@ -124,7 +142,7 @@ export async function runIntegrationFinalize(options: IntegrationFinalizeOptions
     const result = await finalizeIntegration(github, plan, validation);
     console.log(`INTEGRATION PASS — PR #${plan.identity.prNumber} @ ${result.snapshot.identity.headSha.slice(0, 8)}`);
   } catch (error) {
-    await publishIntegrationFailure(github, plan.identity, error);
+    await publishIntegrationFailure(github, plan.identity, plan.integration, error);
     throw error;
   }
 }

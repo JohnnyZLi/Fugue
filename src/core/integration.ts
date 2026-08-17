@@ -5,6 +5,7 @@ import {
   serializeAttestation,
   type HumanControlPlaneAttestation,
   type IntegrationAttestation,
+  type IntegrationEvidenceIdentity,
   type QaAttestation,
   type QaRole,
 } from "./attestations.js";
@@ -24,12 +25,11 @@ import {
   type IntegrationPlan,
   type IntegrationValidation,
 } from "./integration-plan.js";
+import { getCurrentIntegrationRecord, publishIntegrationRecord } from "./integration-status.js";
 import { assertOwnership } from "./ownership.js";
 import { FUGUE_CLI_VERSION } from "./protocol.js";
 import { createProtocolComment, escapeProtocolMarkers, isTrustedProtocolComment } from "./provenance.js";
 import { currentQaAttestations } from "./reviews.js";
-import { runValidation } from "./validation.js";
-import { withCleanWorktree } from "./worktree.js";
 
 const INTEGRATION_FAILURE_START = "<!-- fugue-integration-failure";
 const MARKER_END = "-->";
@@ -54,6 +54,7 @@ interface Prerequisites {
 export async function prepareIntegration(
   github: FugueGitHub,
   prNumber: number,
+  integration: IntegrationEvidenceIdentity,
 ): Promise<PreparedIntegration> {
   const snapshot = await captureEvaluation(github, prNumber);
   const { owner, repo } = github.repository;
@@ -73,6 +74,7 @@ export async function prepareIntegration(
     const plan = integrationPlanSchema.parse({
       version: 1,
       identity: snapshot.identity,
+      integration,
       validation: {
         install: snapshot.policy.config.validation.install,
         checks: snapshot.policy.config.validation.checks,
@@ -96,7 +98,7 @@ export async function prepareIntegration(
     });
     return { snapshot, plan };
   } catch (error) {
-    await publishIntegrationFailure(github, snapshot.identity, error);
+    await publishIntegrationFailure(github, snapshot.identity, integration, error);
     throw error;
   }
 }
@@ -135,6 +137,7 @@ export async function finalizeIntegration(
     kind: "integration",
     attestation_id: createAttestationId("integration"),
     identity: snapshot.identity,
+    integration: plan.integration,
     fugue_version: FUGUE_CLI_VERSION,
     qa: {
       code: qaGate(snapshot, prerequisites.qa, "code"),
@@ -164,11 +167,28 @@ export async function finalizeIntegration(
     created_at: new Date().toISOString(),
   });
 
-  const comment = await createProtocolComment(
-    github,
-    snapshot.pr.number,
-    `INTEGRATION — PASS\n\nHead: \`${snapshot.identity.headSha}\`\nBase: \`${snapshot.identity.baseBranch}@${snapshot.identity.baseSha}\`\nPolicy: \`${snapshot.identity.policyDigest}\`\nWork spec: \`${snapshot.identity.workSpecDigest}\`\n\n${serializeAttestation(attestation)}`,
-  );
+  const record = await requireBoundIntegrationRecord(github, snapshot.identity, plan.integration);
+  await publishIntegrationRecord(github, {
+    ...record,
+    terminal: {
+      state: "success",
+      attestation,
+      created_at: new Date().toISOString(),
+    },
+    created_at: new Date().toISOString(),
+  });
+
+  let targetUrl = record.run?.html_url ?? "";
+  try {
+    const comment = await createProtocolComment(
+      github,
+      snapshot.pr.number,
+      `INTEGRATION — PASS\n\nHead: \`${snapshot.identity.headSha}\`\nBase: \`${snapshot.identity.baseBranch}@${snapshot.identity.baseSha}\`\nRequest: \`${plan.integration.request_id}\`\nRun: \`${plan.integration.run_id}\` attempt 1\nPolicy: \`${snapshot.identity.policyDigest}\`\nWork spec: \`${snapshot.identity.workSpecDigest}\`\n\n${serializeAttestation(attestation)}`,
+    );
+    targetUrl = comment.data.html_url;
+  } catch {
+    // The durable Integration record already contains the complete terminal PASS attestation.
+  }
 
   const { owner, repo } = github.repository;
   await github.octokit.rest.repos.createCommitStatus({
@@ -178,24 +198,33 @@ export async function finalizeIntegration(
     state: "success",
     context: "fugue/integration",
     description: "Fugue Integration passed",
-    target_url: comment.data.html_url,
+    ...(targetUrl ? { target_url: targetUrl } : {}),
   });
 
-  return { snapshot, attestation, url: comment.data.html_url };
+  return { snapshot, attestation, url: targetUrl };
 }
 
 export function renderIntegrationFailureComment(
   identity: IntegrationPlan["identity"],
   label: "FAILED" | "ERROR",
   detail: string,
+  integration?: IntegrationEvidenceIdentity,
 ): string {
-  const marker = `${INTEGRATION_FAILURE_START}\nversion: 1\npr: ${identity.prNumber}\nhead: ${identity.headSha}\n${MARKER_END}`;
+  const marker = [
+    INTEGRATION_FAILURE_START,
+    "version: 1",
+    `pr: ${identity.prNumber}`,
+    `head: ${identity.headSha}`,
+    ...(integration ? [`request_id: ${integration.request_id}`, `run_id: ${integration.run_id}`, "run_attempt: 1"] : []),
+    MARKER_END,
+  ].join("\n");
   return `${marker}\n\nINTEGRATION — ${label}\n\nHead: \`${identity.headSha}\`\nBase: \`${identity.baseBranch}@${identity.baseSha}\`\n\n${escapeProtocolMarkers(detail)}`;
 }
 
 export async function publishIntegrationFailure(
   github: FugueGitHub,
   identity: IntegrationPlan["identity"],
+  integration: IntegrationEvidenceIdentity,
   error: unknown,
 ): Promise<void> {
   const gateFailure = error instanceof IntegrationGateFailure;
@@ -203,18 +232,29 @@ export async function publishIntegrationFailure(
   const label = gateFailure ? "FAILED" : "ERROR";
   const detail = message(error);
   const safeDetail = escapeProtocolMarkers(detail);
-  const { owner, repo } = github.repository;
+  const record = await requireBoundIntegrationRecord(github, identity, integration);
 
-  let targetUrl: string | undefined;
+  await publishIntegrationRecord(github, {
+    ...record,
+    terminal: {
+      state,
+      detail,
+      created_at: new Date().toISOString(),
+    },
+    created_at: new Date().toISOString(),
+  });
+
+  const { owner, repo } = github.repository;
+  let targetUrl = record.run?.html_url;
   try {
     const comment = await createProtocolComment(
       github,
       identity.prNumber,
-      renderIntegrationFailureComment(identity, label, detail),
+      renderIntegrationFailureComment(identity, label, detail, integration),
     );
     targetUrl = comment.data.html_url;
   } catch {
-    // Preserve the original Integration failure even if evidence posting also fails.
+    // The durable record is primary terminal failure authority; the comment is presentation only.
   }
 
   await github.octokit.rest.repos.createCommitStatus({
@@ -228,30 +268,27 @@ export async function publishIntegrationFailure(
   });
 }
 
-export async function integrate(github: FugueGitHub, prNumber: number): Promise<IntegrationResult> {
-  let prepared: PreparedIntegration | null = null;
-  try {
-    const current = await prepareIntegration(github, prNumber);
-    prepared = current;
-    const rawValidation = await withCleanWorktree(current.plan.identity.headSha, (worktree) =>
-      runValidation(
-        worktree,
-        current.plan.validation.install,
-        current.plan.validation.checks,
-      ),
-    );
-    const validation = integrationValidationSchema.parse({
-      version: 1,
-      identity: current.plan.identity,
-      passed: true,
-      commands: rawValidation.commands,
-      created_at: new Date().toISOString(),
-    });
-    return await finalizeIntegration(github, current.plan, validation);
-  } catch (error) {
-    if (prepared) await publishIntegrationFailure(github, prepared.plan.identity, error);
-    throw error;
+/** Local integrate cannot mint canonical request/run identity; authoritative Integration is GitHub-hosted. */
+export async function integrate(_github: FugueGitHub, _prNumber: number): Promise<IntegrationResult> {
+  throw new Error(
+    "Authoritative Integration requires the protected GitHub-hosted workflow and a durable request/run binding; use local integrate only as a protocol-debugging surface.",
+  );
+}
+
+async function requireBoundIntegrationRecord(
+  github: FugueGitHub,
+  identity: IntegrationPlan["identity"],
+  integration: IntegrationEvidenceIdentity,
+) {
+  const record = await getCurrentIntegrationRecord(github, identity);
+  if (!record || record.terminal || !record.run) {
+    throw new Error(`Integration ${integration.request_id} has no active durable bound-run authority.`);
   }
+  if (record.request.request_id !== integration.request_id ||
+    record.run.id !== integration.run_id || record.run.attempt !== integration.run_attempt) {
+    throw new Error("Integration plan does not match the durable request/run authority.");
+  }
+  return record;
 }
 
 async function verifyPrerequisites(

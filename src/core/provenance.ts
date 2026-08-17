@@ -138,10 +138,7 @@ export async function isReusableProtocolComment(
   }
 }
 
-/**
- * Verify a stored canonical publication body independently of an ordinary issue comment. This is
- * used by the work-state status bundle so deleting the Human-facing comment cannot delete truth.
- */
+/** Verify a stored canonical publication body independently of an issue comment. */
 export async function verifyProtocolPublicationBodyAtRevision(
   github: FugueGitHub,
   body: string,
@@ -195,12 +192,21 @@ export async function assertRepositoryDefaultBranchRevision(
   }
 }
 
+/**
+ * Mint an OIDC-bound canonical body without publishing it. Callers that use this for durable
+ * authority MUST keep any commit capability redacted from all pre-commit transport and only reveal
+ * it in their final protected commit write.
+ */
+export async function signProtocolBody(github: FugueGitHub, body: string): Promise<string> {
+  return attachPublisherProof(github.repository.fullName, body);
+}
+
 export async function createProtocolComment(
   github: FugueGitHub,
   issueNumber: number,
   body: string,
 ): Promise<ProtocolCommentResponse> {
-  const signed = await attachPublisherProof(github.repository.fullName, body);
+  const signed = await signProtocolBody(github, body);
   const { owner, repo } = github.repository;
   const response = await github.octokit.rest.issues.createComment({
     owner,
@@ -223,7 +229,7 @@ export async function updateProtocolComment(
   commentId: number,
   body: string,
 ): Promise<ProtocolCommentResponse> {
-  const signed = await attachPublisherProof(github.repository.fullName, body);
+  const signed = await signProtocolBody(github, body);
   const { owner, repo } = github.repository;
   const response = await github.octokit.rest.issues.updateComment({
     owner,

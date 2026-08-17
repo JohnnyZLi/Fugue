@@ -13,23 +13,19 @@ Human ↔ Leader chat
           │
           ├─ creates/specs GitHub work
           ├─ tracks Worker claims/branches/PRs
-          ├─ decides when independent QA is required
           ├─ reads current CI/QA/Integration evidence
           └─ asks for a new disposable chat only when needed
 
-Worker chat ──────┐
-Code QA chat ─────┼──> GitHub durable state
-Security QA chat ─┤
-Visual QA chat ───┘
-                       │
-                       ▼
-              protected Fugue automation
-                       │
-                       ▼
-                 MERGE READY
-                       │
-                       ▼
-                  Human decision
+Worker / QA chats ──> GitHub durable state
+                           │
+                           ▼
+                  protected Fugue automation
+                           │
+                           ▼
+                     MERGE READY
+                           │
+                           ▼
+                      Human decision
 ```
 
 During normal work the Human should not need to run `fugue handoff`, `fugue review`, `fugue integrate`, copy SHAs/Worker IDs, manage branches, or relay verdicts between chats.
@@ -38,14 +34,13 @@ A typical cycle is:
 
 1. Tell the Leader what to build.
 2. The Leader prepares bounded GitHub work.
-3. Protected Fugue canonicalizes that exact Coordinator issue-event snapshot into signed work-state.
+3. Protected Fugue durably captures the exact authorized Coordinator issue-event snapshot and canonicalizes it into protected work-state.
 4. When required, the Leader gives one short Worker prompt to paste into a fresh ChatGPT chat.
 5. The Worker reconstructs from GitHub, implements on the assigned branch, and opens/updates the PR.
-6. Protected Fugue automation waits for exact-head CI, starts the required QA session, and updates the durable state dashboard.
-7. The Leader gives one short QA prompt when you check in.
-8. QA submits its verdict directly to GitHub; Fugue canonicalizes it against the current review session/identity.
-9. Fugue automatically runs Integration when prerequisites are current.
-10. The Leader asks for the final Human merge decision.
+6. Protected Fugue waits for exact-head CI and starts the required QA session.
+7. QA submits its verdict directly to GitHub; Fugue canonicalizes it against the current review session/identity.
+8. Fugue runs one protected Integration attempt for a signed durable request when prerequisites are current.
+9. The Leader asks for the final Human merge decision only after current durable Integration PASS.
 
 See [`docs/leader-chat.md`](docs/leader-chat.md) for the role contract and copy/paste prompts.
 
@@ -63,61 +58,48 @@ AGENTS.md
 .fugue/VERSION
     protocol / runtime compatibility
 
-Signed canonical fugue-work-state status bundle
+d3 durable work-state record on protected base
     authoritative work specification, lifecycle, dependencies/ownership,
     Worker claim, assigned branch, and PR linkage
 
-Canonical fugue-work-state issue comment
-    repairable Human-facing mirror of the signed bundle
+d3 durable Coordinator snapshot on protected base
+    immutable authorized Human issue-event contents before canonicalization
 
-GitHub issue body/labels + fugue-work metadata
-    Coordinator input and repairable presentation mirror only
+d3 durable Integration record on candidate head
+    exact request ID, one protected run ID / attempt 1, and terminal result
 
-GitHub PR body + fugue-pr metadata
-    repairable implementation-association mirror only
-
-PR comments + canonical Fugue attestations
-    signed review sessions, QA verdicts, Human acknowledgement,
-    Integration requests/results
+ordinary issue/PR/protocol comments
+    repairable Human-facing mirrors unless explicitly canonical QA/Human evidence
 
 commit statuses
-    cryptographically reconstructable work-state bundle chunks plus UI signals:
-    fugue/code-qa
-    fugue/security-qa
-    fugue/visual-qa
-    fugue/integration
+    d3 transport chunks plus UI/branch signals such as fugue/integration
 ```
 
-Canonical work-state authority does not use one fixed append-only status context. Protected Fugue signs the complete work-state body with GitHub OIDC, compresses that signed body into status chunks whose contexts are derived from a fresh secret, writes those data chunks first, and reveals the secret only in a manifest status written last. The secret makes future chunk contexts unpredictable while a transaction is being written. Readers take the earliest server-assigned status in each exact secret-derived context, reconstruct the body, and verify its OIDC proof, issue, base SHA, and signed timestamp. A candidate may append forged statuses after contexts become visible, exhaust old contexts, or publish arbitrary fake manifests, but those writes cannot replace an already-written protected chunk or prevent the next protected publication from using a fresh secret.
+### d3 authority commit
 
-The ordinary canonical work-state comment is not part of that authority chain. If it is deleted or tampered, scheduled protected reconciliation reconstructs the signed body from the status bundle and writes a new current comment mirror. Invalid or incomplete bundles are ignored rather than becoming a permanent newest-head poison, and replaying an older valid signed body cannot outrank a newer signed work-state timestamp.
+Candidate workflows may have `statuses:write`, so a status context or Actions-bot creator cannot be authority by itself. Fugue's d3 record makes the **authority commit** protected as well as the body:
 
-Canonical durable Fugue comments have one structural Fugue protocol marker and are content-bound using GitHub Actions OIDC proof to an approved Fugue workflow on the repository default branch at the required protected workflow revision. Historical work-state rollover additionally requires the proof's `workflow_sha` and the signed state's `base_sha` to equal the exact historical protected base being reused. The control-plane workflow checks out its immutable `github.workflow_sha`, reconciliation compares that SHA with freshly resolved current policy before mutation, and work-state publication verifies the just-minted OIDC proof against the exact base again before its manifest can commit. No process-wide cached default-branch SHA is authoritative.
+1. Protected Fugue chooses a fresh 128-bit bundle key and a separate 128-bit authority-commit nonce.
+2. The OIDC-signed canonical body covers both values.
+3. Every pre-commit status chunk contains a copy with both values redacted; data contexts are derived from the unrevealed key.
+4. The protected writer verifies current base/publisher identity again.
+5. Only the final manifest status reveals the exact key and nonce and therefore makes that signed body reconstructable.
 
-Candidate control-plane changes are proposed future policy. They do not weaken the protected-base rules or workflow code used to evaluate their own PR. Source-level changes to reconciliation, state/provenance, submissions/gates, repository discovery, and Integration trust runtime are classified as control-plane changes and therefore require the same explicit Human acknowledgement as workflow/policy changes.
+A candidate that observes or copies pre-commit statuses cannot finish an aborted prospective publication because it never learns the signed key/nonce. After a genuine commit, copying the body into a fresh candidate-chosen manifest does not work either: the signature binds the original manifest key and commit nonce. Readers use the earliest server-assigned status in each exact secret-derived data context, so later same-context writes cannot replace protected chunks.
 
-## Protected GitHub control plane
+### Bounded recovery
 
-`.github/workflows/fugue-control-plane.yml` is the always-available reconciliation runtime. It reacts to issue/PR/comment/CI events and also runs periodically as recovery. Each invocation reconstructs GitHub state and performs idempotent deterministic transitions; it has no workflow database.
+Fake manifests must not create unbounded read amplification. Normal reconstruction uses a protected post-commit locator comment. If that mirror is deleted or tampered, recovery processes fixed-size status pages, at most a fixed small number of manifests per invocation, and resolves their bounded chunk sets entirely from the already-loaded adjacent pages. A signed protected recovery cursor advances across finite hostile history over scheduled runs. Permanent status spam can delay recovery, but it cannot force unbounded per-read pagination, make an older state current, or require Human repository surgery.
 
-Coordinator issue edits are accepted only from the immutable GitHub Actions event payload for an authorized write/maintain/admin actor. Fugue does not authenticate an event and then fetch a later mutable issue body, so a candidate workflow cannot substitute different content between the Human event and canonicalization.
+The same durable-record primitive backs work-state, Coordinator snapshots, and Integration state. Ordinary locator/result comments can therefore be recreated after `issues:write` deletion.
 
-It automatically handles:
+## Protected Coordinator intent
 
-- ready-work allocation and Worker branch creation;
-- recoverable signed work-state bundle publication and comment/mirror repair;
-- Worker PR adoption;
-- central changed-file ownership enforcement;
-- exact-head CI gating before QA;
-- code-first QA sequencing;
-- current review-session creation;
-- QA/Human submission ingestion;
-- stale evidence after head/base/spec changes;
-- draft promotion;
-- GitHub-hosted Integration dispatch and recovery after cancelled/aborted runs;
-- one mutable issue state dashboard containing the current next action and copy/paste prompt.
+Coordinator intent is accepted only from the exact immutable GitHub Actions `issues` event payload for an authorized write/maintain/admin actor. Fugue does not authenticate one Human event and later fetch mutable issue contents.
 
-The PR event uses `pull_request_target` so control-plane code and write authority come from the protected base instead of the candidate PR. Canonical comments additionally carry an OIDC proof whose audience binds the exact comment body, whose `workflow_ref` binds the approved workflow path on the repository default branch, and whose `workflow_sha` is checked against the protected revision required for that evidence.
+GitHub Actions allows only one pending run per concurrency group, so issue-event runs do **not** share the repository-wide pending slot. Each authorized issue event has a run-specific non-replacing concurrency identity. The run commits its full event snapshot—title, body, labels, actor, action, and issue revision—to d3 durable authority before canonical work-state mutation. Scheduled reconciliation recovers and replays the latest protected issue revision. A crash after capture or deletion of the ordinary snapshot comment therefore does not erase the Human edit.
+
+Other control-plane event classes remain repository-serialized.
 
 ## Worker chats
 
@@ -132,7 +114,7 @@ and open or update the implementation PR. Do not merge or self-approve.
 Do not ask the Human to operate Fugue from the terminal.
 ```
 
-Fugue adopts the assigned-branch PR into signed canonical work-state and writes/repairs the PR's `fugue-pr` metadata as a presentation mirror. The Worker does not need to relay its result back to the Leader; GitHub is the handoff.
+Fugue adopts the assigned-branch PR into protected canonical work-state and repairs issue/PR metadata as presentation mirrors. The Worker does not need to relay its result back to the Leader; GitHub is the handoff.
 
 ## QA chats
 
@@ -147,135 +129,59 @@ Do not implement fixes. Submit the result directly to GitHub; do not ask
 the Human to use a terminal or relay the verdict.
 ```
 
-The QA chat submits a request, for example:
-
-```yaml
-<!-- fugue-review-submit
-version: 1
-session_id: rev-code-12345678
-role: code
-verdict: approved
-agents_update: not-required
-validation_control: acceptable
-summary: Exact-head review passed.
--->
-```
-
-Visual QA can add:
-
-```yaml
-runtime_tested: true
-viewports:
-  - 1440x900
-  - 390x844
-```
-
-The submission does **not** carry canonical head/base/policy identity. Protected Fugue automation finds the current review session, reconstructs the exact evaluation identity, validates role-specific evidence, verifies the submitting actor has repository write/maintain/admin permission, and writes the canonical signed attestation/status. Untrusted submission fields cannot contain Fugue protocol markers, and canonical publication refuses bodies with more than one protocol marker, so a rejection path cannot become a signing oracle. Malformed, stale, unauthorized, or conflicting submissions are durably rejected rather than silently reused.
-
-## Changes requested
-
-A current QA `changes_requested` verdict moves the work back to **NEEDS WORKER CHAT**. A replacement Worker chat reconstructs the same canonical Worker claim/branch/PR plus current QA findings. When the Worker pushes a new head, historical QA naturally becomes stale and the next current QA session is created after exact-head CI passes.
+QA submissions are requests, not canonical evidence. Protected Fugue verifies the actor, current session, and exact evaluation identity, then writes canonical QA evidence. A changed head/base/policy/spec makes old QA historical.
 
 ## Human control-plane acknowledgement
 
-Control-plane changes remain an explicit Human boundary. This includes source-level trust-runtime changes matched by `control_plane.paths`, not just workflow/policy file edits. The Leader explains the material protected-policy/runtime change and asks the Human whether they acknowledge the **current exact evaluation identity**. The Human only answers the decision; they do not copy SHAs, digests, or protocol fields.
+Control-plane changes remain an explicit Human boundary. `control_plane.paths` includes workflow/policy files **and** source-level trust runtime: CLI dispatch, validation, configuration, ownership, reconciliation, state/provenance, submissions/gates, repository discovery/authentication, evaluation/QA/review code, and Integration control.
 
-After approval, the Leader re-fetches the current evaluation from GitHub and posts an identity-bound request such as:
+The Human only decides whether to acknowledge the current exact evaluation identity. The Leader re-fetches the identity and submits the structured request through GitHub; the Human does not copy SHAs or run a terminal command.
 
-```yaml
-<!-- fugue-human-submit
-version: 1
-kind: control_plane_ack
-identity:
-  prNumber: 456
-  headSha: <current exact PR head>
-  baseBranch: main
-  baseSha: <current protected-base SHA>
-  policyDigest: <current protected policy digest>
-  protocolVersion: 1
-  issueNumber: 123
-  workId: work-123
-  workSpecDigest: <current work-spec digest>
--->
-```
-
-The request itself is not canonical acknowledgement evidence. Protected Fugue automation verifies the GitHub actor has repository write/maintain/admin permission and that every evaluation-identity field still matches the current PR. It then writes the workflow-bound canonical Human acknowledgement. A changed head, base, policy, protocol, issue/work identity, or work specification makes the old request stale rather than carrying approval forward.
-
-No terminal command is required in normal operation.
+Security-QA conditional coverage likewise includes direct trust primitives such as `src/cli.ts`, `src/core/validation.ts`, `src/core/config.ts`, `src/core/ownership.ts`, and `src/core/git.ts` in addition to the existing state/provenance/QA/CI/Integration modules.
 
 ## Required CI provenance
 
-Required CI is executed by the configured workflow from the protected base using `pull_request_target`, not by candidate-controlled PR workflow code. The protected workflow checks out the exact candidate head with only `contents: read`, no persisted checkout credential, and blank `GITHUB_TOKEN` / `GH_TOKEN` for candidate commands. Fugue accepts the required job only from the protected-base workflow run whose durable run name binds both the exact PR number and candidate head SHA. A candidate workflow file, arbitrary lookalike check/status, or run for another PR/head cannot satisfy the internal Fugue CI gate or gain a pre-gate write-capable durable-state path.
+Required CI is executed by the configured workflow from the protected base using `pull_request_target`, not by candidate-controlled PR workflow code. Candidate commands run from the exact head with read-only contents permission, no persisted checkout credential, and blank publication tokens. Fugue accepts the configured job only from the protected-base workflow run bound to the exact PR/head.
 
 ## GitHub-hosted Integration
 
 `.github/workflows/fugue-integration.yml` runs Integration from protected-base code after current required QA and Human acknowledgement are satisfied.
 
-The workflow separates authority:
+The durable lifecycle is:
 
 ```text
-PREPARE (write-capable trusted Fugue)
-    accept only the current signed durable Integration request
-    capture exact identity
-    verify base / ownership / QA / dependencies / policy evidence
-    verify trusted workflow/runtime SHA matches current protected base
-    publish integration pending UI/status signal
-    write immutable validation plan
+REQUEST
+    protected Fugue creates an unpredictable signed request ID
+    and commits it to the candidate head as a d3 Integration record
 
-VALIDATE (candidate checkout, read-only GitHub permission)
-    checkout exact prepared head
-    run protected-base install/check commands
-    blank GitHub publication tokens for candidate commands
-    never interpolate untrusted workflow inputs directly into shell program text
-    produce validation evidence
+FIRST PROTECTED RUN
+    exactly one causally valid workflow-run ID at attempt 1 may bind that request
+    prepare proves GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT match that first-run authority
 
-FINALIZE (write-capable trusted Fugue)
-    verify validation evidence matches the protected command plan
-    re-fetch exact identity
-    re-check prerequisites / CI / mergeability
-    reject drift
-    publish signed canonical Integration attestation + fugue/integration UI/status signal
+VALIDATE
+    candidate checkout is read-only and credential-separated
+    validation evidence carries the exact request ID + run ID + attempt 1
+
+TERMINAL
+    protected Fugue commits PASS/failure/error to the d3 Integration record first
+    then writes presentation attestation comment / fugue/integration status
 ```
 
-The candidate is never used as the source of the workflow code that judges it, and candidate validation does not receive Fugue publication authority.
+A later dispatch with the same request ID cannot replace the bound run. Re-running the same run ID cannot replace attempt 1. If a genuine first run completes `failure`, that failure is terminal even if it happened before the prepare runtime could write its normal binding mirror. It never becomes an automatic retry.
 
-Authoritative Integration state is reconstructed from the signed exact-identity Integration request, its causally later protected workflow run bound to both `request_id` and the expected PR input, and the signed Integration attestation. Fugue resolves **attempt 1** explicitly for a matching workflow-run ID; re-running that same ID cannot erase or replace a genuine first-attempt PASS/failure. A first attempt that was cancelled/aborted remains recoverable transport failure and the durable request becomes eligible for redispatch. `fugue/integration` remains the GitHub branch-protection/UI signal, but the shared Actions status context is not treated as durable Fugue truth by itself.
+Cancellation/abortion and deletion of a bound run are different: Fugue durably marks that request aborted, then recovery creates a **new request ID**. It never silently substitutes another workflow-run ID under the old request.
 
-## Repository bootstrap
-
-Fugue CLI is still used for one-time repository setup and status/protocol inspection.
-
-```bash
-git clone https://github.com/JohnnyZLi/Fugue.git
-cd Fugue
-npm ci
-npm run build
-npm link
-
-fugue init
-fugue status
-```
-
-`fugue init` provisions protocol labels and branch protection. Normal work after bootstrap is coordinated through the Leader/GitHub control plane.
-
-GitHub authentication lookup order remains:
-
-```text
-GITHUB_TOKEN
-GH_TOKEN
-gh auth token
-```
+Terminal PASS/failure is stored in the durable record and therefore survives deletion of the workflow run, request comment, Integration result/attestation comment, or UI status. A terminal PASS embeds the full Integration attestation plus exact request ID, run ID, and attempt 1. `fugue/integration` remains the branch-protection/UI signal; it is not durable authority by itself.
 
 ## Local CLI and recovery
 
-Local commands remain useful for bootstrap, status inspection, protocol development, and debugging. Canonical publication requires the protected GitHub workflow identity, so a local invocation using a Human/user token does **not** establish authoritative QA, acknowledgement, state, or Integration evidence.
+The CLI remains useful for bootstrap, status inspection, and protocol debugging. Authoritative publication requires protected GitHub workflow identity; a local Human/user token does not establish work-state, QA, acknowledgement, or Integration authority.
 
 ```bash
 fugue status
 fugue advance --dry-run
 
-# Protocol-development/debug surfaces; authoritative mutation/recovery
-# should be routed through the protected GitHub workflows.
+# Debug/bootstrap surfaces; protected workflows own authoritative mutation.
 fugue reconcile ...
 fugue run ...
 fugue handoff ...
@@ -285,11 +191,9 @@ fugue acknowledge ...
 fugue integrate ...
 ```
 
-The protected workflows are restart-safe because GitHub remains durable truth.
-
 ## Review identity
 
-QA and Integration evidence is tied to the exact evaluated state, including:
+QA and Integration evidence binds the exact evaluated state:
 
 ```text
 PR number
@@ -302,10 +206,25 @@ work ID
 work-spec digest
 ```
 
-A changed head, changed base, changed policy, or changed work specification makes older evidence historical rather than silently carrying approval forward.
+Integration additionally binds its exact request ID, protected workflow-run ID, and attempt 1.
+
+## Repository bootstrap
+
+```bash
+git clone https://github.com/JohnnyZLi/Fugue.git
+cd Fugue
+npm ci
+npm run build
+npm link
+
+fugue init
+fugue status
+```
+
+Normal work after bootstrap is coordinated through the Leader/GitHub control plane.
 
 ## First proving grounds
 
-Fugue now governs its own repository. [Path](https://github.com/JohnnyZLi/Path) remains the visual-product dogfood target for parallel work and artifact-backed Visual QA.
+Fugue governs its own repository. [Path](https://github.com/JohnnyZLi/Path) remains the visual-product dogfood target for parallel work and artifact-backed Visual QA.
 
 See [`docs/protocol-v0.1.md`](docs/protocol-v0.1.md), [`docs/chatgpt-project.md`](docs/chatgpt-project.md), and [`docs/leader-chat.md`](docs/leader-chat.md).

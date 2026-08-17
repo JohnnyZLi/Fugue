@@ -23,8 +23,10 @@ permissions:
   pull-requests: write
   statuses: write
 
+# Issue-event runs use a run-specific group so GitHub's single-pending replacement cannot discard
+# the only immutable Human event snapshot. Other event classes remain repository-serialized.
 concurrency:
-  group: fugue-control-plane-${{ github.repository }}
+  group: ${{ github.event_name == 'issues' && format('fugue-control-plane-issue-{0}', github.run_id) || format('fugue-control-plane-{0}', github.repository) }}
   cancel-in-progress: false
 
 jobs:

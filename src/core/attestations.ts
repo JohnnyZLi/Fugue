@@ -67,11 +67,18 @@ export const humanControlPlaneAttestationSchema = z.object({
 
 const qaGateSchema = z.enum(["passed", "not_required"]);
 
+export const integrationEvidenceIdentitySchema = z.object({
+  request_id: z.string().regex(/^int-[0-9a-f]{16}-[0-9a-f]{16}$/),
+  run_id: z.number().int().positive(),
+  run_attempt: z.literal(1),
+});
+
 export const integrationAttestationSchema = z.object({
   version: z.literal(1),
   kind: z.literal("integration"),
   attestation_id: z.string().min(1),
   identity: evaluationIdentitySchema,
+  integration: integrationEvidenceIdentitySchema,
   fugue_version: z.string().min(1),
   qa: z.object({
     code: qaGateSchema,
@@ -112,6 +119,7 @@ export type ReviewStart = z.infer<typeof reviewStartSchema>;
 export type QaAttestation = z.infer<typeof qaAttestationSchema>;
 export type HumanControlPlaneAttestation = z.infer<typeof humanControlPlaneAttestationSchema>;
 export type IntegrationAttestation = z.infer<typeof integrationAttestationSchema>;
+export type IntegrationEvidenceIdentity = z.infer<typeof integrationEvidenceIdentitySchema>;
 export type QaRole = z.infer<typeof qaRoleSchema>;
 export type FugueAttestation = ReviewStart | QaAttestation | HumanControlPlaneAttestation | IntegrationAttestation;
 
@@ -131,8 +139,6 @@ export function serializeAttestation(value: FugueAttestation): string {
 }
 
 export function parseAttestation(body: string): FugueAttestation | null {
-  // Canonical Fugue writers append the structured attestation after any human-readable
-  // narrative. Parse the trailing marker so user-controlled narrative cannot shadow it.
   const start = body.lastIndexOf(START);
   if (start < 0) return null;
   const end = body.indexOf(END, start + START.length);

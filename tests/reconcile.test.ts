@@ -1,103 +1,87 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { integrationAttestationSchema } from "../src/core/attestations.js";
 import type { EvaluationSnapshot } from "../src/core/evaluation.js";
 import type { FugueGitHub } from "../src/core/github.js";
-import { verifyDependenciesSatisfied } from "../src/core/gates.js";
 import {
+  createIntegrationRecord,
   createIntegrationRequest,
   integrationRunTitle,
-  serializeIntegrationRequest,
+  type IntegrationRecord,
 } from "../src/core/integration-plan.js";
 import {
+  bindIntegrationRun,
   currentIntegrationState,
+  ensureIntegrationDispatch,
   findIntegrationWorkflowRun,
-  INTEGRATION_REQUEST_RECOVERY_GRACE_MS,
+  getCurrentIntegrationRecord,
+  publishIntegrationRecord,
 } from "../src/core/integration-status.js";
 import { upsertWorkMetadata, workMetadataSchema } from "../src/core/metadata.js";
 import type { ActivePolicy } from "../src/core/policy.js";
-import { FUGUE_PROTOCOL_ACTOR } from "../src/core/provenance.js";
 import {
-  allocateWorker,
-  assertProtectedWorkflowRuntimeCurrent,
-  coordinatorIssueEventFromEnvironment,
-  dispatchIntegration,
-  ingestCoordinatorIssueEvent,
-} from "../src/core/reconcile.js";
-import { renderStateComment, upsertStateComment } from "../src/core/state-comment.js";
+  assertRepositoryDefaultBranchRevision,
+  FUGUE_PROTOCOL_ACTOR,
+  signProtocolBody,
+  verifyProtocolPublicationBodyAtRevision,
+} from "../src/core/provenance.js";
+import { ingestCoordinatorSnapshot, preserveCoordinatorIssueEvent } from "../src/core/reconcile.js";
 import {
   canonicalRequirements,
   createCanonicalWorkState,
-  encodeWorkStateBundle,
+  durableManifestContext,
   loadCurrentCanonicalWorkState,
-  loadReusableCanonicalWorkState,
   parseCanonicalWorkState,
   publishCanonicalWorkState,
-  repairCanonicalWorkStateComments,
-  serializeCanonicalWorkState,
+  recoverCoordinatorSnapshots,
+  recoverDurableProtocolRecord,
   type CanonicalWorkState,
-  type WorkState,
 } from "../src/core/state.js";
-import { planWork, type WorkflowObservation } from "../src/core/workflow.js";
 
 vi.mock("../src/core/provenance.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/core/provenance.js")>();
   return {
     ...actual,
-    isTrustedProtocolComment: vi.fn(async (_github: FugueGitHub, comment: { user?: { login?: string | null } | null }) =>
-      comment.user?.login === "github-actions[bot]"),
-    verifyProtocolPublicationBodyAtRevision: vi.fn(async (
-      _github: FugueGitHub,
-      body: string,
-      expectedSha: string,
-    ) => body.includes(`proof-sha:${expectedSha}`)),
-    readRepositoryDefaultBranchIdentity: vi.fn(async (github: FugueGitHub) => ({
-      branch: "main",
-      sha: (github as unknown as TestGitHub).__defaultSha ?? BASE,
-    })),
-    assertRepositoryDefaultBranchRevision: vi.fn(async (github: FugueGitHub, expectedSha: string) => {
-      const actualSha = (github as unknown as TestGitHub).__defaultSha ?? expectedSha;
-      if (actualSha !== expectedSha) throw new Error(`stale base ${actualSha}`);
+    assertRepositoryDefaultBranchRevision: vi.fn(async (github: FugueGitHub, expected: string) => {
+      const actualSha = (github as TestGithub).__baseSha ?? expected;
+      if (actualSha !== expected) throw new Error(`stale protected revision ${actualSha.slice(0, 8)}`);
     }),
-    createProtocolComment: vi.fn(async (github: FugueGitHub, issueNumber: number, body: string) => {
-      const publisherSha = (github as unknown as TestGitHub).__publisherSha ?? BASE;
-      const signed = `${body}\n\nproof-sha:${publisherSha}`;
-      const response = await github.octokit.rest.issues.createComment({
+    signProtocolBody: vi.fn(async (_github: FugueGitHub, body: string) =>
+      `${body}\n\n<!-- fugue-publisher-proof\nversion: 1\ntoken: test-proof\n-->`),
+    verifyProtocolPublicationBodyAtRevision: vi.fn(async (
+      github: FugueGitHub,
+      body: string,
+      expected: string,
+    ) => {
+      if (((github as TestGithub).__publisherSha ?? expected) !== expected) return false;
+      const key = body.match(/Fugue-Authority-Key: ([0-9a-f]{32})/i)?.[1];
+      const commit = body.match(/Fugue-Authority-Commit: ([0-9a-f]{32})/i)?.[1];
+      return Boolean(key && commit && !/^0+$/.test(key) && !/^0+$/.test(commit));
+    }),
+    isTrustedProtocolComment: vi.fn(async (_github: FugueGitHub, comment: TestComment) =>
+      comment.user?.login === "github-actions[bot]"),
+    createProtocolComment: vi.fn(async (github: FugueGitHub, issueNumber: number, body: string) =>
+      github.octokit.rest.issues.createComment({
         owner: github.repository.owner,
         repo: github.repository.repo,
         issue_number: issueNumber,
-        body: signed,
-      });
-      return {
-        data: {
-          id: response.data.id,
-          html_url: response.data.html_url,
-          body: response.data.body ?? signed,
-          created_at: response.data.created_at,
-        },
-      };
-    }),
-    updateProtocolComment: vi.fn(async (github: FugueGitHub, commentId: number, body: string) => {
-      const response = await github.octokit.rest.issues.updateComment({
+        body,
+      })),
+    updateProtocolComment: vi.fn(async (github: FugueGitHub, commentId: number, body: string) =>
+      github.octokit.rest.issues.updateComment({
         owner: github.repository.owner,
         repo: github.repository.repo,
         comment_id: commentId,
         body,
-      });
-      return { data: { id: response.data.id, html_url: response.data.html_url, body: response.data.body ?? body } };
-    }),
+      })),
   };
 });
 
 const BOT = { login: FUGUE_PROTOCOL_ACTOR, type: "Bot" } as const;
 const BASE = "b".repeat(40);
-const NEXT_BASE = "c".repeat(40);
-const OLD_BASE = "d".repeat(40);
 const HEAD = "a".repeat(40);
 
-function canonicalWork(createdAt = "2026-08-16T20:00:00.000Z", requirements = "## Outcome\nProtected truth"): CanonicalWorkState {
-  const metadata = workMetadataSchema.parse({
+function workMetadata(execution = true) {
+  return workMetadataSchema.parse({
     version: 1,
     work_id: "work-18",
     spec: {
@@ -106,70 +90,26 @@ function canonicalWork(createdAt = "2026-08-16T20:00:00.000Z", requirements = "#
       qa: { force: ["code"] },
       authorized_changes: { agents_invariants: [] },
     },
-    execution: { worker_id: "wkr-12345678", branch: "agent/18-chat-first" },
+    execution: execution ? { worker_id: "wkr-12345678", branch: "agent/18-chat-first" } : {},
   });
+}
+
+function canonicalWork(requirements = "## Outcome\nProtected truth", createdAt = "2026-08-17T03:00:00.000Z"): CanonicalWorkState {
   return createCanonicalWorkState({
     issue: 18,
     title: "Chat-first orchestration",
     state: "state:working",
     agentReady: true,
     requirements,
-    metadata,
+    metadata: workMetadata(),
     pr: {
       number: 21,
-      draft: true,
+      draft: false,
       metadata: { version: 1, work_id: "work-18", issue: 18, worker_id: "wkr-12345678", branch: "agent/18-chat-first" },
     },
     baseSha: BASE,
     createdAt,
   });
-}
-
-function work(): WorkState {
-  const canonical = canonicalWork();
-  return {
-    issueNumber: 18,
-    title: canonical.title,
-    url: "https://github.com/JohnnyZLi/Fugue/issues/18",
-    stateLabel: canonical.state,
-    agentReady: canonical.agent_ready,
-    metadata: canonical.metadata,
-    requirements: canonicalRequirements(canonical),
-    workSpecDigest: "sha256:spec",
-    pr: {
-      number: 21,
-      url: "https://github.com/JohnnyZLi/Fugue/pull/21",
-      headSha: HEAD,
-      headBranch: "agent/18-chat-first",
-      draft: true,
-      metadata: canonical.pr!.metadata,
-    },
-    drift: [],
-    presentationDrift: [],
-    canonical,
-  };
-}
-
-function readyWork(): WorkState {
-  const item = work();
-  const metadata = { ...item.metadata, execution: {} };
-  const canonical = createCanonicalWorkState({
-    issue: 18,
-    title: item.title,
-    state: "state:ready",
-    agentReady: true,
-    requirements: item.requirements,
-    metadata,
-    baseSha: BASE,
-  });
-  return { ...item, stateLabel: "state:ready", metadata, pr: null, canonical };
-}
-
-function policy(baseSha = BASE): ActivePolicy {
-  return {
-    identity: { baseBranch: "main", baseSha, policyDigest: "sha256:policy", protocolVersion: 1 },
-    config: { branches: { worker_pattern: "agent/{issue}-{slug}" } },
-  } as unknown as ActivePolicy;
 }
 
 function snapshot(): EvaluationSnapshot {
@@ -189,505 +129,356 @@ function snapshot(): EvaluationSnapshot {
   } as unknown as EvaluationSnapshot;
 }
 
-function observation(overrides: Partial<WorkflowObservation> = {}): WorkflowObservation {
+function policy(): ActivePolicy {
   return {
-    issueNumber: 18,
-    workId: "work-18",
-    stateLabel: "state:working",
-    workerClaimed: true,
-    hasPr: true,
-    prNumber: 21,
-    prDraft: true,
-    drift: [],
-    ownership: "passed",
-    ci: "success",
-    baseCurrent: true,
-    qa: [
-      { role: "code", state: "none", supersededSessions: 0 },
-      { role: "security", state: "none", supersededSessions: 0 },
-    ],
-    controlPlaneChanged: false,
-    humanControlPlaneAcknowledged: false,
-    integration: "none",
-    ...overrides,
-  };
+    identity: { baseBranch: "main", baseSha: BASE, policyDigest: "sha256:policy", protocolVersion: 1 },
+    config: { branches: { worker_pattern: "agent/{issue}-{slug}" } },
+  } as unknown as ActivePolicy;
 }
 
-describe("chat-first reconciliation planning", () => {
-  it("waits for CI and sequences Code QA before Security QA", () => {
-    expect(planWork(observation({ ci: "pending" }))).toEqual({ kind: "wait_ci", state: "pending" });
-    expect(planWork(observation())).toEqual({ kind: "start_qa", roles: ["code"] });
-    expect(planWork(observation({ qa: [
-      { role: "code", state: "approved", supersededSessions: 0 },
-      { role: "security", state: "none", supersededSessions: 0 },
-    ] }))).toEqual({ kind: "start_qa", roles: ["security"] });
+describe("d3 protected durable authority", () => {
+  it("does not expose an authority commit capability before the protected manifest write", async () => {
+    const github = makeGithub({ failManifestAlways: true });
+    await expect(publishCanonicalWorkState(github, canonicalWork())).rejects.toThrow(/Unable to commit/);
+    expect(github.__comments).toHaveLength(0);
+    expect(github.__statuses.some((status) => status.context.includes("/m/"))).toBe(false);
+
+    for (const [, signedInput] of vi.mocked(signProtocolBody).mock.calls) {
+      const key = signedInput.match(/Fugue-Authority-Key: ([0-9a-f]{32})/)?.[1];
+      const commit = signedInput.match(/Fugue-Authority-Commit: ([0-9a-f]{32})/)?.[1];
+      if (!key || !commit) continue;
+      expect(github.__statuses.some((status) => status.context.includes(key))).toBe(false);
+      expect(github.__statuses.some((status) => status.description.includes(commit))).toBe(false);
+    }
+
+    github.__statuses.push({
+      id: ++github.__nextStatusId,
+      sha: BASE,
+      context: durableManifestContext("work/18", "f".repeat(32)),
+      description: `n=1;d=${"1".repeat(64)};c=${"e".repeat(32)}`,
+    });
+    const recovered = await recoverDurableProtocolRecord(github, {
+      storageSha: BASE,
+      publisherSha: BASE,
+      scope: "work/18",
+      issueNumber: 18,
+      parse: parseCanonicalWorkState,
+      timestamp: (value) => Date.parse(value.created_at),
+    });
+    expect(recovered.record).toBeUndefined();
+    expect(recovered.exhausted).toBe(true);
+  });
+
+  it("requires exact publisher/base proof before any manifest becomes discoverable", async () => {
+    const github = makeGithub();
+    github.__publisherSha = "c".repeat(40);
+    await expect(publishCanonicalWorkState(github, canonicalWork())).rejects.toThrow(/publisher proof/);
+    expect(github.__statuses).toHaveLength(0);
+    vi.mocked(assertRepositoryDefaultBranchRevision).mockClear();
+    vi.mocked(verifyProtocolPublicationBodyAtRevision).mockClear();
+  });
+
+  it("abandons an exhausted transaction and retries under fresh unrevealed secrets", async () => {
+    const github = makeGithub({ failFirstManifest: true });
+    await expect(publishCanonicalWorkState(github, canonicalWork())).resolves.toBe(true);
+    expect(github.__statuses.filter((status) => status.context.includes("/m/"))).toHaveLength(1);
+    const dataContexts = github.__statuses.filter((status) => status.context.includes("/d/")).map((status) => status.context);
+    expect(new Set(dataContexts).size).toBeGreaterThan(1);
+  });
+
+  it("bounds fake-manifest and chunk reconstruction work per scheduled recovery slice", async () => {
+    const github = makeGithub();
+    for (let index = 0; index < 100; index += 1) {
+      const key = index.toString(16).padStart(32, "0");
+      github.__statuses.push({
+        id: ++github.__nextStatusId,
+        sha: BASE,
+        context: durableManifestContext("work/18", key),
+        description: `n=48;d=${"a".repeat(64)};c=${"b".repeat(32)}`,
+      });
+    }
+    github.__listStatus.mockClear();
+    vi.mocked(verifyProtocolPublicationBodyAtRevision).mockClear();
+    const first = await recoverDurableProtocolRecord(github, {
+      storageSha: BASE,
+      publisherSha: BASE,
+      scope: "work/18",
+      issueNumber: 18,
+      parse: parseCanonicalWorkState,
+      timestamp: (value) => Date.parse(value.created_at),
+    });
+    expect(first.exhausted).toBe(false);
+    expect(github.__listStatus).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(verifyProtocolPublicationBodyAtRevision)).not.toHaveBeenCalled();
+    expect(github.__comments.some((comment) => comment.body.includes("fugue-durable-recovery"))).toBe(true);
+  });
+
+  it("recovers the newest committed state after all ordinary state comments are destroyed", async () => {
+    const github = makeGithub();
+    await publishCanonicalWorkState(github, canonicalWork("older"));
+    await publishCanonicalWorkState(github, canonicalWork("newer", "2026-08-17T03:01:00.000Z"));
+    github.__comments.splice(0);
+    const recovered = await loadCurrentCanonicalWorkState(github, 18, BASE);
+    expect(canonicalRequirements(recovered!)).toBe("newer");
+    expect(github.__comments.some((comment) => comment.body.includes("work-d3"))).toBe(true);
   });
 });
 
-describe("recoverable canonical work-state authority", () => {
-  it("ignores forged fixed-head poison and later same-context appends around a valid secret bundle", async () => {
-    const state = canonicalWork();
-    const fixture = bundleFixture(state, "01".repeat(16), 100);
-    const firstData = fixture.statuses[0]!;
-    const statuses: TestStatus[] = [
-      { id: 1, sha: BASE, context: "fugue/work-state/18", description: "forged newest head" },
-      firstData,
-      { id: firstData.id + 1, sha: BASE, context: firstData.context, description: "attacker interleaved later chunk" },
-      ...fixture.statuses.slice(1),
-      { id: 9999, sha: BASE, context: "fugue/work-state-stage/18", description: "exhausted legacy context" },
-    ];
-    const github = makeStatusGithub([], statuses);
-    await expect(loadCurrentCanonicalWorkState(github, 18, BASE)).resolves.toMatchObject({
-      issue: 18,
-      requirements_b64: state.requirements_b64,
-    });
-  });
-
-  it("does not let replayed older valid bundles roll back a newer signed state", async () => {
-    const older = bundleFixture(canonicalWork("2026-08-16T20:00:00.000Z", "old"), "02".repeat(16), 10);
-    const newer = bundleFixture(canonicalWork("2026-08-16T21:00:00.000Z", "new"), "03".repeat(16), 100);
-    const replay = rebundleFixture(older.body, 18, BASE, "04".repeat(16), 1000);
-    const github = makeStatusGithub([], [...older.statuses, ...newer.statuses, ...replay]);
-    const current = await loadCurrentCanonicalWorkState(github, 18, BASE);
-    expect(canonicalRequirements(current!)).toBe("new");
-  });
-
-  it("recovers from a validation/exhaustion failure by abandoning the partial bundle and using a fresh secret", async () => {
-    const github = makeStatusGithub([], [], { failFirstManifest: true });
-    await expect(publishCanonicalWorkState(github, canonicalWork())).resolves.toBe(true);
-    const manifests = githubTestStatuses(github).filter((status) => status.context.includes("/m/"));
-    expect(manifests).toHaveLength(1);
-    expect(githubTestStatuses(github).some((status) => status.context === "fugue/work-state/18")).toBe(false);
-    await expect(loadCurrentCanonicalWorkState(github, 18, BASE)).resolves.toMatchObject({ issue: 18 });
-  });
-
-  it("reconstructs authority after all canonical comments are deleted and recreates the mirror", async () => {
-    const fixture = bundleFixture(canonicalWork(), "05".repeat(16), 10);
-    const github = makeStatusGithub([], fixture.statuses, {
-      issues: [{ number: 18, pull_request: undefined }],
-    });
-    await expect(loadCurrentCanonicalWorkState(github, 18, BASE)).resolves.toMatchObject({ issue: 18 });
-    await expect(repairCanonicalWorkStateComments(github, policy())).resolves.toEqual([18]);
-    expect(githubTestComments(github)).toHaveLength(1);
-    expect(parseCanonicalWorkState(githubTestComments(github)[0]!.body)?.issue).toBe(18);
-  });
-
-  it("ignores invalid poison bundles and finds the nearest exact-base historical signed state", async () => {
-    const historicalState = createCanonicalWorkState({
-      ...workStateInput(canonicalWork()),
-      baseSha: OLD_BASE,
-      createdAt: "2026-08-15T20:00:00.000Z",
-    });
-    const valid = bundleFixture(historicalState, "06".repeat(16), 50, OLD_BASE);
-    const poison = rebundleFixture(valid.body.replace(`proof-sha:${OLD_BASE}`, `proof-sha:${BASE}`), 18, OLD_BASE, "07".repeat(16), 500);
-    const github = makeStatusGithub([], [...valid.statuses, ...poison], { commits: [NEXT_BASE, BASE, OLD_BASE] });
-    await expect(loadReusableCanonicalWorkState(github, 18, NEXT_BASE, "main")).resolves.toMatchObject({
-      issue: 18,
-      base_sha: OLD_BASE,
-    });
-  });
-
-  it("verifies the publisher/base identity before committing any discoverable manifest", async () => {
-    const github = makeStatusGithub([], []);
-    github.__publisherSha = OLD_BASE;
-    await expect(publishCanonicalWorkState(github, canonicalWork())).rejects.toThrow(/publisher proof/);
-    expect(githubTestStatuses(github)).toHaveLength(0);
-  });
-
-  it("rejects a stale protected workflow runtime before mutation", () => {
-    expect(() => assertProtectedWorkflowRuntimeCurrent(policy(BASE), OLD_BASE)).toThrow(/Stale protected Fugue invocation/);
-    expect(() => assertProtectedWorkflowRuntimeCurrent(policy(BASE), BASE)).not.toThrow();
-  });
-
-  it("canonicalizes the authorized issue-event snapshot rather than a later mutable issue body", async () => {
-    const original = bundleFixture(canonicalWork(), "08".repeat(16), 10);
-    const attackerMetadata = workMetadataSchema.parse({
-      ...original.state.metadata,
-      spec: { ...original.state.metadata.spec, dependencies: [99] },
-      execution: { worker_id: "wkr-attacker", branch: "agent/18-attacker" },
-    });
-    const snapshotBody = upsertWorkMetadata("Coordinator-approved", attackerMetadata);
-    const issueGet = vi.fn(async () => ({ data: { title: "later attacker body" } }));
-    const github = makeStatusGithub([], original.statuses, { issueGet });
-    await expect(ingestCoordinatorIssueEvent(github, policy(), {
+describe("Coordinator event durability", () => {
+  it("recovers an authorized immutable Human snapshot after its ordinary snapshot comment is deleted", async () => {
+    const github = makeGithub();
+    const body = upsertWorkMetadata("## Outcome\nHuman-approved snapshot", workMetadata(false));
+    await expect(preserveCoordinatorIssueEvent(github, policy(), {
       eventName: "issues",
       action: "edited",
       actor: "JohnnyZLi",
+      eventId: "event-1",
       issueNumber: 18,
-      issueTitle: "Coordinator snapshot",
-      issueBody: snapshotBody,
+      issueTitle: "Approved title",
+      issueBody: body,
       issueLabels: ["state:working", "agent:ready"],
+      issueUpdatedAt: "2026-08-17T03:05:00.000Z",
+      issueIsPullRequest: false,
     })).resolves.toBe(true);
-    expect(issueGet).not.toHaveBeenCalled();
+    github.__comments.splice(0);
+
+    const snapshots = await recoverCoordinatorSnapshots(github, policy());
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]).toMatchObject({ event_id: "event-1", title: "Approved title", body });
+    await ingestCoordinatorSnapshot(github, policy(), snapshots[0]!);
     const current = await loadCurrentCanonicalWorkState(github, 18, BASE);
-    expect(current?.title).toBe("Coordinator snapshot");
-    expect(current?.metadata.spec.dependencies).toEqual([99]);
-    expect(current?.metadata.execution).toEqual(original.state.metadata.execution);
-  });
-
-  it("reads Coordinator identity and contents from GITHUB_EVENT_PATH", () => {
-    const dir = mkdtempSync(join(tmpdir(), "fugue-event-"));
-    const path = join(dir, "event.json");
-    const oldName = process.env.GITHUB_EVENT_NAME;
-    const oldPath = process.env.GITHUB_EVENT_PATH;
-    try {
-      writeFileSync(path, JSON.stringify({
-        action: "edited",
-        sender: { login: "JohnnyZLi" },
-        issue: {
-          number: 18,
-          title: "Event snapshot title",
-          body: "Event snapshot body",
-          labels: [{ name: "state:working" }, { name: "agent:ready" }],
-        },
-      }));
-      process.env.GITHUB_EVENT_NAME = "issues";
-      process.env.GITHUB_EVENT_PATH = path;
-      expect(coordinatorIssueEventFromEnvironment()).toMatchObject({
-        eventName: "issues",
-        actor: "JohnnyZLi",
-        issueTitle: "Event snapshot title",
-        issueBody: "Event snapshot body",
-      });
-    } finally {
-      if (oldName === undefined) delete process.env.GITHUB_EVENT_NAME;
-      else process.env.GITHUB_EVENT_NAME = oldName;
-      if (oldPath === undefined) delete process.env.GITHUB_EVENT_PATH;
-      else process.env.GITHUB_EVENT_PATH = oldPath;
-      rmSync(dir, { recursive: true, force: true });
-    }
+    expect(current?.title).toBe("Approved title");
+    expect(canonicalRequirements(current!)).toContain("Human-approved snapshot");
   });
 });
 
-describe("dependency and Worker recovery", () => {
-  it("requires canonical merged dependency linkage", async () => {
-    const metadata = workMetadataSchema.parse({
-      version: 1,
-      work_id: "work-99",
-      spec: {},
-      execution: { worker_id: "wkr-dependency", branch: "agent/99-dependency" },
-    });
-    const dependency = createCanonicalWorkState({
-      issue: 99,
-      title: "Dependency",
-      state: "state:working",
-      agentReady: true,
-      requirements: "Dependency",
-      metadata,
-      pr: {
-        number: 50,
-        draft: false,
-        metadata: { version: 1, work_id: "work-99", issue: 99, worker_id: "wkr-dependency", branch: "agent/99-dependency" },
-      },
-      baseSha: BASE,
-      createdAt: "2026-08-16T19:00:00.000Z",
-    });
-    const fixture = bundleFixture(dependency, "09".repeat(16), 10);
-    const pullGet = vi.fn(async () => ({ data: { merged: false, head: { ref: "agent/99-dependency" } } }));
-    const github = makeStatusGithub([], fixture.statuses, { pullGet });
-    await expect(verifyDependenciesSatisfied(github, [99], BASE)).rejects.toThrow(/not merged/);
+describe("durable Integration one-request/one-run/result authority", () => {
+  it("binds a request to the earliest causally valid attempt-1 run and rejects later replacements", async () => {
+    const github = makeGithub();
+    const request = createIntegrationRequest(snapshot().identity, "2026-08-17T03:20:00.000Z", "0123456789abcdef");
+    await publishIntegrationRecord(github, createIntegrationRecord(request));
+    github.__runs.push(run(request, 101, "2026-08-17T03:20:01.000Z", "in_progress", null));
+    github.__runs.push(run(request, 102, "2026-08-17T03:20:02.000Z", "queued", null));
+    await expect(findIntegrationWorkflowRun(github, request)).resolves.toMatchObject({ id: 101, attempt: 1 });
+    const bound = await bindIntegrationRun(github, snapshot(), request.request_id, 101);
+    expect(bound.run?.id).toBe(101);
+    await expect(bindIntegrationRun(github, snapshot(), request.request_id, 102)).rejects.toThrow(/already bound/);
   });
 
-  it("can retry Worker allocation after branch creation succeeds before canonical publication", async () => {
-    const item = readyWork();
-    let branchSha: string | null = null;
-    const github = makeStatusGithub([], []);
-    let failOnce = true;
-    const originalCreate = github.octokit.rest.issues.createComment;
-    github.octokit.rest.issues.createComment = vi.fn(async (...args: Parameters<typeof originalCreate>) => {
-      if (failOnce) {
-        failOnce = false;
-        throw new Error("simulated publication crash");
-      }
-      return originalCreate(...args);
-    }) as typeof originalCreate;
-    github.octokit.rest.git.getRef = vi.fn(async () => {
-      if (!branchSha) throw Object.assign(new Error("Not Found"), { status: 404 });
-      return { data: { object: { sha: branchSha } } } as never;
+  it("preserves terminal PASS after request/result comments and the bound workflow run are deleted", async () => {
+    const github = makeGithub();
+    const record = await publishBoundRecord(github, 201);
+    const attestation = integrationAttestation(record);
+    await publishIntegrationRecord(github, {
+      ...record,
+      terminal: { state: "success", attestation, created_at: "2026-08-17T03:30:05.000Z" },
+      created_at: "2026-08-17T03:30:05.000Z",
     });
-    github.octokit.rest.git.createRef = vi.fn(async (args) => {
-      branchSha = args.sha;
-      return { data: {} } as never;
+    github.__comments.splice(0);
+    github.__runs.splice(0);
+    github.__attempts.clear();
+    const state = await settleIntegrationState(github);
+    expect(state.state).toBe("success");
+    expect(state.attestation?.integration).toEqual({ request_id: record.request.request_id, run_id: 201, run_attempt: 1 });
+  });
+
+  it("preserves terminal failure and never silently converts it into retry", async () => {
+    const github = makeGithub();
+    const record = await publishBoundRecord(github, 301);
+    await publishIntegrationRecord(github, {
+      ...record,
+      terminal: { state: "failure", detail: "protected gate failed", created_at: "2026-08-17T03:40:05.000Z" },
+      created_at: "2026-08-17T03:40:05.000Z",
     });
-    await expect(allocateWorker(github, policy(), item)).rejects.toThrow(/publication crash/);
-    await expect(allocateWorker(github, policy(), item)).resolves.toBeUndefined();
-    expect(github.octokit.rest.git.createRef).toHaveBeenCalledTimes(1);
+    github.__comments.splice(0);
+    github.__runs.push(run(record.request, 999, "2026-08-17T03:41:00.000Z", "completed", "success"));
+    github.__attempts.clear();
+    expect((await settleIntegrationState(github)).state).toBe("failure");
+    const dispatch = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:00:00Z"));
+    expect(dispatch.dispatch).toBe(false);
+    expect(dispatch.request?.request_id).toBe(record.request.request_id);
+  });
+
+  it("aborts a deleted bound run and creates a fresh request instead of substituting a later same-request run", async () => {
+    const github = makeGithub();
+    const bound = await publishBoundRecord(github, 401);
+    github.__runs.push(run(bound.request, 999, "2026-08-17T03:50:10.000Z", "queued", null));
+    github.__attempts.clear();
+    const next = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:10:00Z"));
+    expect(next.dispatch).toBe(true);
+    expect(next.request?.request_id).not.toBe(bound.request.request_id);
+    const current = await getCurrentIntegrationRecord(github, snapshot().identity);
+    expect(current?.request.request_id).toBe(next.request?.request_id);
+    expect(current?.run).toBeNull();
   });
 });
 
-describe("Integration request/run causality and attempt preservation", () => {
-  it("ignores exact same-request preplay before the durable request", async () => {
-    const request = createIntegrationRequest(snapshot().identity, "2026-08-16T20:00:10.000Z", "0123456789abcdef");
-    const github = integrationGithub([], [{
-      id: 1,
-      display_title: integrationRunTitle(request.request_id, 21),
-      created_at: "2026-08-16T20:00:09.000Z",
-      run_attempt: 1,
-      status: "completed",
-      conclusion: "failure",
-      html_url: "https://example.test/preplay",
-    }]);
-    await expect(findIntegrationWorkflowRun(github, request)).resolves.toBeUndefined();
-  });
-
-  it("preserves genuine attempt-1 PASS when the same run ID is re-run and cancelled", async () => {
-    const request = createIntegrationRequest(snapshot().identity, "2026-08-16T20:00:10.000Z", "0123456789abcdef");
-    const current = runRecord(request, { id: 77, run_attempt: 2, conclusion: "cancelled" });
-    const first = runRecord(request, { id: 77, run_attempt: 1, conclusion: "success" });
-    const github = integrationGithub([], [current], new Map([[77, first]]));
-    await expect(findIntegrationWorkflowRun(github, request)).resolves.toMatchObject({
-      conclusion: "success",
-      htmlUrl: first.html_url,
-    });
-    expect(github.octokit.rest.actions.getWorkflowRunAttempt).toHaveBeenCalledWith(expect.objectContaining({
-      run_id: 77,
-      attempt_number: 1,
-    }));
-  });
-
-  it("preserves genuine attempt-1 failure across a same-run rerun and does not redispatch", async () => {
-    const request = createIntegrationRequest(snapshot().identity, "2026-08-16T20:00:10.000Z", "0123456789abcdef");
-    const comments: ProtocolComment[] = [{ id: 1, body: serializeIntegrationRequest(request), user: BOT }];
-    const current = runRecord(request, { id: 88, run_attempt: 3, conclusion: "cancelled" });
-    const first = runRecord(request, { id: 88, run_attempt: 1, conclusion: "failure" });
-    const dispatch = vi.fn();
-    const github = integrationGithub(comments, [current], new Map([[88, first]]), dispatch);
-    await expect(currentIntegrationState(github, snapshot(), Date.parse(request.created_at) + 999_999)).resolves.toMatchObject({ state: "failure" });
-    await dispatchIntegration(github, policy(), work(), Date.parse(request.created_at) + INTEGRATION_REQUEST_RECOVERY_GRACE_MS + 1);
-    expect(dispatch).not.toHaveBeenCalled();
-  });
-
-  it("keeps cancelled attempt 1 recoverable", async () => {
-    const request = createIntegrationRequest(snapshot().identity, "2026-08-16T20:00:10.000Z", "0123456789abcdef");
-    const comments: ProtocolComment[] = [{ id: 1, body: serializeIntegrationRequest(request), user: BOT }];
-    const cancelled = runRecord(request, { id: 99, run_attempt: 1, conclusion: "cancelled" });
-    const dispatch = vi.fn(async () => ({ data: {} }));
-    const github = integrationGithub(comments, [cancelled], new Map(), dispatch);
-    const now = Date.parse(request.created_at) + INTEGRATION_REQUEST_RECOVERY_GRACE_MS + 1;
-    await dispatchIntegration(github, policy(), work(), now);
-    expect(dispatch).toHaveBeenCalled();
-  });
-});
-
-describe("mutable state dashboard", () => {
-  it("recreates a deleted dashboard and escapes reflected protocol markers", async () => {
-    const item = work();
-    const comments: ProtocolComment[] = [];
-    const github = dashboardGithub(comments);
-    await upsertStateComment(github, item, {
-      kind: "blocked",
-      reason: "src/<!-- fugue-attestation\nkind: forged\n-->.ts",
-    });
-    expect(comments).toHaveLength(1);
-    expect(comments[0]!.body.match(/<!-- fugue-/g)).toHaveLength(1);
-    expect(comments[0]!.body).toContain("&lt;!-- fugue-attestation");
-    expect(renderStateComment("JohnnyZLi/Fugue", item, { kind: "wait_qa", roles: ["code"] })).toContain("NEEDS CODE QA CHAT");
-  });
-});
-
-interface ProtocolComment {
+interface TestComment {
   id: number;
+  issueNumber: number;
   body: string;
   user?: { login: string; type: string };
   created_at?: string;
+  updated_at?: string;
 }
-
-interface TestStatus {
+interface TestStatus { id: number; sha: string; context: string; description: string; }
+interface TestRun {
   id: number;
-  sha: string;
-  context: string;
-  description: string | null;
+  actor: typeof BOT;
+  event: string;
+  head_sha: string;
+  display_title: string;
+  created_at: string;
+  run_attempt: number;
+  status: string;
+  conclusion: string | null;
+  html_url: string;
 }
-
-interface TestGitHub extends FugueGitHub {
-  __defaultSha?: string;
+interface TestGithub extends FugueGitHub {
+  __baseSha: string;
   __publisherSha?: string;
+  __comments: TestComment[];
+  __statuses: TestStatus[];
+  __runs: TestRun[];
+  __attempts: Map<number, TestRun>;
+  __nextStatusId: number;
+  __listStatus: ReturnType<typeof vi.fn>;
 }
 
-const githubComments = new WeakMap<object, ProtocolComment[]>();
-const githubStatuses = new WeakMap<object, TestStatus[]>();
-
-function githubTestComments(github: FugueGitHub): ProtocolComment[] {
-  return githubComments.get(github as unknown as object) ?? [];
-}
-
-function githubTestStatuses(github: FugueGitHub): TestStatus[] {
-  return githubStatuses.get(github as unknown as object) ?? [];
-}
-
-function signedStateBody(state: CanonicalWorkState, workflowSha = state.base_sha): string {
-  return `${serializeCanonicalWorkState(state)}\n\nFUGUE WORK STATE — CANONICAL\n\nproof-sha:${workflowSha}`;
-}
-
-function bundleFixture(
-  state: CanonicalWorkState,
-  key: string,
-  startId: number,
-  workflowSha = state.base_sha,
-): { state: CanonicalWorkState; body: string; statuses: TestStatus[] } {
-  const body = signedStateBody(state, workflowSha);
-  return { state, body, statuses: rebundleFixture(body, state.issue, state.base_sha, key, startId) };
-}
-
-function rebundleFixture(body: string, issue: number, sha: string, key: string, startId: number): TestStatus[] {
-  const bundle = encodeWorkStateBundle(issue, key, body);
-  const statuses = bundle.data.map((record, index) => ({
-    id: startId + index,
-    sha,
-    context: record.context,
-    description: record.description,
-  }));
-  statuses.push({
-    id: startId + bundle.data.length + 1,
-    sha,
-    context: bundle.manifest.context,
-    description: bundle.manifest.description,
-  });
-  return statuses;
-}
-
-function workStateInput(state: CanonicalWorkState) {
-  return {
-    issue: state.issue,
-    title: state.title,
-    state: state.state,
-    agentReady: state.agent_ready,
-    requirements: canonicalRequirements(state),
-    metadata: state.metadata,
-    pr: state.pr,
-    baseSha: state.base_sha,
-  };
-}
-
-function makeStatusGithub(
-  comments: ProtocolComment[],
-  statuses: TestStatus[],
-  options: {
-    commits?: string[];
-    issues?: Array<Record<string, unknown>>;
-    issueGet?: ReturnType<typeof vi.fn>;
-    pullGet?: ReturnType<typeof vi.fn>;
-    failFirstManifest?: boolean;
-  } = {},
-): TestGitHub {
-  const listCommitStatusesForRef = vi.fn();
-  const listCommits = vi.fn();
-  const listComments = vi.fn();
-  const listForRepo = vi.fn();
-  let nextCommentId = Math.max(0, ...comments.map((comment) => comment.id)) + 1;
-  let nextStatusId = Math.max(0, ...statuses.map((status) => status.id)) + 1;
+function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?: boolean } = {}): TestGithub {
+  const comments: TestComment[] = [];
+  const statuses: TestStatus[] = [];
+  const runs: TestRun[] = [];
+  const attempts = new Map<number, TestRun>();
+  let nextCommentId = 0;
+  let nextStatusId = 0;
   let failedManifest = false;
-  const createComment = vi.fn(async (args: { body: string }) => {
-    const comment = { id: nextCommentId++, body: args.body, user: BOT, created_at: new Date().toISOString() };
-    comments.push(comment);
-    return { data: { id: comment.id, body: comment.body, created_at: comment.created_at, html_url: `https://example.test/comment/${comment.id}` } };
+  const listForRepo = vi.fn();
+  const listCommits = vi.fn();
+  const listCommitStatusesForRef = vi.fn(async (args: { ref: string; page?: number; per_page?: number }) => {
+    const perPage = args.per_page ?? 100;
+    const page = args.page ?? 1;
+    const filtered = statuses.filter((status) => status.sha === args.ref).sort((a, b) => b.id - a.id);
+    return { data: filtered.slice((page - 1) * perPage, page * perPage) };
   });
-  const createCommitStatus = vi.fn(async (args: { sha: string; context: string; description?: string | null }) => {
-    if (options.failFirstManifest && !failedManifest && args.context.includes("/m/")) {
-      failedManifest = true;
-      throw Object.assign(new Error("context exhausted"), { status: 422 });
-    }
-    const status = { id: nextStatusId++, sha: args.sha, context: args.context, description: args.description ?? null };
-    statuses.push(status);
-    return { data: status };
+  const listComments = vi.fn(async (args: { issue_number: number; page?: number; per_page?: number }) => {
+    const perPage = args.per_page ?? 100;
+    const page = args.page ?? 1;
+    const filtered = comments.filter((comment) => comment.issueNumber === args.issue_number).sort((a, b) => a.id - b.id);
+    return { data: filtered.slice((page - 1) * perPage, page * perPage) };
   });
-  const github = {
+
+  return {
     repository: { owner: "JohnnyZLi", repo: "Fugue", fullName: "JohnnyZLi/Fugue" },
+    __baseSha: BASE,
+    __comments: comments,
+    __statuses: statuses,
+    __runs: runs,
+    __attempts: attempts,
+    get __nextStatusId() { return nextStatusId; },
+    set __nextStatusId(value: number) { nextStatusId = value; },
+    __listStatus: listCommitStatusesForRef,
     octokit: {
-      paginate: vi.fn(async (fn: unknown, args: { ref?: string }) => {
-        if (fn === listCommitStatusesForRef) return statuses.filter((status) => status.sha === args.ref);
-        if (fn === listCommits) return (options.commits ?? [BASE]).map((sha) => ({ sha }));
-        if (fn === listComments) return comments;
-        if (fn === listForRepo) return options.issues ?? [];
+      paginate: vi.fn(async (fn: unknown) => {
+        if (fn === listForRepo) return [{ number: 18, pull_request: undefined, state: "open", labels: [], body: "", title: "Issue", html_url: "https://example.test/issues/18" }];
+        if (fn === listCommits) return [{ sha: BASE }];
         return [];
       }),
       rest: {
         issues: {
+          get: vi.fn(async (args: { issue_number: number }) => ({ data: { comments: comments.filter((comment) => comment.issueNumber === args.issue_number).length } })),
           listComments,
+          createComment: vi.fn(async (args: { issue_number: number; body: string }) => {
+            const comment: TestComment = { id: ++nextCommentId, issueNumber: args.issue_number, body: args.body, user: BOT, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+            comments.push(comment);
+            return { data: { id: comment.id, body: comment.body, html_url: `https://example.test/comment/${comment.id}`, created_at: comment.created_at } };
+          }),
+          updateComment: vi.fn(async (args: { comment_id: number; body: string }) => {
+            const comment = comments.find((item) => item.id === args.comment_id);
+            if (!comment) throw Object.assign(new Error("Not Found"), { status: 404 });
+            comment.body = args.body;
+            comment.updated_at = new Date().toISOString();
+            return { data: { id: comment.id, body: comment.body, html_url: `https://example.test/comment/${comment.id}`, created_at: comment.created_at } };
+          }),
+          deleteComment: vi.fn(async (args: { comment_id: number }) => {
+            const index = comments.findIndex((item) => item.id === args.comment_id);
+            if (index >= 0) comments.splice(index, 1);
+            return { data: {} };
+          }),
           listForRepo,
-          createComment,
-          updateComment: vi.fn(),
-          get: options.issueGet ?? vi.fn(),
+          update: vi.fn(async () => ({ data: {} })),
         },
         repos: {
+          createCommitStatus: vi.fn(async (args: { sha: string; context: string; description?: string }) => {
+            if (args.context.includes("/m/") && (options.failManifestAlways || (options.failFirstManifest && !failedManifest))) {
+              failedManifest = true;
+              throw Object.assign(new Error("status context exhausted"), { status: 422 });
+            }
+            const status = { id: ++nextStatusId, sha: args.sha, context: args.context, description: args.description ?? "" };
+            statuses.push(status);
+            return { data: status };
+          }),
           listCommitStatusesForRef,
-          listCommits,
-          createCommitStatus,
           getCollaboratorPermissionLevel: vi.fn(async () => ({ data: { permission: "admin" } })),
+          listCommits,
         },
-        pulls: { get: options.pullGet ?? vi.fn() },
-        git: { getRef: vi.fn(), createRef: vi.fn() },
+        actions: {
+          listWorkflowRuns: vi.fn(async () => ({ data: { workflow_runs: runs } })),
+          getWorkflowRunAttempt: vi.fn(async (args: { run_id: number; attempt_number: number }) => {
+            const item = attempts.get(args.run_id);
+            if (!item || args.attempt_number !== 1) throw Object.assign(new Error("Not Found"), { status: 404 });
+            return { data: item };
+          }),
+          createWorkflowDispatch: vi.fn(async () => ({ data: {} })),
+        },
+        git: { getRef: vi.fn(async () => ({ data: { object: { sha: BASE } } })), createRef: vi.fn(async () => ({ data: {} })) },
+        pulls: { get: vi.fn() },
       },
     },
-    __defaultSha: BASE,
-    __publisherSha: BASE,
-  } as unknown as TestGitHub;
-  githubComments.set(github as unknown as object, comments);
-  githubStatuses.set(github as unknown as object, statuses);
-  return github;
+  } as unknown as TestGithub;
 }
 
-function runRecord(request: ReturnType<typeof createIntegrationRequest>, overrides: Record<string, unknown>) {
+function run(request: ReturnType<typeof createIntegrationRequest>, id: number, createdAt: string, status: string, conclusion: string | null): TestRun {
   return {
-    id: 1,
-    actor: BOT,
-    event: "workflow_dispatch",
-    head_sha: BASE,
-    display_title: integrationRunTitle(request.request_id, 21),
-    created_at: "2026-08-16T20:00:11.000Z",
-    run_attempt: 1,
-    status: "completed",
-    conclusion: "success",
-    html_url: "https://example.test/integration",
-    ...overrides,
+    id, actor: BOT, event: "workflow_dispatch", head_sha: request.identity.baseSha,
+    display_title: integrationRunTitle(request.request_id, request.identity.prNumber),
+    created_at: createdAt, run_attempt: 1, status, conclusion, html_url: `https://example.test/runs/${id}`,
   };
 }
 
-function integrationGithub(
-  comments: ProtocolComment[],
-  runs: Array<Record<string, unknown>>,
-  attemptOnes = new Map<number, Record<string, unknown>>(),
-  dispatch = vi.fn(),
-): FugueGitHub {
-  const listComments = vi.fn();
-  return {
-    repository: { owner: "JohnnyZLi", repo: "Fugue", fullName: "JohnnyZLi/Fugue" },
-    octokit: {
-      paginate: vi.fn(async (fn: unknown) => fn === listComments ? comments : []),
-      rest: {
-        issues: { listComments, createComment: vi.fn() },
-        actions: {
-          listWorkflowRuns: vi.fn(async () => ({ data: { workflow_runs: runs } })),
-          getWorkflowRunAttempt: vi.fn(async (args: { run_id: number }) => {
-            const value = attemptOnes.get(args.run_id);
-            if (!value) throw Object.assign(new Error("Not Found"), { status: 404 });
-            return { data: value };
-          }),
-          createWorkflowDispatch: dispatch,
-        },
-      },
-    },
-  } as unknown as FugueGitHub;
+async function publishBoundRecord(github: TestGithub, runId: number): Promise<IntegrationRecord> {
+  const request = createIntegrationRequest(snapshot().identity, "2026-08-17T03:30:00.000Z", runId.toString(16).padStart(16, "0"));
+  await publishIntegrationRecord(github, createIntegrationRecord(request));
+  const first = run(request, runId, "2026-08-17T03:30:01.000Z", "in_progress", null);
+  github.__runs.push(first);
+  github.__attempts.set(runId, first);
+  return bindIntegrationRun(github, snapshot(), request.request_id, runId);
 }
 
-function dashboardGithub(comments: ProtocolComment[]): FugueGitHub {
-  const listComments = vi.fn();
-  return {
-    repository: { owner: "JohnnyZLi", repo: "Fugue", fullName: "JohnnyZLi/Fugue" },
-    octokit: {
-      paginate: vi.fn(async (fn: unknown) => fn === listComments ? comments : []),
-      rest: {
-        issues: {
-          listComments,
-          createComment: vi.fn(async (args: { body: string }) => {
-            const comment = { id: comments.length + 1, body: args.body, user: BOT };
-            comments.push(comment);
-            return { data: { id: comment.id, body: comment.body, html_url: "https://example.test/state" } };
-          }),
-          updateComment: vi.fn(),
-          deleteComment: vi.fn(),
-        },
-      },
-    },
-  } as unknown as FugueGitHub;
+function integrationAttestation(record: IntegrationRecord) {
+  return integrationAttestationSchema.parse({
+    version: 1,
+    kind: "integration",
+    attestation_id: "att-integration-test",
+    identity: record.identity,
+    integration: { request_id: record.request.request_id, run_id: record.run!.id, run_attempt: 1 },
+    fugue_version: "0.1.0-alpha.0",
+    qa: { code: "passed", security: "passed", visual: "not_required" },
+    dependencies: { passed: true },
+    agents_md: { impact_reviewed: true, update_required: false, update_present: false },
+    control_plane: { changed: false, human_acknowledgement: "not_required" },
+    validation_control: { changed: false, reviewed: true, acceptable: true },
+    validation: { clean_worktree: true, passed: true, commands: ["npm test"] },
+    ci: { passed: true, checks: ["test"] },
+    base_current: { passed: true }, conflicts: { none: true }, verdict: "approved",
+    created_at: "2026-08-17T03:30:05.000Z",
+  });
+}
+
+async function settleIntegrationState(github: TestGithub) {
+  let state = await currentIntegrationState(github, snapshot(), Date.parse("2026-08-17T04:00:00Z"));
+  for (let attempt = 0; attempt < 8 && state.state === "pending"; attempt += 1) {
+    state = await currentIntegrationState(github, snapshot(), Date.parse("2026-08-17T04:00:00Z"));
+  }
+  return state;
 }

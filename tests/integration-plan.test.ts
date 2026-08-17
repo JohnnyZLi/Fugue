@@ -21,10 +21,17 @@ const identity = {
   workSpecDigest: "sha256:spec",
 };
 
+const integration = {
+  request_id: "int-0123456789abcdef-fedcba9876543210",
+  run_id: 12345,
+  run_attempt: 1 as const,
+};
+
 function plan() {
   return integrationPlanSchema.parse({
     version: 1,
     identity,
+    integration,
     validation: { install: ["npm ci"], checks: ["npm test"] },
     required_ci: ["test"],
     qa_required: ["code", "security"],
@@ -36,9 +43,10 @@ function plan() {
 }
 
 describe("GitHub-hosted Integration plan", () => {
-  it("binds validation commands to an exact prepared evaluation identity", () => {
+  it("binds validation to the exact evaluation and protected request/run identity", () => {
     const value = plan();
     expect(value.identity.headSha).toBe(identity.headSha);
+    expect(value.integration).toEqual(integration);
     expect(value.validation.checks).toEqual(["npm test"]);
   });
 
@@ -50,14 +58,25 @@ describe("GitHub-hosted Integration plan", () => {
     expect(first.created_at).toBe("2026-08-16T20:00:00.000Z");
   });
 
-  it("rejects validation evidence for a different identity shape", () => {
+  it("rejects validation evidence for a different identity or run binding", () => {
     expect(() => integrationValidationSchema.parse({
       version: 1,
       identity: { ...identity, protocolVersion: 2 },
+      integration,
       passed: true,
       commands: ["npm ci", "npm test"],
       created_at: new Date().toISOString(),
     })).toThrow();
+    const value = plan();
+    const wrongRun = integrationValidationSchema.parse({
+      version: 1,
+      identity,
+      integration: { ...integration, run_id: integration.run_id + 1 },
+      passed: true,
+      commands: ["npm ci", "npm test"],
+      created_at: new Date().toISOString(),
+    });
+    expect(() => assertValidationMatchesPlan(value, wrongRun)).toThrow(/request\/run identity/);
   });
 
   it("rejects validation evidence that changes the protected-base command plan", () => {
@@ -65,6 +84,7 @@ describe("GitHub-hosted Integration plan", () => {
     const valid = integrationValidationSchema.parse({
       version: 1,
       identity,
+      integration,
       passed: true,
       commands: ["npm ci", "npm test"],
       created_at: new Date().toISOString(),
@@ -84,48 +104,44 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).not.toContain('integration-runtime prepare "${{ inputs.pr }}"');
   });
 
-  it("pins protected reconciliation to immutable workflow_sha while event contents come from GITHUB_EVENT_PATH", async () => {
+  it("pins reconciliation to workflow_sha and prevents issue-event pending replacement", async () => {
     const workflow = await readFile(".github/workflows/fugue-control-plane.yml", "utf8");
     expect(workflow).toContain("pull_request_target:");
-    expect(workflow).not.toContain("pull_request:\n");
     expect(workflow).toContain("ref: ${{ github.workflow_sha }}");
     expect(workflow).toContain("FUGUE_WORKFLOW_SHA: ${{ github.workflow_sha }}");
-    expect(workflow).not.toContain("ref: ${{ github.event.repository.default_branch }}");
+    expect(workflow).toContain("github.event_name == 'issues'");
+    expect(workflow).toContain("github.run_id");
+    expect(workflow).not.toContain("group: fugue-control-plane-${{ github.repository }}\n");
   });
 
-  it("covers every direct security trust primitive, including repository discovery", async () => {
+  it("covers all direct Security-QA trust primitives requested by the contract", async () => {
     const config = await readFile(".fugue/config.yml", "utf8");
     for (const path of [
-      "src/core/qa.ts",
-      "src/core/metadata.ts",
-      "src/core/pr-metadata.ts",
-      "src/core/hash.ts",
-      "src/core/glob.ts",
-      "src/core/worker.ts",
-      "src/core/dependencies.ts",
+      "src/cli.ts",
+      "src/core/validation.ts",
       "src/core/git.ts",
+      "src/core/config.ts",
+      "src/core/ownership.ts",
       "src/core/state.ts",
-      "src/core/evaluation.ts",
-      "src/core/review-activity.ts",
-      "src/core/gates.ts",
-      "src/core/workflow.ts",
+      "src/core/reconcile.ts",
       "src/core/provenance.ts",
-      "src/core/ci.ts",
+      "src/core/integration.ts",
+      "src/core/integration-status.ts",
     ]) expect(config).toContain(`- "${path}"`);
   });
 
-  it("treats source-level trust-runtime changes as Human control-plane acknowledgement changes", async () => {
+  it("treats CLI, validation, config, ownership and trust runtime as Human control-plane changes", async () => {
     const raw = await readFile(".fugue/config.yml", "utf8");
     const config = parseConfig(raw);
     for (const path of [
+      "src/cli.ts",
+      "src/core/validation.ts",
+      "src/core/config.ts",
+      "src/core/ownership.ts",
       "src/core/reconcile.ts",
       "src/core/state.ts",
       "src/core/provenance.ts",
-      "src/core/submissions.ts",
-      "src/core/gates.ts",
-      "src/core/integration.ts",
       "src/core/integration-status.ts",
-      "src/core/git.ts",
       "src/commands/integration-runtime.ts",
     ]) {
       const resolution = resolveQaRequirements(config, [path]);

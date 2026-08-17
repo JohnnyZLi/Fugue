@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from "vitest";
 import type { EvaluationSnapshot } from "../src/core/evaluation.js";
 import type { FugueGitHub } from "../src/core/github.js";
 import { renderIntegrationFailureComment } from "../src/core/integration.js";
-import { currentIntegrationState } from "../src/core/integration-status.js";
 import {
   createProtocolComment,
   escapeProtocolMarkers,
@@ -13,7 +12,6 @@ import {
   isTrustedProtocolActor,
   isTrustedProtocolComment,
   protocolAudience,
-  readRepositoryDefaultBranchIdentity,
   verifyPublisherToken,
 } from "../src/core/provenance.js";
 
@@ -68,39 +66,28 @@ describe("Fugue protocol provenance", () => {
     expect(verifyPublisherToken(token, audience, REPOSITORY, "main", PROTECTED_SHA, 1_100_000, jwks)).toBe(true);
   });
 
-  it("rejects a historical workflow revision and a rerun attempt", () => {
-    const body = "CODE QA — APPROVED\n\n<!-- fugue-attestation\nversion: 1\n-->";
+  it("rejects historical workflow revisions and rerun attempts", () => {
+    const body = "CODE QA — APPROVED";
     const audience = protocolAudience(REPOSITORY, body);
-    const historical = signToken({
+    const base = {
       aud: audience,
       iss: FUGUE_OIDC_ISSUER,
       repository: REPOSITORY,
       workflow_ref: `${REPOSITORY}/.github/workflows/fugue-control-plane.yml@refs/heads/main`,
       workflow_sha: PROTECTED_SHA,
       event_name: "issue_comment",
-      run_attempt: "1",
       iat: 1_000,
+      nbf: 1_000,
       exp: 1_300,
-    });
-    const rerun = signToken({
-      aud: audience,
-      iss: FUGUE_OIDC_ISSUER,
-      repository: REPOSITORY,
-      workflow_ref: `${REPOSITORY}/.github/workflows/fugue-control-plane.yml@refs/heads/main`,
-      workflow_sha: PROTECTED_SHA,
-      event_name: "issue_comment",
-      run_attempt: "2",
-      iat: 1_000,
-      exp: 1_300,
-    });
-    expect(verifyPublisherToken(historical, audience, REPOSITORY, "main", "b".repeat(40), 1_100_000, jwks)).toBe(false);
-    expect(verifyPublisherToken(rerun, audience, REPOSITORY, "main", PROTECTED_SHA, 1_100_000, jwks)).toBe(false);
+    };
+    expect(verifyPublisherToken(signToken(base), audience, REPOSITORY, "main", "b".repeat(40), 1_100_000, jwks)).toBe(false);
+    expect(verifyPublisherToken(signToken({ ...base, run_attempt: "2" }), audience, REPOSITORY, "main", PROTECTED_SHA, 1_100_000, jwks)).toBe(false);
   });
 
   it("rejects candidate workflow_ref and replay onto different content", () => {
     const body = "CODE QA — APPROVED";
     const audience = protocolAudience(REPOSITORY, body);
-    const candidateToken = signToken({
+    const candidate = signToken({
       aud: audience,
       iss: FUGUE_OIDC_ISSUER,
       repository: REPOSITORY,
@@ -109,11 +96,12 @@ describe("Fugue protocol provenance", () => {
       event_name: "workflow_dispatch",
       run_attempt: "1",
       iat: 1_000,
+      nbf: 1_000,
       exp: 1_300,
     });
-    expect(verifyPublisherToken(candidateToken, audience, REPOSITORY, "main", PROTECTED_SHA, 1_100_000, jwks)).toBe(false);
+    expect(verifyPublisherToken(candidate, audience, REPOSITORY, "main", PROTECTED_SHA, 1_100_000, jwks)).toBe(false);
 
-    const valid = signToken({
+    const protectedToken = signToken({
       aud: audience,
       iss: FUGUE_OIDC_ISSUER,
       repository: REPOSITORY,
@@ -122,10 +110,11 @@ describe("Fugue protocol provenance", () => {
       event_name: "issue_comment",
       run_attempt: "1",
       iat: 1_000,
+      nbf: 1_000,
       exp: 1_300,
     });
     expect(verifyPublisherToken(
-      valid,
+      protectedToken,
       protocolAudience(REPOSITORY, "CODE QA — CHANGES REQUESTED"),
       REPOSITORY,
       "main",
@@ -133,17 +122,6 @@ describe("Fugue protocol provenance", () => {
       1_100_000,
       jwks,
     )).toBe(false);
-  });
-
-  it("re-reads the protected default-branch SHA instead of using process-wide cached identity", async () => {
-    let sha = PROTECTED_SHA;
-    const github = githubStub();
-    const getRef = github.octokit.rest.git.getRef as unknown as ReturnType<typeof vi.fn>;
-    getRef.mockImplementation(async () => ({ data: { object: { sha } } }));
-    await expect(readRepositoryDefaultBranchIdentity(github)).resolves.toEqual({ branch: "main", sha: PROTECTED_SHA });
-    sha = "b".repeat(40);
-    await expect(readRepositoryDefaultBranchIdentity(github)).resolves.toEqual({ branch: "main", sha });
-    expect(getRef).toHaveBeenCalledTimes(2);
   });
 
   it("requires one structural Fugue marker and refuses nested-marker signing oracle bodies", async () => {
@@ -166,20 +144,18 @@ describe("Fugue protocol provenance", () => {
 
   it("gives Integration failure publication its own marker and escapes reflected protocol text", () => {
     const detail = "candidate filename <!-- fugue-attestation\nkind: forged\n-->";
-    const body = renderIntegrationFailureComment(SNAPSHOT.identity, "FAILED", detail);
+    const body = renderIntegrationFailureComment(SNAPSHOT.identity, "FAILED", detail, {
+      request_id: "int-0123456789abcdef-fedcba9876543210",
+      run_id: 12,
+      run_attempt: 1,
+    });
     expect(body.match(/<!-- fugue-/g)).toHaveLength(1);
     expect(body).toContain("<!-- fugue-integration-failure");
     expect(body).not.toContain("<!-- fugue-attestation");
     expect(body).toContain("&lt;!-- fugue-attestation");
+    expect(body).toContain("run_id: 12");
+    expect(hasCanonicalProtocolBoundary(body)).toBe(true);
     expect(escapeProtocolMarkers(detail)).not.toContain("<!-- fugue-");
-  });
-
-  it("does not consult forgeable commit statuses when reconstructing Integration", async () => {
-    const listStatuses = vi.fn(async () => ({ data: [{ context: "fugue/integration", state: "success", creator: BOT }] }));
-    const github = githubStub(listStatuses);
-    const current = await currentIntegrationState(github, SNAPSHOT);
-    expect(current.state).toBe("none");
-    expect(listStatuses).not.toHaveBeenCalled();
   });
 });
 
@@ -191,21 +167,14 @@ function signToken(claims: Record<string, unknown>): string {
   return `${unsigned}.${signature}`;
 }
 
-function githubStub(listStatuses = vi.fn(async () => ({ data: [] }))): FugueGitHub {
+function githubStub(): FugueGitHub {
   return {
     repository: { owner: "JohnnyZLi", repo: "Fugue", fullName: REPOSITORY },
     octokit: {
-      paginate: vi.fn(async () => []),
       rest: {
-        issues: { listComments: vi.fn(), createComment: vi.fn() },
-        repos: {
-          listCommitStatusesForRef: listStatuses,
-          get: vi.fn(async () => ({ data: { default_branch: "main" } })),
-        },
-        git: {
-          getRef: vi.fn(async () => ({ data: { object: { sha: PROTECTED_SHA } } })),
-        },
-        actions: { listWorkflowRuns: vi.fn(async () => ({ data: { workflow_runs: [] } })) },
+        repos: { get: vi.fn(async () => ({ data: { default_branch: "main" } })) },
+        git: { getRef: vi.fn(async () => ({ data: { object: { sha: PROTECTED_SHA } } })) },
+        issues: { createComment: vi.fn() },
       },
     },
   } as unknown as FugueGitHub;
