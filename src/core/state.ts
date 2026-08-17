@@ -539,7 +539,11 @@ export async function publishDurableProtocolRecord(
         best_body_b64: Buffer.from(bestSignedBody, "utf8").toString("base64url"),
         best_manifest: bestManifest,
       }));
-      return bestSignedBody;
+      const durable = await findRecoveryCursor(github, recoveryIdentityOptions);
+      if (!durable?.cursor.commit_witness || !durable.cursor.best_body_b64) {
+        throw new CanonicalWorkStateIntegrityError(`Protected durable witness for ${input.scope} did not become readable.`);
+      }
+      return Buffer.from(durable.cursor.best_body_b64, "base64url").toString("utf8");
     } catch (error) {
       if (httpStatus(error) !== 422) throw error;
       lastError = error;
@@ -1543,9 +1547,9 @@ async function writeRecoveryCursor(
   await compactFugueRecoveryAuthorityVariables(github, identity);
   const current = await findRecoveryCursor(github, options);
   if (current && recoveryAuthorityConflict(current.cursor, supplied)) {
-    throw new CanonicalWorkStateIntegrityError(
-      `Conflicting protected durable witnesses share one authority order for ${options.scope}.`,
-    );
+    // The supplied body is not durable yet. If a same-order sibling became authoritative first,
+    // this publication lost its conditional-update race; do not create a second conflicting witness.
+    return;
   }
   if (current && compareRecoveryProgress(current.cursor, supplied) >= 0) {
     await compactFugueRecoveryAuthorityVariables(github, identity);
@@ -1566,6 +1570,13 @@ Durable Fugue recovery checkpoint: ${options.scope}`;
   if (!(await verifyProtocolPublicationBodyAtRevision(github, signed, options.publisherSha, timestamp))) {
     throw new CanonicalWorkStateIntegrityError("Durable recovery checkpoint failed protected provenance self-check.");
   }
+
+  // Another protected publisher may have committed while this run was signing. Re-evaluate the
+  // conditional update before any Authority allocation so an older sibling cannot leave a durable
+  // equal-order conflict merely because it finishes later.
+  const latest = await findRecoveryCursor(github, options);
+  if (latest && recoveryAuthorityConflict(latest.cursor, cursor)) return;
+  if (latest && compareRecoveryProgress(latest.cursor, cursor) >= 0) return;
 
   // Re-check before allocation; the create/rename itself is provisional and performs a second
   // post-mutation revision proof, rolling the exact new witness back if the base advanced inside
@@ -1692,7 +1703,7 @@ export async function publishCanonicalWorkState(
     parsed = canonicalWorkStateSchema.parse({ ...parsed, created_at: new Date(createdMs).toISOString() });
   }
 
-  await publishDurableProtocolRecord(github, {
+  const committedBody = await publishDurableProtocolRecord(github, {
     storageSha: parsed.base_sha,
     publisherSha: parsed.base_sha,
     scope: workScope(parsed.issue),
@@ -1700,8 +1711,12 @@ export async function publishCanonicalWorkState(
     publicationTimestamp: Date.parse(parsed.created_at),
     authorityOrder: canonicalWorkAuthorityOrder(parsed),
   });
-  await replaceWorkLocator(github, parsed);
-  return true;
+  const committed = parseCanonicalWorkState(committedBody);
+  if (!committed || committed.issue !== parsed.issue || committed.base_sha.toLowerCase() !== parsed.base_sha.toLowerCase()) {
+    throw new CanonicalWorkStateIntegrityError(`Protected durable work-state publication for Issue #${parsed.issue} returned another identity.`);
+  }
+  await replaceWorkLocator(github, committed);
+  return exactCanonicalWorkState(committed, parsed);
 }
 
 export async function loadCurrentCanonicalWorkState(
@@ -1854,7 +1869,7 @@ export async function publishCoordinatorSnapshot(
   const parsed = coordinatorSnapshotSchema.parse(snapshot);
   const current = await loadLatestCoordinatorSnapshot(github, parsed.issue, baseSha);
   if (current && compareCoordinatorSnapshots(parsed, current) <= 0) return;
-  await publishDurableProtocolRecord(github, {
+  const committedBody = await publishDurableProtocolRecord(github, {
     storageSha: baseSha,
     publisherSha: baseSha,
     scope: coordinatorScope(parsed.issue),
@@ -1864,7 +1879,11 @@ COORDINATOR SNAPSHOT — DURABLE`,
     publicationTimestamp: Date.parse(parsed.captured_at),
     authorityOrder: coordinatorAuthorityOrder(parsed),
   });
-  await replaceCoordinatorLocator(github, parsed);
+  const committed = parseCoordinatorSnapshot(committedBody);
+  if (!committed || committed.issue !== parsed.issue) {
+    throw new CanonicalWorkStateIntegrityError(`Protected durable Coordinator publication for Issue #${parsed.issue} returned another identity.`);
+  }
+  await replaceCoordinatorLocator(github, committed);
 }
 
 export async function loadLatestCoordinatorSnapshot(
