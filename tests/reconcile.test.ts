@@ -44,6 +44,7 @@ import {
   createCanonicalWorkState,
   durableManifestContext,
   loadCurrentCanonicalWorkState,
+  loadLatestCoordinatorSnapshot,
   parseCanonicalWorkState,
   publishCanonicalWorkState,
   publishCoordinatorSnapshot,
@@ -61,8 +62,12 @@ vi.mock("../src/core/provenance.js", async (importOriginal) => {
       const actualSha = (github as TestGithub).__baseSha ?? expected;
       if (actualSha !== expected) throw new Error(`stale protected revision ${actualSha.slice(0, 8)}`);
     }),
-    signProtocolBody: vi.fn(async (_github: FugueGitHub, body: string) =>
-      `${body}\n\n<!-- fugue-publisher-proof\nversion: 1\ntoken: test-proof\n-->`),
+    signProtocolBody: vi.fn(async (github: FugueGitHub, body: string) => {
+      if (body.includes("<!-- fugue-durable-recovery")) {
+        await (github as TestGithub).__beforeRecoverySign?.(body);
+      }
+      return `${body}\n\n<!-- fugue-publisher-proof\nversion: 1\ntoken: test-proof\n-->`;
+    }),
     createDurableManifestProof: vi.fn(async () => "manifest-proof"),
     verifyDurableManifestProof: vi.fn(async (_github: FugueGitHub, proof: string) => proof === "manifest-proof"),
     verifyProtocolPublicationBodyAtRevision: vi.fn(async (
@@ -99,6 +104,7 @@ vi.mock("../src/core/provenance.js", async (importOriginal) => {
 
 const BOT = { login: FUGUE_PROTOCOL_ACTOR, type: "Bot" } as const;
 const BASE = "b".repeat(40);
+const NEXT_BASE = "c".repeat(40);
 const HEAD = "a".repeat(40);
 const CURRENT_WORK_SPEC_DIGEST = "sha256:a808b8ae2dbf920771f978dfb3c747d7372b24bf516e3d4d92b0d26afa55a15a";
 
@@ -188,6 +194,16 @@ function recoveryScopes(github: TestGithub): Set<string> {
   return new Set(recoveryCheckpointBodies(github)
     .map((body) => recoveryCursorBody(body)?.scope)
     .filter((scope): scope is string => typeof scope === "string"));
+}
+
+function recoveryAuthorityOrders(github: TestGithub, scope: string): string[] {
+  return recoveryCheckpointBodies(github).flatMap((body) => {
+    const cursor = recoveryCursorBody(body);
+    if (cursor?.scope !== scope || cursor.commit_witness !== true) return [];
+    const manifest = cursor.best_manifest as { authority_order_b64?: unknown } | undefined;
+    if (typeof manifest?.authority_order_b64 !== "string") return [];
+    return [Buffer.from(manifest.authority_order_b64, "base64url").toString("utf8")];
+  });
 }
 
 function explodeRecoveryPacksToLeaves(github: TestGithub): void {
@@ -342,6 +358,33 @@ describe("d3 protected durable authority", () => {
     vi.mocked(verifyProtocolPublicationBodyAtRevision).mockClear();
   });
 
+  it("refuses the Authority witness if protected base advances after manifest creation", async () => {
+    const github = makeGithub();
+    let moved = false;
+    github.__afterManifestStatus = async () => {
+      if (moved) return;
+      moved = true;
+      github.__baseSha = NEXT_BASE;
+    };
+
+    await expect(publishDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: "base-race", unsignedBody: "stale-base-body",
+      publicationTimestamp: Date.parse("2026-08-17T03:00:00.000Z"), authorityOrder: "2026-08-17T03:00:00.000Z",
+    })).rejects.toThrow(/stale protected revision/);
+    expect(github.__statuses.some((status) => status.context.includes("/m/"))).toBe(true);
+    expect(recoveryCheckpointBodies(github).map(recoveryCursorBody)
+      .some((cursor) => cursor?.scope === "base-race" && cursor.commit_witness === true)).toBe(false);
+
+    github.__afterManifestStatus = undefined;
+    github.__publisherSha = NEXT_BASE;
+    await expect(publishDurableProtocolRecord(github, {
+      storageSha: NEXT_BASE, publisherSha: NEXT_BASE, scope: "base-race", unsignedBody: "fresh-base-body",
+      publicationTimestamp: Date.parse("2026-08-17T03:01:00.000Z"), authorityOrder: "2026-08-17T03:01:00.000Z",
+    })).resolves.toContain("fresh-base-body");
+    expect(recoveryCheckpointBodies(github).map(recoveryCursorBody)
+      .some((cursor) => cursor?.scope === "base-race" && cursor.commit_witness === true)).toBe(true);
+  });
+
   it("abandons an exhausted transaction and retries under fresh unrevealed secrets", async () => {
     const github = makeGithub({ failFirstManifest: true });
     await expect(publishCanonicalWorkState(github, canonicalWork())).resolves.toBe(true);
@@ -470,12 +513,13 @@ describe("d3 protected durable authority", () => {
     const github = makeGithub();
     await publishCanonicalWorkState(github, canonicalWork("capacity-safe"));
     github.__comments.splice(0);
-    const checkpoint = [...github.__authorityVariables.entries()].find(([name]) => name.startsWith("FUGUE_D3_"));
-    expect(checkpoint).toBeDefined();
-    const [name, value] = checkpoint!;
-    const prefix = name.slice(0, -16);
+    const value = recoveryCheckpointBodies(github).find((body) => recoveryCursorBody(body)?.scope === "work/18");
+    expect(value).toBeDefined();
+    const cursor = recoveryCursorBody(value!);
+    const identity = `${String(cursor!.storage_sha).toLowerCase()}\0${String(cursor!.publisher_sha).toLowerCase()}\0${String(cursor!.scope)}`;
+    const prefix = `FUGUE_D3_${createHash("sha256").update(identity, "utf8").digest("hex").slice(0, 16).toUpperCase()}_`;
     for (let index = 0; github.__authorityVariables.size < 500; index += 1) {
-      github.__authorityVariables.set(`${prefix}${index.toString(16).padStart(16, "0")}`, value);
+      github.__authorityVariables.set(`${prefix}${index.toString(16).padStart(16, "0")}`, value!);
     }
     expect(github.__authorityVariables.size).toBe(500);
     await compactFugueRecoveryAuthorityVariables(github);
@@ -499,15 +543,18 @@ describe("d3 protected durable authority", () => {
       storageSha: BASE, publisherSha: BASE, scope: "work/18", issueNumber: 18,
       parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
     });
-    const checkpoint = [...github.__authorityVariables.entries()].find(([name]) => name.startsWith("FUGUE_D3_"))!;
-    const prefix = checkpoint[0].slice(0, -16);
-    github.__authorityVariables.set(`${prefix}${"e".repeat(16)}`, checkpoint[1]);
-    github.__authorityVariables.set(`${prefix}${"f".repeat(16)}`, checkpoint[1]);
+    const checkpoint = recoveryCheckpointBodies(github).find((body) => recoveryCursorBody(body)?.scope === "work/18")!;
+    const cursor = recoveryCursorBody(checkpoint)!;
+    const identity = `${String(cursor.storage_sha).toLowerCase()}\0${String(cursor.publisher_sha).toLowerCase()}\0${String(cursor.scope)}`;
+    const prefix = `FUGUE_D3_${createHash("sha256").update(identity, "utf8").digest("hex").slice(0, 16).toUpperCase()}_`;
+    github.__authorityVariables.set(`${prefix}${"e".repeat(16)}`, checkpoint);
+    github.__authorityVariables.set(`${prefix}${"f".repeat(16)}`, checkpoint);
     await Promise.all([
       compactFugueRecoveryAuthorityVariables(github),
       compactFugueRecoveryAuthorityVariables(github),
     ]);
-    const surviving = [...github.__authorityVariables.keys()].filter((name) => name.startsWith(prefix));
+    const surviving = recoveryCheckpointBodies(github)
+      .filter((body) => recoveryCursorBody(body)?.scope === "work/18");
     expect(surviving).toHaveLength(1);
   });
 
@@ -596,6 +643,64 @@ describe("d3 protected durable authority", () => {
     expect([...racing.__authorityVariables.keys()].filter((name) => name.startsWith("UNRELATED_DRAINED_"))).toHaveLength(unrelatedRacing);
     for (const scope of scopes) expect(recoveryScopes(racing).has(scope)).toBe(true);
     expect(racing.__authorityVariables.size).toBeLessThanOrEqual(500);
+  });
+
+  it("uses partial-pack representation capacity at the 500-variable hard cap with no donors or reserves", async () => {
+    const bucket = recoveryBucketForScope("work/18");
+    const scopes = recoveryScopesForBucket(bucket, 146, "fully-compacted");
+    const github = makeGithub();
+    for (const [index, scope] of scopes.slice(0, 145).entries()) seedRecoveryWitness(github, scope, 5000 + index);
+
+    await compactFugueRecoveryAuthorityVariables(github);
+    for (const name of [...github.__authorityVariables.keys()]) {
+      if (name.startsWith("FUGUE_D3R_")) github.__authorityVariables.delete(name);
+    }
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_D3_"))).toHaveLength(0);
+    const packedBefore = [...github.__authorityVariables.entries()]
+      .filter(([name]) => name.startsWith(`FUGUE_D3P_${bucket}_`));
+    expect(packedBefore).toHaveLength(10);
+    expect(packedBefore.length).toBeGreaterThan(8);
+    expect(packedBefore.some(([, value]) => (JSON.parse(value) as { entries: unknown[] }).entries.length < 16)).toBe(true);
+    expect(recoveryScopes(github)).toEqual(new Set(scopes.slice(0, 145)));
+
+    const unrelated = new Set<string>();
+    for (let index = 0; index < 490; index += 1) {
+      const name = `UNRELATED_COMPACTED_${String(index).padStart(4, "0")}`;
+      github.__authorityVariables.set(name, "unrelated");
+      unrelated.add(name);
+    }
+    expect(github.__authorityVariables.size).toBe(500);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_D3R_"))).toHaveLength(0);
+
+    const newOrder = "2026-08-18T00:00:00.000Z";
+    await publishDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: scopes[145]!, unsignedBody: "146th-same-bucket",
+      publicationTimestamp: Date.parse(newOrder), authorityOrder: newOrder,
+    });
+    expect(github.__authorityVariables.size).toBe(500);
+    expect(recoveryScopes(github)).toEqual(new Set(scopes));
+    expect([...unrelated].every((name) => github.__authorityVariables.get(name) === "unrelated")).toBe(true);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_D3R_"))).toHaveLength(0);
+    expect(recoveryAuthorityOrders(github, scopes[145]!)).toContain(newOrder);
+
+    const newerOrder = "2026-08-18T00:01:00.000Z";
+    await publishDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: scopes[0]!, unsignedBody: "strictly-newer-existing-identity",
+      publicationTimestamp: Date.parse(newerOrder), authorityOrder: newerOrder,
+    });
+    expect(github.__authorityVariables.size).toBe(500);
+    expect(recoveryScopes(github)).toEqual(new Set(scopes));
+    expect([...unrelated].every((name) => github.__authorityVariables.get(name) === "unrelated")).toBe(true);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_D3R_"))).toHaveLength(0);
+    expect(recoveryAuthorityOrders(github, scopes[0]!)).toContain(newerOrder);
+
+    const recovered = await recoverDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: scopes[0]!, issueNumber: 18,
+      parse: (body) => body,
+      timestamp: () => Date.parse(newerOrder),
+      order: () => newerOrder,
+    });
+    expect(recovered.record?.body).toContain("strictly-newer-existing-identity");
   });
 
   it("ignores pre-created, deleted, rewound, fast-forwarded, and replayed custom recovery refs after presentation loss", async () => {
@@ -702,6 +807,82 @@ describe("Coordinator event durability", () => {
     expect(canonicalRequirements(work!)).toContain("new Human edit");
   });
 
+
+  it("orders overlapping same-scope witnesses by logical Coordinator authority, not manifest ID", async () => {
+    const github = makeGithub();
+    const baseline = coordinatorSnapshotSchema.parse({
+      version: 1, kind: "coordinator_snapshot", event_id: "event-050", event_sequence: 50,
+      event_name: "issues", action: "edited", actor: "JohnnyZLi", issue: 18,
+      title: "Baseline", body: upsertWorkMetadata("## Outcome\nbaseline", workMetadata(false)),
+      labels: ["state:working", "agent:ready"], issue_updated_at: "2026-08-17T03:04:00.000Z",
+      captured_at: "2026-08-17T03:04:01.000Z",
+    });
+    const older = coordinatorSnapshotSchema.parse({
+      ...baseline, event_id: "event-100", event_sequence: 100, title: "Older overlapping edit",
+      body: upsertWorkMetadata("## Outcome\nolder-overlap", workMetadata(false)),
+      issue_updated_at: "2026-08-17T03:05:00.000Z", captured_at: "2026-08-17T03:05:01.000Z",
+    });
+    const newer = coordinatorSnapshotSchema.parse({
+      ...baseline, event_id: "event-200", event_sequence: 200, title: "Newer overlapping edit",
+      body: upsertWorkMetadata("## Outcome\nnewer-overlap", workMetadata(false)),
+      issue_updated_at: "2026-08-17T03:06:00.000Z", captured_at: "2026-08-17T03:06:01.000Z",
+    });
+    await publishCoordinatorSnapshot(github, BASE, baseline);
+
+    let releaseNewer!: () => void;
+    let releaseOlder!: () => void;
+    let reachedNewer!: () => void;
+    let reachedOlder!: () => void;
+    const newerRelease = new Promise<void>((resolve) => { releaseNewer = resolve; });
+    const olderRelease = new Promise<void>((resolve) => { releaseOlder = resolve; });
+    const newerReached = new Promise<void>((resolve) => { reachedNewer = resolve; });
+    const olderReached = new Promise<void>((resolve) => { reachedOlder = resolve; });
+    github.__beforeRecoverySign = async (body) => {
+      const cursor = recoveryCursorBody(body);
+      if (cursor?.scope !== "coord/18" || cursor.commit_witness !== true) return;
+      const manifest = cursor.best_manifest as { authority_order_b64?: unknown } | undefined;
+      if (typeof manifest?.authority_order_b64 !== "string") return;
+      const order = Buffer.from(manifest.authority_order_b64, "base64url").toString("utf8");
+      if (order.includes("event-200")) {
+        reachedNewer();
+        await newerRelease;
+      } else if (order.includes("event-100")) {
+        reachedOlder();
+        await olderRelease;
+      }
+    };
+
+    const newerPublish = publishCoordinatorSnapshot(github, BASE, newer);
+    await newerReached;
+    const olderPublish = publishCoordinatorSnapshot(github, BASE, older);
+    await olderReached;
+
+    // Both publishers have read the same baseline witness and reached witness signing, while no
+    // new witness is durable yet. Newer started first, so its manifest server ID is lower.
+    const manifests = github.__statuses.filter((status) => status.context.includes("/m/") && status.target_url)
+      .map((status) => ({
+        id: status.id,
+        order: Buffer.from(new URL(status.target_url!).searchParams.get("o")!, "base64url").toString("utf8"),
+      }));
+    const newerManifest = manifests.find((manifest) => manifest.order.includes("event-200"))!;
+    const olderManifest = manifests.find((manifest) => manifest.order.includes("event-100"))!;
+    expect(newerManifest.id).toBeLessThan(olderManifest.id);
+
+    releaseNewer();
+    await newerPublish;
+    releaseOlder();
+    await olderPublish;
+    github.__beforeRecoverySign = undefined;
+
+    let recovered = await loadLatestCoordinatorSnapshot(github, 18, BASE);
+    expect(recovered).toMatchObject({ event_id: "event-200", title: "Newer overlapping edit" });
+    await compactFugueRecoveryAuthorityVariables(github);
+    recovered = await loadLatestCoordinatorSnapshot(github, 18, BASE);
+    expect(recovered).toMatchObject({ event_id: "event-200", title: "Newer overlapping edit" });
+    const orders = recoveryAuthorityOrders(github, "coord/18");
+    expect(orders.some((order) => order.includes("event-200"))).toBe(true);
+    expect(orders.every((order) => !order.includes("event-100"))).toBe(true);
+  });
 
   it("totally orders distinct authorized edits that share issue.updated_at and action", async () => {
     const github = makeGithub();
@@ -982,6 +1163,8 @@ interface TestGithub extends FugueGitHub {
   __authorityVariables: Map<string, string>;
   __nextStatusId: number;
   __statusReadAppends: number[];
+  __afterManifestStatus?: (status: TestStatus) => Promise<void> | void;
+  __beforeRecoverySign?: (body: string) => Promise<void> | void;
   __listStatus: ReturnType<typeof vi.fn>;
   __listWorkflowRuns: ReturnType<typeof vi.fn>;
 }
@@ -1002,6 +1185,7 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
   let failedManifest = false;
   let interleavedManifest = false;
   let interleavedSameContext = false;
+  let afterManifestStatus: TestGithub["__afterManifestStatus"];
   const statusReadAppends: number[] = [];
   let statusReadOrdinal = 0;
   const listForRepo = vi.fn();
@@ -1071,6 +1255,8 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
     get __nextStatusId() { return nextStatusId; },
     set __nextStatusId(value: number) { nextStatusId = value; },
     __statusReadAppends: statusReadAppends,
+    get __afterManifestStatus() { return afterManifestStatus; },
+    set __afterManifestStatus(value) { afterManifestStatus = value; },
     __listStatus: listCommitStatusesForRef,
     __listWorkflowRuns: listWorkflowRuns,
     octokit: {
@@ -1116,6 +1302,7 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
             }
             const status = { id: ++nextStatusId, sha: args.sha, context: args.context, description: args.description ?? "", target_url: args.target_url, created_at: new Date().toISOString() };
             statuses.push(status);
+            if (args.context.includes("/m/")) await afterManifestStatus?.(status);
             if (options.interleaveSameContext && args.context.includes("/d/") && !interleavedSameContext) {
               interleavedSameContext = true;
               statuses.push({ id: ++nextStatusId, sha: args.sha, context: args.context, description: "hostile-same-context", created_at: new Date().toISOString() });

@@ -300,6 +300,12 @@ function authorityBody(unsignedBody: string, key: string, nonce: string): string
   return `${unsignedBody}\n\n${AUTHORITY_KEY_PREFIX}${key}\n${AUTHORITY_COMMIT_PREFIX}${nonce}`;
 }
 
+function logicalAuthorityBody(signedBody: string): string {
+  const marker = `\n\n${AUTHORITY_KEY_PREFIX}`;
+  const index = signedBody.lastIndexOf(marker);
+  return index < 0 ? signedBody : signedBody.slice(0, index);
+}
+
 function redactAuthorityBody(signedBody: string, key: string, nonce: string): string {
   const keyLine = `${AUTHORITY_KEY_PREFIX}${key}`;
   const commitLine = `${AUTHORITY_COMMIT_PREFIX}${nonce}`;
@@ -437,6 +443,11 @@ export async function publishDurableProtocolRecord(
         target_url: manifestTarget,
       });
 
+      // The status manifest is still only prospective transport. Re-prove the current protected
+      // default-branch revision after GitHub assigns its exact server ID and before any Authority
+      // witness can be signed or persisted.
+      await assertRepositoryDefaultBranchRevision(github, input.publisherSha);
+
       // A status-only manifest is prospective transport, not committed d3 authority. The protected
       // Authority App certifies the exact server-assigned manifest/chunk identity in a signed,
       // write-once witness before publication is allowed to succeed. Readers therefore never need
@@ -462,10 +473,23 @@ export async function publishDurableProtocolRecord(
       const previous = await findRecoveryCursor(github, recoveryIdentityOptions);
       let bestManifest = committedManifest;
       let bestSignedBody = signedBody;
-      if (previous?.cursor.commit_witness && previous.cursor.best_manifest && previous.cursor.best_body_b64 &&
-          compareManifest(previous.cursor.best_manifest, committedManifest) > 0) {
-        bestManifest = previous.cursor.best_manifest;
-        bestSignedBody = Buffer.from(previous.cursor.best_body_b64, "base64url").toString("utf8");
+      if (previous?.cursor.commit_witness && previous.cursor.best_manifest && previous.cursor.best_body_b64) {
+        const previousSignedBody = Buffer.from(previous.cursor.best_body_b64, "base64url").toString("utf8");
+        const manifestComparison = compareManifest(previous.cursor.best_manifest, committedManifest);
+        if (manifestComparison > 0) {
+          bestManifest = previous.cursor.best_manifest;
+          bestSignedBody = previousSignedBody;
+        } else if (manifestComparison === 0) {
+          if (logicalAuthorityBody(previousSignedBody) !== input.unsignedBody) {
+            throw new CanonicalWorkStateIntegrityError(
+              `Conflicting protected durable bodies share authority order ${input.authorityOrder}.`,
+            );
+          }
+          // Equal logical authority is the same protocol version. Keep the already durable witness
+          // instead of letting transport manifest ID or completion order choose between retries.
+          bestManifest = previous.cursor.best_manifest;
+          bestSignedBody = previousSignedBody;
+        }
       }
       const completeTopId = Math.max(previous?.cursor.complete_top_id ?? 0, committedManifest.id);
       await writeRecoveryCursor(github, recoveryIdentityOptions, recoveryCursorSchema.parse({
@@ -624,9 +648,7 @@ function manifestOrder(manifest: RecoveryManifest): string {
 }
 
 function compareManifest(left: RecoveryManifest, right: RecoveryManifest): number {
-  const order = compareAuthorityOrder(manifestOrder(left), manifestOrder(right));
-  if (order !== 0) return order;
-  return right.id - left.id;
+  return compareAuthorityOrder(manifestOrder(left), manifestOrder(right));
 }
 
 function compareAuthorityOrder(left: string, right: string): number {
@@ -764,7 +786,9 @@ async function replaceFugueAuthorityVariable(
   expectedSourceValue: string,
   targetName: string,
   targetValue: string,
+  expectedPublisherSha?: string,
 ): Promise<boolean> {
+  if (expectedPublisherSha) await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
   if (sourceName === targetName) return expectedSourceValue === targetValue;
   const injected = injectedAuthorityVariables(github);
   if (injected) {
@@ -839,7 +863,33 @@ function recoveryVariableName(options: RecoveryIdentityOptions, signedBody: stri
   return `${recoveryVariablePrefix(options)}${checkpoint}`;
 }
 
+function committedRecoveryAuthorityOrder(cursor: RecoveryCursor): string | undefined {
+  if (!cursor.commit_witness || !cursor.best_manifest || !cursor.best_body_b64) return undefined;
+  return manifestOrder(cursor.best_manifest);
+}
+
+function recoveryAuthorityConflict(left: RecoveryCursor, right: RecoveryCursor): boolean {
+  const leftOrder = committedRecoveryAuthorityOrder(left);
+  const rightOrder = committedRecoveryAuthorityOrder(right);
+  if (leftOrder === undefined || rightOrder === undefined || compareAuthorityOrder(leftOrder, rightOrder) !== 0) {
+    return false;
+  }
+  const leftBody = Buffer.from(left.best_body_b64!, "base64url").toString("utf8");
+  const rightBody = Buffer.from(right.best_body_b64!, "base64url").toString("utf8");
+  return logicalAuthorityBody(leftBody) !== logicalAuthorityBody(rightBody);
+}
+
 function compareRecoveryProgress(left: RecoveryCursor, right: RecoveryCursor): number {
+  const leftAuthority = committedRecoveryAuthorityOrder(left);
+  const rightAuthority = committedRecoveryAuthorityOrder(right);
+  if (leftAuthority !== undefined || rightAuthority !== undefined) {
+    if (leftAuthority === undefined) return -1;
+    if (rightAuthority === undefined) return 1;
+    const authority = compareAuthorityOrder(leftAuthority, rightAuthority);
+    if (authority !== 0) return authority;
+  }
+  // Transport progress is relevant only within one logical authority version (or legacy recovery
+  // cursors). It can never outrank a newer committed authority order.
   if (left.complete_top_id !== right.complete_top_id) return left.complete_top_id - right.complete_top_id;
   if (left.scan_top_id !== right.scan_top_id) return left.scan_top_id - right.scan_top_id;
   if (left.phase !== right.phase) return left.phase === "materialize" ? 1 : -1;
@@ -980,6 +1030,11 @@ async function findRecoveryCursor(
   const variables = await listFugueAuthorityVariables(github, "FUGUE_D3");
   for (const entry of await verifiedRecoveryEntriesForBucket(github, recoveryOptionsBucket(options), variables)) {
     if (recoveryIdentity(entry.cursor) !== identity) continue;
+    if (best && recoveryAuthorityConflict(entry.cursor, best.cursor)) {
+      throw new CanonicalWorkStateIntegrityError(
+        `Conflicting protected durable witnesses share one authority order for ${options.scope}.`,
+      );
+    }
     if (!best || compareRecoveryProgress(entry.cursor, best.cursor) > 0 ||
         (compareRecoveryProgress(entry.cursor, best.cursor) === 0 &&
           recoveryBodyTieBreak(entry.signedBody) < recoveryBodyTieBreak(best.signedBody))) {
@@ -1013,6 +1068,34 @@ interface RecoveryAllocation {
   value: string;
 }
 
+interface VerifiedRecoveryAllocation extends RecoveryAllocation {
+  entry: VerifiedRecoveryEntry;
+  bucket: string;
+}
+
+async function verifyRecoveryAllocation(
+  github: FugueGitHub,
+  allocation: RecoveryAllocation,
+): Promise<VerifiedRecoveryAllocation> {
+  const cursor = await verifyRecoveryCursorBody(github, allocation.value);
+  if (!cursor) {
+    throw new CanonicalWorkStateIntegrityError("Required protected recovery allocation failed signed-witness verification.");
+  }
+  const options: RecoveryIdentityOptions = {
+    storageSha: cursor.storage_sha,
+    publisherSha: cursor.publisher_sha,
+    scope: cursor.scope,
+  };
+  if (recoveryVariableName(options, allocation.value) !== allocation.name) {
+    throw new CanonicalWorkStateIntegrityError("Required protected recovery allocation name does not bind its signed witness body.");
+  }
+  return {
+    ...allocation,
+    bucket: recoveryCursorBucket(cursor),
+    entry: { sourceVariableName: allocation.name, signedBody: allocation.value, cursor },
+  };
+}
+
 interface RecoveryCompactionResult {
   progress: boolean;
   allocated: boolean;
@@ -1022,7 +1105,7 @@ async function compactRecoveryBucket(
   github: FugueGitHub,
   bucket: string,
   variables: readonly FugueAuthorityVariable[],
-  allocation?: RecoveryAllocation,
+  allocation?: VerifiedRecoveryAllocation,
 ): Promise<RecoveryCompactionResult> {
   const entries = await verifiedRecoveryEntriesForBucket(github, bucket, variables);
   if (!entries.length) return { progress: false, allocated: false };
@@ -1041,6 +1124,15 @@ async function compactRecoveryBucket(
 
   const winners: VerifiedRecoveryEntry[] = [];
   for (const group of grouped.values()) {
+    for (let leftIndex = 0; leftIndex < group.length; leftIndex += 1) {
+      for (let rightIndex = leftIndex + 1; rightIndex < group.length; rightIndex += 1) {
+        if (recoveryAuthorityConflict(group[leftIndex]!.cursor, group[rightIndex]!.cursor)) {
+          throw new CanonicalWorkStateIntegrityError(
+            `Conflicting protected durable witnesses share one authority order for ${group[leftIndex]!.cursor.scope}.`,
+          );
+        }
+      }
+    }
     group.sort((left, right) => {
       const progress = compareRecoveryProgress(right.cursor, left.cursor);
       if (progress !== 0) return progress;
@@ -1056,17 +1148,93 @@ async function compactRecoveryBucket(
   let allocated = allocation ? await getFugueAuthorityVariable(github, allocation.name) === allocation.value : false;
   const winnerSources = new Set(winners.map((entry) => entry.sourceVariableName));
 
+  if (allocation && !allocated && allocation.bucket === bucket) {
+    const allocationIdentity = recoveryIdentity(allocation.entry.cursor);
+    const currentWinner = winners.find((entry) => recoveryIdentity(entry.cursor) === allocationIdentity);
+    if (currentWinner) {
+      if (recoveryAuthorityConflict(currentWinner.cursor, allocation.entry.cursor)) {
+        throw new CanonicalWorkStateIntegrityError(
+          `Conflicting protected durable witnesses share one authority order for ${allocation.entry.cursor.scope}.`,
+        );
+      }
+      if (compareRecoveryProgress(currentWinner.cursor, allocation.entry.cursor) >= 0) {
+        return { progress, allocated: true };
+      }
+    }
+  }
+
   for (const sourceName of [...bySource.keys()].sort()) {
     if (winnerSources.has(sourceName)) continue;
     const expected = sourceValues.get(sourceName);
     if (allocation && !allocated && expected !== undefined &&
-        await replaceFugueAuthorityVariable(github, sourceName, expected, allocation.name, allocation.value)) {
+        await replaceFugueAuthorityVariable(
+          github,
+          sourceName,
+          expected,
+          allocation.name,
+          allocation.value,
+          allocation.entry.cursor.publisher_sha,
+        )) {
       allocated = true;
       progress = true;
       continue;
     }
     await deleteFugueAuthorityVariable(github, sourceName);
     progress = true;
+  }
+
+  // At the hard cap, a waiting witness can still be representable inside an existing partial
+  // content-addressed pack even when there is no reserve or redundant donor variable. Transform one
+  // occupied verified source directly into the replacement pack, keeping repository variable count
+  // constant. For a newer existing identity, replace that identity in its source first; if that
+  // source cannot fit the new body, another partial source may carry the newer witness while the old
+  // copy remains harmlessly non-greatest until later cleanup.
+  if (allocation && !allocated && allocation.bucket === bucket) {
+    const allocationIdentity = recoveryIdentity(allocation.entry.cursor);
+    const currentWinner = winners.find((entry) => recoveryIdentity(entry.cursor) === allocationIdentity);
+    const sourceCandidates = [...winnerSources].map((sourceName) => ({
+      sourceName,
+      expectedValue: sourceValues.get(sourceName),
+      entries: winners.filter((entry) => entry.sourceVariableName === sourceName),
+      replacesCurrent: sourceName === currentWinner?.sourceVariableName,
+    })).filter((candidate): candidate is {
+      sourceName: string;
+      expectedValue: string;
+      entries: VerifiedRecoveryEntry[];
+      replacesCurrent: boolean;
+    } => candidate.expectedValue !== undefined)
+      .sort((left, right) => {
+        if (left.replacesCurrent !== right.replacesCurrent) return left.replacesCurrent ? -1 : 1;
+        if (left.entries.length !== right.entries.length) return right.entries.length - left.entries.length;
+        return left.sourceName.localeCompare(right.sourceName);
+      });
+
+    for (const candidate of sourceCandidates) {
+      const outputEntries = candidate.entries
+        .filter((entry) => !candidate.replacesCurrent || recoveryIdentity(entry.cursor) !== allocationIdentity);
+      outputEntries.push(allocation.entry);
+      outputEntries.sort((left, right) => recoveryIdentity(left.cursor).localeCompare(recoveryIdentity(right.cursor)));
+      if (outputEntries.length > RECOVERY_PACK_MAX_ENTRIES) continue;
+      const outputValue = serializeRecoveryPack(outputEntries.map((entry) => entry.signedBody));
+      if (Buffer.byteLength(outputValue, "utf8") > RECOVERY_PACK_VALUE_LIMIT) continue;
+      const outputName = recoveryPackName(bucket, outputValue);
+      const existingOutput = await getFugueAuthorityVariable(github, outputName);
+      if (existingOutput !== undefined && existingOutput !== outputValue) continue;
+      if (existingOutput === outputValue) return { progress, allocated: true };
+      if (await replaceFugueAuthorityVariable(
+        github,
+        candidate.sourceName,
+        candidate.expectedValue,
+        outputName,
+        outputValue,
+        allocation.entry.cursor.publisher_sha,
+      )) {
+        return { progress: true, allocated: true };
+      }
+      // A concurrent protected writer may have transformed this source after our snapshot. Force a
+      // fresh outer pass instead of treating a stale source view as representational exhaustion.
+      if (await getFugueAuthorityVariable(github, candidate.sourceName) !== candidate.expectedValue) progress = true;
+    }
   }
 
   type SourceUnit = { sourceName: string; expectedValue: string; entries: VerifiedRecoveryEntry[] };
@@ -1098,7 +1266,9 @@ async function compactRecoveryBucket(
   if (current.length) sourceGroups.push(current);
 
   for (const sourceGroup of sourceGroups) {
-    if (sourceGroup.length < 2) continue;
+    // A sole verified leaf is also canonicalized into a one-entry content-addressed pack. This is
+    // count-neutral and guarantees that an already-compacted bucket exposes any remaining partial
+    // pack capacity to a later hard-cap allocation.
     const outputEntries = sourceGroup.flatMap((unit) => unit.entries)
       .sort((left, right) => recoveryIdentity(left.cursor).localeCompare(recoveryIdentity(right.cursor)));
     const outputValue = serializeRecoveryPack(outputEntries.map((entry) => entry.signedBody));
@@ -1121,7 +1291,14 @@ async function compactRecoveryBucket(
     for (const unit of sourceGroup) {
       if (unit.sourceName === donorName || unit.sourceName === outputName) continue;
       if (allocation && !allocated &&
-          await replaceFugueAuthorityVariable(github, unit.sourceName, unit.expectedValue, allocation.name, allocation.value)) {
+          await replaceFugueAuthorityVariable(
+            github,
+            unit.sourceName,
+            unit.expectedValue,
+            allocation.name,
+            allocation.value,
+            allocation.entry.cursor.publisher_sha,
+          )) {
         allocated = true;
         progress = true;
         continue;
@@ -1135,22 +1312,34 @@ async function compactRecoveryBucket(
 
 async function consumeRecoveryReserveForAllocation(
   github: FugueGitHub,
-  allocation: RecoveryAllocation,
+  allocation: VerifiedRecoveryAllocation,
 ): Promise<boolean> {
   if (await getFugueAuthorityVariable(github, allocation.name) === allocation.value) return true;
   const reserves = (await listFugueAuthorityVariables(github, RECOVERY_RESERVE_PREFIX))
     .filter((reserve) => reserve.value === RECOVERY_RESERVE_VALUE)
     .sort((left, right) => left.name.localeCompare(right.name));
   for (const reserve of reserves) {
-    if (await replaceFugueAuthorityVariable(github, reserve.name, reserve.value, allocation.name, allocation.value)) return true;
+    if (await replaceFugueAuthorityVariable(
+      github,
+      reserve.name,
+      reserve.value,
+      allocation.name,
+      allocation.value,
+      allocation.entry.cursor.publisher_sha,
+    )) return true;
   }
   return false;
 }
 
 async function allocateRecoveryVariable(github: FugueGitHub, allocation: RecoveryAllocation): Promise<boolean> {
-  if (await createFugueAuthorityVariable(github, allocation.name, allocation.value)) return true;
-  if (await getFugueAuthorityVariable(github, allocation.name) === allocation.value) return true;
-  if (await consumeRecoveryReserveForAllocation(github, allocation)) return true;
+  const verifiedAllocation = await verifyRecoveryAllocation(github, allocation);
+  await assertRepositoryDefaultBranchRevision(github, verifiedAllocation.entry.cursor.publisher_sha);
+  if (await createFugueAuthorityVariable(github, verifiedAllocation.name, verifiedAllocation.value)) return true;
+  if (await getFugueAuthorityVariable(github, verifiedAllocation.name) === verifiedAllocation.value) {
+    await assertRepositoryDefaultBranchRevision(github, verifiedAllocation.entry.cursor.publisher_sha);
+    return true;
+  }
+  if (await consumeRecoveryReserveForAllocation(github, verifiedAllocation)) return true;
 
   for (let attempt = 0; attempt < RECOVERY_COMPACTION_RETRY_LIMIT; attempt += 1) {
     const variables = await listFugueAuthorityVariables(github, "FUGUE_D3");
@@ -1162,21 +1351,22 @@ async function allocateRecoveryVariable(github: FugueGitHub, allocation: Recover
         github,
         bucket,
         variables.filter((entry) => variableRecoveryBucket(entry.name) === bucket),
-        allocation,
+        verifiedAllocation,
       );
       madeProgress ||= result.progress;
-      if (result.allocated || await getFugueAuthorityVariable(github, allocation.name) === allocation.value) {
+      if (result.allocated || await getFugueAuthorityVariable(github, verifiedAllocation.name) === verifiedAllocation.value) {
         await ensureRecoveryReserveVariables(github);
         return true;
       }
     }
-    if (await createFugueAuthorityVariable(github, allocation.name, allocation.value)) {
+    await assertRepositoryDefaultBranchRevision(github, verifiedAllocation.entry.cursor.publisher_sha);
+    if (await createFugueAuthorityVariable(github, verifiedAllocation.name, verifiedAllocation.value)) {
       await ensureRecoveryReserveVariables(github);
       return true;
     }
     if (!madeProgress) break;
   }
-  return await getFugueAuthorityVariable(github, allocation.name) === allocation.value;
+  return await getFugueAuthorityVariable(github, verifiedAllocation.name) === verifiedAllocation.value;
 }
 
 /**
@@ -1214,14 +1404,23 @@ async function writeRecoveryCursor(
   options: RecoveryIdentityOptions,
   supplied: RecoveryCursor,
 ): Promise<void> {
+  // The Authority-variable witness is the actual d3 commit point. A run whose protected base has
+  // ceased to be current must not compact, sign, or allocate that witness.
+  await assertRepositoryDefaultBranchRevision(github, options.publisherSha);
   const identity = recoveryOptionsIdentity(options);
   await compactFugueRecoveryAuthorityVariables(github, identity);
   const current = await findRecoveryCursor(github, options);
+  if (current && recoveryAuthorityConflict(current.cursor, supplied)) {
+    throw new CanonicalWorkStateIntegrityError(
+      `Conflicting protected durable witnesses share one authority order for ${options.scope}.`,
+    );
+  }
   if (current && compareRecoveryProgress(current.cursor, supplied) >= 0) {
     await compactFugueRecoveryAuthorityVariables(github, identity);
     return;
   }
 
+  await assertRepositoryDefaultBranchRevision(github, options.publisherSha);
   const cursor = recoveryCursorSchema.parse({ ...supplied, checkpoint_at: new Date().toISOString() });
   const payload = Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
   const unsigned = `${RECOVERY_START}
@@ -1236,10 +1435,13 @@ Durable Fugue recovery checkpoint: ${options.scope}`;
     throw new CanonicalWorkStateIntegrityError("Durable recovery checkpoint failed protected provenance self-check.");
   }
 
+  // Re-check immediately before the create-only/slot-preserving Authority mutation. This is the
+  // last trust-root observation before the witness can become durable.
+  await assertRepositoryDefaultBranchRevision(github, options.publisherSha);
   const name = recoveryVariableName(options, signed);
   if (!(await allocateRecoveryVariable(github, { name, value: signed }))) {
     throw new CanonicalWorkStateIntegrityError(
-      "Protected Fugue Authority-variable namespace has no redundant recovery slot for the required immutable checkpoint; refusing to delete any sole-greatest cursor or unrelated repository variable.",
+      "Protected Fugue Authority-variable namespace cannot represent the required immutable checkpoint after redundant-source, reserve-transfer, and partial-pack allocation; refusing to delete any sole-greatest cursor or unrelated repository variable.",
     );
   }
   const durable = await findRecoveryCursor(github, options);
