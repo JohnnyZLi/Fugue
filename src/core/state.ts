@@ -43,7 +43,6 @@ const STATUS_PAGE_SIZE = 100;
 const MANIFEST_PROOFS_PER_RECOVERY_SLICE = 8;
 const STATUS_PAGES_PER_RECOVERY_SLICE = 32;
 const REPOSITORY_AUTHORITY_VARIABLE_CAPACITY = 500;
-export const FUGUE_RECOVERY_VARIABLE_LIMIT = 24;
 const RECOVERY_AUTHORITY_PREFIX = "FUGUE_D3_";
 const MANIFEST_PATTERN = /^n=(\d+);c=([0-9a-f]{32});b=([0-9a-f]{64});a=(\d+);z=(\d+)$/i;
 const DURABLE_MANIFEST_URL = "https://token.actions.githubusercontent.com/fugue/d3";
@@ -1043,9 +1042,11 @@ async function verifiedRecoveryAuthorityVariables(github: FugueGitHub): Promise<
 }
 
 /**
- * Recovery checkpoints are performance state, never d3 authority. Keep one deterministic greatest
- * checkpoint per identity and a small global working set. Equal-progress writers choose the same
- * lexicographic survivor, so concurrent cleanup cannot cross-delete every valid checkpoint.
+ * Recovery checkpoints are performance state, never d3 authority. Compaction is strictly per
+ * recovery identity: one deterministic greatest cursor survives for every active scope. A
+ * different scope's sole in-progress cursor is never evicted. Under repository capacity pressure
+ * only quiescent completed cursors are reclaimable, so many simultaneous recoveries retain
+ * monotonic progress instead of restarting from page 1.
  */
 export async function compactFugueRecoveryAuthorityVariables(
   github: FugueGitHub,
@@ -1073,26 +1074,17 @@ export async function compactFugueRecoveryAuthorityVariables(
     for (const stale of group.slice(1)) await deleteFugueAuthorityVariable(github, stale.variableName);
   }
 
-  survivors.sort((left, right) => {
-    const leftPreserved = recoveryIdentity(left.cursor) === preserveIdentity ? 1 : 0;
-    const rightPreserved = recoveryIdentity(right.cursor) === preserveIdentity ? 1 : 0;
-    if (leftPreserved !== rightPreserved) return rightPreserved - leftPreserved;
-    const timestamp = Date.parse(right.cursor.checkpoint_at) - Date.parse(left.cursor.checkpoint_at);
-    if (timestamp !== 0) return timestamp;
-    return left.variableName.localeCompare(right.variableName);
-  });
-
-  for (const stale of survivors.slice(FUGUE_RECOVERY_VARIABLE_LIMIT)) {
-    if (recoveryIdentity(stale.cursor) === preserveIdentity) continue;
-    await deleteFugueAuthorityVariable(github, stale.variableName);
-  }
-
   let all = await listFugueAuthorityVariables(github, "");
   if (all.length + reserveSlots <= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY) return;
-  const deletable = survivors
+  const quiescent = survivors
     .filter((entry) => recoveryIdentity(entry.cursor) !== preserveIdentity)
-    .sort((left, right) => Date.parse(left.cursor.checkpoint_at) - Date.parse(right.cursor.checkpoint_at));
-  for (const stale of deletable) {
+    .filter((entry) => entry.cursor.phase === "discover" && entry.cursor.scan_top_id === entry.cursor.complete_top_id)
+    .sort((left, right) => {
+      const timestamp = Date.parse(left.cursor.checkpoint_at) - Date.parse(right.cursor.checkpoint_at);
+      if (timestamp !== 0) return timestamp;
+      return left.variableName.localeCompare(right.variableName);
+    });
+  for (const stale of quiescent) {
     await deleteFugueAuthorityVariable(github, stale.variableName);
     all = await listFugueAuthorityVariables(github, "");
     if (all.length + reserveSlots <= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY) return;

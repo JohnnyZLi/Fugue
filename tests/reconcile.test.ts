@@ -16,9 +16,12 @@ import {
   getCurrentIntegrationRecord,
   getIntegrationRunStartEvidence,
   INTEGRATION_AUTHORITY_SLOT_LIMIT,
-  integrationEvidenceVariableName,
+  integrationAnchorVariableName,
+  integrationElectionVariableName,
+  integrationRunStartVariableName,
   integrationRunStartSchema,
   publishIntegrationRecord,
+  releaseIntegrationAuthorityVariable,
   sealIntegrationWorkflowRunEvent,
   serializeIntegrationRunStartEvidence,
 } from "../src/core/integration-status.js";
@@ -353,6 +356,34 @@ describe("d3 protected durable authority", () => {
     expect(surviving).toHaveLength(1);
   });
 
+  it("preserves monotonic checkpoints for more than 24 simultaneously recovering scopes under concurrent compaction", async () => {
+    const github = makeGithub();
+    for (let index = 0; index < 3400; index += 1) {
+      github.__statuses.push({ id: ++github.__nextStatusId, sha: BASE, context: `many-scope-noise/${index}`, description: "noise" });
+    }
+    for (let scope = 0; scope < 30; scope += 1) {
+      const result = await recoverDurableProtocolRecord(github, {
+        storageSha: BASE, publisherSha: BASE, scope: `many/${scope}`, issueNumber: 100 + scope,
+        parse: () => null, timestamp: () => 0, order: () => "",
+      });
+      expect(result.exhausted).toBe(false);
+    }
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_D3_"))).toHaveLength(30);
+    await Promise.all([
+      compactFugueRecoveryAuthorityVariables(github),
+      compactFugueRecoveryAuthorityVariables(github),
+      compactFugueRecoveryAuthorityVariables(github),
+    ]);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_D3_"))).toHaveLength(30);
+    github.__listStatus.mockClear();
+    await recoverDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: "many/29", issueNumber: 129,
+      parse: () => null, timestamp: () => 0, order: () => "",
+    });
+    const pages = github.__listStatus.mock.calls.map((call) => call[0]?.page ?? 1);
+    expect(pages.some((page) => page > 1)).toBe(true);
+  });
+
   it("ignores pre-created, deleted, rewound, fast-forwarded, and replayed custom recovery refs after presentation loss", async () => {
     const github = makeGithub();
     await publishCanonicalWorkState(github, canonicalWork("ref-independent-authority"));
@@ -500,7 +531,7 @@ describe("durable Integration one-request/one-run/result authority", () => {
     const stale = integrationRunStartSchema.parse({
       version: 1, kind: "integration_run_start", request_id: record.request.request_id,
       pr_number: record.identity.prNumber, head_sha: record.identity.headSha, base_sha: record.identity.baseSha,
-      secret_digest: record.dispatch!.secret_digest, run_id: 999, run_attempt: 1, created_at: "2026-08-17T03:19:59.000Z",
+      secret_digest: record.dispatch!.secret_digest, anchor_name: record.dispatch!.anchor_name, run_id: 999, run_attempt: 1, created_at: "2026-08-17T03:19:59.000Z",
     });
     const staleSigned = await signProtocolBody(github, serializeIntegrationRunStartEvidence(stale));
     const staleCommit = await github.octokit.rest.git.createCommit({ owner: "JohnnyZLi", repo: "Fugue", message: staleSigned, tree: "1".repeat(40), parents: [BASE] });
@@ -609,9 +640,9 @@ describe("durable Integration one-request/one-run/result authority", () => {
     const github = makeGithub();
     const orphan = createIntegrationRequest(snapshot().identity, "2026-08-17T03:48:00.000Z");
     await authorizeIntegrationDispatch(github, orphan, "2026-08-17T03:48:00.000Z", "a".repeat(64));
-    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_PR_"))).toHaveLength(1);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_A_"))).toHaveLength(1);
 
-    const next = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T03:48:05.000Z"));
+    const next = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:00:00.000Z"));
     expect(next.dispatch).toBe(true);
     expect(next.request?.request_id).not.toBe(orphan.request_id);
     const current = await getCurrentIntegrationRecord(github, snapshot().identity);
@@ -619,14 +650,53 @@ describe("durable Integration one-request/one-run/result authority", () => {
     expect(current?.dispatch).toBeDefined();
   });
 
-  it("backs off safely when the bounded active Integration-slot budget is occupied", async () => {
+  it("linearizes concurrent protected request writers through one create-only election", async () => {
     const github = makeGithub();
+    const now = Date.parse("2026-08-17T03:48:00.000Z");
+    const [left, right] = await Promise.all([
+      ensureIntegrationDispatch(github, snapshot(), now),
+      ensureIntegrationDispatch(github, snapshot(), now),
+    ]);
+    expect(left.dispatch).toBe(true);
+    expect(right.dispatch).toBe(true);
+    expect(left.request?.request_id).toBe(right.request?.request_id);
+    expect(left.dispatchSecret).toBe(right.dispatchSecret);
+    const durable = await getCurrentIntegrationRecord(github, snapshot().identity);
+    expect(durable?.request.request_id).toBe(left.request?.request_id);
+    expect(durable?.dispatch?.anchor_name).toBe(left.authorityAnchor);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_A_"))).toHaveLength(1);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_E_"))).toHaveLength(0);
+  });
+
+  it("never lets stale cleanup delete a newer request-specific run-start", async () => {
+    const github = makeGithub();
+    const first = await publishAuthorizedRecord(github, 811, "2026-08-17T03:48:00.000Z");
+    await publishIntegrationRecord(github, {
+      ...first,
+      terminal: { state: "aborted", detail: "retry", created_at: "2026-08-17T03:48:05.000Z" },
+      created_at: "2026-08-17T03:48:05.000Z",
+    });
+    const next = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T03:48:10.000Z"));
+    expect(next.dispatch).toBe(true);
+    const second = await getCurrentIntegrationRecord(github, snapshot().identity);
+    expect(second?.request.request_id).not.toBe(first.request.request_id);
+    await installRunStartEvidence(github, second!, 812, "2026-08-17T03:48:11.000Z");
+    await releaseIntegrationAuthorityVariable(github, first);
+    expect((await getIntegrationRunStartEvidence(github, second!))?.run_id).toBe(812);
+  });
+
+  it("reclaims repository-wide pre-d3 orphan anchors before the active-slot cap wedges new Integration", async () => {
+    const github = makeGithub();
+    const old = "2026-08-17T03:00:00.000Z";
     for (let index = 0; index < INTEGRATION_AUTHORITY_SLOT_LIMIT; index += 1) {
-      github.__authorityVariables.set(`FUGUE_INT_PR_${String(1000 + index).padStart(10, "0")}`, "occupied");
+      const otherIdentity = { ...snapshot().identity, prNumber: 1000 + index };
+      const request = createIntegrationRequest(otherIdentity, old, index.toString(16).padStart(16, "0"));
+      await authorizeIntegrationDispatch(github, request, old, (index + 1).toString(16).padStart(64, "0"));
     }
-    const next = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T03:49:00.000Z"));
-    expect(next.dispatch).toBe(false);
-    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_PR_"))).toHaveLength(INTEGRATION_AUTHORITY_SLOT_LIMIT);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_A_"))).toHaveLength(INTEGRATION_AUTHORITY_SLOT_LIMIT);
+    const next = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T03:30:00.000Z"));
+    expect(next.dispatch).toBe(true);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_A_"))).toHaveLength(1);
   });
 
   it("reclaims the bounded per-PR Integration authority slot across repeated cancellations", async () => {
@@ -642,7 +712,7 @@ describe("durable Integration one-request/one-run/result authority", () => {
       await expect(sealIntegrationWorkflowRunEvent(
         github, completionEvent(record!.request, runId, "cancelled", new Date(now + 2000).toISOString()),
       )).resolves.toBe(true);
-      expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_PR_"))).toHaveLength(0);
+      expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_A_") || name.startsWith("FUGUE_INT_S_"))).toHaveLength(0);
       now += 10_000;
     }
   });
@@ -839,7 +909,7 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
           createWorkflowDispatch: vi.fn(async () => ({ data: {} })),
         },
         git: { getRef, getCommit, createCommit, createRef, updateRef },
-        pulls: { get: vi.fn(async () => ({ data: { head: { sha: HEAD }, base: { ref: "main" } } })) },
+        pulls: { get: vi.fn(async () => ({ data: { state: "open", head: { sha: HEAD }, base: { ref: "main", sha: BASE } } })) },
       },
     },
   } as unknown as TestGithub;
@@ -890,10 +960,10 @@ async function installRunStartEvidence(
   const evidence = integrationRunStartSchema.parse({
     version: 1, kind: "integration_run_start", request_id: record.request.request_id,
     pr_number: record.identity.prNumber, head_sha: record.identity.headSha, base_sha: record.identity.baseSha,
-    secret_digest: record.dispatch.secret_digest, run_id: runId, run_attempt: 1, created_at: createdAt,
+    secret_digest: record.dispatch.secret_digest, anchor_name: record.dispatch.anchor_name, run_id: runId, run_attempt: 1, created_at: createdAt,
   });
   const signed = await signProtocolBody(github, serializeIntegrationRunStartEvidence(evidence));
-  github.__authorityVariables.set(integrationEvidenceVariableName(record.identity.prNumber), signed);
+  github.__authorityVariables.set(integrationRunStartVariableName(record.request), signed);
   expect((await getIntegrationRunStartEvidence(github, record))?.run_id).toBe(runId);
 }
 

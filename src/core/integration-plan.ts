@@ -19,6 +19,7 @@ export const integrationRequestSchema = z.object({
 export const integrationDispatchAuthorizationSchema = z.object({
   secret_digest: z.string().regex(/^[0-9a-f]{64}$/i),
   authorized_at: z.string().min(1),
+  anchor_name: z.string().regex(/^FUGUE_INT_A_\d{10}_[0-9A-F]{16}$/),
 });
 
 export const integrationRunBindingSchema = z.object({

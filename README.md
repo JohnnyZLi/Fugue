@@ -89,7 +89,7 @@ A candidate that observes or copies pre-commit statuses cannot finish an aborted
 
 ### Bounded recovery
 
-Fake manifests must not create unbounded read amplification, and an attacker with `issues:write`, `statuses:write`, or `contents:write` must not be able to erase recovery progress. Locator comments and every `refs/fugue/**` custom Git ref are presentation/untrusted only. Recovery processes fixed-size status pages and bounded manifest/chunk work under a frozen status-ID ceiling, then writes each OIDC-signed progress checkpoint through a dedicated Fugue Authority GitHub App into repository Actions Variables. The normal workflow `GITHUB_TOKEN` permission set has no Variables permission; the App credential is exposed only through the protected-base `fugue-authority` environment. Readers validate checkpoints and select greatest progress. The checkpoint plane is a bounded working set: equal-progress writers deterministically retain the same lexicographic survivor, stale groups are compacted, and compaction runs before a new slot is needed so a full Fugue checkpoint set can recover without repository surgery.
+Fake manifests must not create unbounded read amplification, and an attacker with `issues:write`, `statuses:write`, or `contents:write` must not be able to erase recovery progress. Locator comments and every `refs/fugue/**` custom Git ref are presentation/untrusted only. Recovery processes fixed-size status pages and bounded manifest/chunk work under a frozen status-ID ceiling, then writes each OIDC-signed progress checkpoint through a dedicated Fugue Authority GitHub App into repository Actions Variables. The normal workflow `GITHUB_TOKEN` permission set has no Variables permission; the App credential is exposed only through the protected-base `fugue-authority` environment. Readers validate checkpoints and select greatest progress. The checkpoint plane is a bounded working set: equal-progress writers deterministically retain the same lexicographic survivor; compaction is per d3 scope and never evicts another active scope's sole cursor, while only quiescent completed cursors are reclaimed under finite-capacity pressure.
 
 The same durable-record primitive backs work-state, Coordinator snapshots, and Integration state. Ordinary locator/result comments and all custom Fugue refs can therefore be deleted or redirected without rolling authority backward; protected recovery recreates presentation from d3 plus the separate authority-variable checkpoint plane.
 
@@ -153,13 +153,13 @@ The durable lifecycle is:
 REQUEST
     protected Fugue creates an unpredictable signed request ID plus a fresh
     one-use 256-bit dispatch capability; only its digest is durable in d3
-    and a signed dispatch anchor is stored in the bounded per-PR Authority slot
+    and a signed dispatch anchor is stored in the bounded request-specific Authority anchor
 
 RUN START
     before checkout/setup/build, attempt 1 proves the one-use capability
-    and transitions the protected per-PR authority slot once to an OIDC-signed
-    run-start value carrying GITHUB_RUN_ID + attempt 1; after d3 binds that run,
-    the transient slot is reclaimed
+    from its request-specific immutable anchor and creates a request-specific
+    OIDC-signed run-start record with create-only first-wins semantics carrying
+    GITHUB_RUN_ID + attempt 1; after d3 binds that run, transient request records are reclaimed
 
 VALIDATE
     candidate checkout is read-only and credential-separated
@@ -170,7 +170,7 @@ TERMINAL
     then writes presentation attestation comment / fugue/integration status
 ```
 
-Filtered workflow-run search and custom Git refs are not binding authority. Same-request flood runs do not know the one-use capability and cannot transition the App-owned per-PR authority slot, while reruns are rejected because only attempt 1 may consume it. Fugue caps active Integration slots and reclaims each slot as soon as d3 contains the protected run binding or terminal abort, so cancellation/retry churn cannot consume the repository's finite Variables namespace. The exact run ID comes from the signed run-start value, so GitHub list caps and hostile ref movement do not affect first-run identity.
+Filtered workflow-run search and custom Git refs are not binding authority. Concurrent protected reconcilers converge through one deterministic create-only election, then use immutable request-specific anchor/run-start names; no live Authority variable is PATCHed or reused. Same-request flood runs do not know the one-use capability and cannot replace the first create-only run-start, while reruns are rejected because only attempt 1 may consume it. Fugue caps active request anchors, safely scavenges aged pre-d3 orphans repository-wide, and reclaims each request's transient records as soon as d3 contains the protected run binding or terminal abort, so cancellation/retry or abandoned-PR residue cannot consume the finite Variables namespace. The exact run ID comes from the signed run-start value, so GitHub list caps and hostile ref movement do not affect first-run identity.
 
 If transport never crosses the run-start boundary, protected recovery may abort that unused request and create a fresh one. Once run-start is durable, however, deletion of the exact Actions run cannot become a retry: after the recovery grace period Fugue seals terminal failure unless it already has durable PASS/failure/error or an actually observed cancellation/abortion. A `workflow_run` consumer can seal outcomes promptly, but cancelling or deleting that consumer cannot erase the run-start evidence or turn a possible genuine failure into retryable transport.
 
@@ -242,4 +242,4 @@ See [`docs/protocol-v0.1.md`](docs/protocol-v0.1.md), [`docs/chatgpt-project.md`
 
 ### d3 recovery and Integration ordering
 
-D3 manifests authenticate the ordered exact server status ID of every committed chunk plus authority order. Recovery freezes a status-ID ceiling and advances a bounded, self-compacting signed low-water cursor without resetting when hostile statuses are appended; locator/receipt comments are repaired presentation hints only. Coordinator snapshots order by immutable issue `updated_at` plus protected sequence/event identity. Integration binds from the one-use App-owned per-PR run-start slot—not workflow-run list scanning—and then commits that exact run ID into d3; protected `workflow_run` completion events can seal terminal failure even if the Actions run is subsequently deleted. Work-spec identity is produced by the single `canonicalWorkSpecIdentity` normalization/hash path and review-start attestations carry that exact digest.
+D3 manifests authenticate the ordered exact server status ID of every committed chunk plus authority order. Recovery freezes a status-ID ceiling and advances a bounded, self-compacting signed low-water cursor without resetting when hostile statuses are appended; locator/receipt comments are repaired presentation hints only. Coordinator snapshots order by immutable issue `updated_at` plus protected sequence/event identity. Integration binds from the one-use App-owned request-specific run-start record—not workflow-run list scanning—and then commits that exact run ID into d3; protected `workflow_run` completion events can seal terminal failure even if the Actions run is subsequently deleted. Work-spec identity is produced by the single `canonicalWorkSpecIdentity` normalization/hash path and review-start attestations carry that exact digest.

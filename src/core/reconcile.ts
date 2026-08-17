@@ -27,7 +27,7 @@ import { upsertStateComment } from "./state-comment.js";
 import { actionLabel, observeWork, planWork, type WorkflowAction } from "./workflow.js";
 import { claimWorker } from "./worker.js";
 import type { FugueGitHub } from "./github.js";
-import { ensureIntegrationDispatch, sealIntegrationWorkflowRunEvent } from "./integration-status.js";
+import { ensureIntegrationDispatch, reclaimOrphanIntegrationAuthorityVariables, sealIntegrationWorkflowRunEvent } from "./integration-status.js";
 import { FUGUE_PROTOCOL_ACTOR } from "./provenance.js";
 import { captureEvaluation } from "./evaluation.js";
 import { loadCurrentCanonicalWorkState, publishCanonicalWorkState } from "./state.js";
@@ -70,6 +70,7 @@ export async function reconcileRepository(
   assertProtectedWorkflowRuntimeCurrent(policy);
   await rollCanonicalWorkStatesToCurrentBase(github, policy);
   await repairCanonicalWorkStateComments(github, policy);
+  await reclaimOrphanIntegrationAuthorityVariables(github);
 
   await sealIntegrationWorkflowRunEvent(github, integrationWorkflowRunEventFromEnvironment());
   const event = coordinatorIssueEventFromEnvironment();
@@ -449,13 +450,13 @@ export async function dispatchIntegration(github: FugueGitHub, policy: ActivePol
     throw new Error(`Integration dispatch base changed while reconciling PR #${prNumber}.`);
   }
   const next = await ensureIntegrationDispatch(github, snapshot, now);
-  if (!next.dispatch || !next.request || !next.dispatchSecret) return;
+  if (!next.dispatch || !next.request || !next.dispatchSecret || !next.authorityAnchor) return;
   await github.octokit.rest.actions.createWorkflowDispatch({
     owner,
     repo,
     workflow_id: "fugue-integration.yml",
     ref: policy.identity.baseBranch,
-    inputs: { pr: prNumber, request_id: next.request.request_id, dispatch_secret: next.dispatchSecret },
+    inputs: { pr: prNumber, request_id: next.request.request_id, dispatch_secret: next.dispatchSecret, authority_anchor: next.authorityAnchor },
   });
 }
 

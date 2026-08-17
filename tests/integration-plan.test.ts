@@ -122,6 +122,7 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).toContain('GH_TOKEN: ""');
     expect(workflow).toContain("FUGUE_RUNTIME_SHA: ${{ github.sha }}");
     expect(workflow).toContain("dispatch_secret:");
+    expect(workflow).toContain("authority_anchor:");
     expect(workflow).toContain("environment: fugue-authority");
     expect(workflow).toContain("Audit external Fugue Authority environment invariant");
     expect(workflow).toContain("deployment-branch-policies?per_page=100");
@@ -131,8 +132,12 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).toContain("FUGUE_AUTHORITY_APP_PRIVATE_KEY");
     expect(workflow).toContain("FUGUE_AUTHORITY_TOKEN");
     expect(workflow).toContain("Commit protected Integration run-start evidence");
-    expect(workflow).toContain("FUGUE_INT_PR_${String(prNumber).padStart(10, '0')}");
-    expect(workflow).toContain("/actions/variables/${variableName}");
+    const prepare = workflow.slice(workflow.indexOf("  prepare:"), workflow.indexOf("  validate:"));
+    expect(prepare).toContain("actions: read");
+    expect(workflow).toContain("FUGUE_INT_S_${String(prNumber).padStart(10, '0')}_${requestToken}");
+    expect(workflow).toContain("/actions/variables/${anchorName}");
+    expect(workflow).toContain("method: 'POST'");
+    expect(workflow).not.toContain("method: 'PATCH'");
     expect(workflow).not.toContain("/git/refs/");
     expect(workflow).not.toContain("fugue/integration/${digest}");
     expect(workflow).toContain("ACTIONS_ID_TOKEN_REQUEST_URL");

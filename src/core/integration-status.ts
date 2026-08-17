@@ -8,6 +8,7 @@ import {
   createIntegrationRequest,
   integrationDispatchAuthorizationSchema,
   integrationRunTitle,
+  integrationRequestSchema,
   parseIntegrationRecord,
   serializeIntegrationRecord,
   type IntegrationDispatchAuthorization,
@@ -32,7 +33,6 @@ import {
   listFugueAuthorityVariables,
   publishDurableProtocolRecord,
   recoverDurableProtocolRecord,
-  updateFugueAuthorityVariable,
 } from "./state.js";
 
 export type IntegrationState = "none" | "pending" | "success" | "failure" | "error" | "stale";
@@ -71,7 +71,9 @@ export const INTEGRATION_REQUEST_RECOVERY_GRACE_MS = 10 * 60 * 1000;
 const INTEGRATION_DISPATCH_ANCHOR_START = "<!-- fugue-integration-dispatch-anchor";
 const INTEGRATION_RUN_START = "<!-- fugue-integration-run-start";
 const PROTOCOL_END = "-->";
-const INTEGRATION_AUTHORITY_PREFIX = "FUGUE_INT_PR_";
+const INTEGRATION_ELECTION_PREFIX = "FUGUE_INT_E_";
+const INTEGRATION_ANCHOR_PREFIX = "FUGUE_INT_A_";
+const INTEGRATION_RUN_START_PREFIX = "FUGUE_INT_S_";
 export const INTEGRATION_AUTHORITY_SLOT_LIMIT = 64;
 
 export class IntegrationAuthorityCapacityPendingError extends Error {
@@ -84,22 +86,24 @@ export class IntegrationAuthorityCapacityPendingError extends Error {
 const integrationDispatchAnchorSchema = z.object({
   version: z.literal(1),
   kind: z.literal("integration_dispatch_anchor"),
-  request_id: z.string().min(1),
-  pr_number: z.number().int().positive(),
-  head_sha: z.string().regex(/^[0-9a-f]{40}$/i),
-  base_sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  election_name: z.string().regex(/^FUGUE_INT_E_\d{10}_[0-9A-F]{16}_[0-9A-F]{8}$/),
+  anchor_name: z.string().regex(/^FUGUE_INT_A_\d{10}_[0-9A-F]{16}$/),
+  predecessor_request_id: z.string().regex(/^int-[0-9a-f]{16}-[0-9a-f]{16}$/).nullable(),
+  request: integrationRequestSchema,
   secret_digest: z.string().regex(/^[0-9a-f]{64}$/i),
+  dispatch_secret: z.string().regex(/^[0-9a-f]{64}$/i),
   authorized_at: z.string().min(1),
 });
 
 export const integrationRunStartSchema = z.object({
   version: z.literal(1),
   kind: z.literal("integration_run_start"),
-  request_id: z.string().min(1),
+  request_id: z.string().regex(/^int-[0-9a-f]{16}-[0-9a-f]{16}$/),
   pr_number: z.number().int().positive(),
   head_sha: z.string().regex(/^[0-9a-f]{40}$/i),
   base_sha: z.string().regex(/^[0-9a-f]{40}$/i),
   secret_digest: z.string().regex(/^[0-9a-f]{64}$/i),
+  anchor_name: z.string().regex(/^FUGUE_INT_A_\d{10}_[0-9A-F]{16}$/),
   run_id: z.number().int().positive(),
   run_attempt: z.literal(1),
   created_at: z.string().min(1),
@@ -124,9 +128,34 @@ function parseIntegrationEvidence<T>(body: string, marker: string, schema: z.Zod
   return schema.parse(JSON.parse(Buffer.from(match[1], "base64url").toString("utf8")) as unknown);
 }
 
-export function integrationEvidenceVariableName(prNumber: number): string {
-  if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error("Invalid Integration PR number.");
-  return `${INTEGRATION_AUTHORITY_PREFIX}${String(prNumber).padStart(10, "0")}`;
+function integrationRequestToken(requestId: string): string {
+  return createHash("sha256").update(requestId, "utf8").digest("hex").slice(0, 16).toUpperCase();
+}
+
+function integrationIdentityToken(request: IntegrationRequest): string {
+  const match = request.request_id.match(/^int-([0-9a-f]{16})-[0-9a-f]{16}$/);
+  if (!match?.[1]) throw new Error("Invalid Integration request identity token.");
+  return match[1].toUpperCase();
+}
+
+function predecessorToken(predecessorRequestId?: string): string {
+  if (!predecessorRequestId) return "00000000";
+  if (!/^int-[0-9a-f]{16}-[0-9a-f]{16}$/.test(predecessorRequestId)) {
+    throw new Error("Invalid Integration predecessor request ID.");
+  }
+  return createHash("sha256").update(predecessorRequestId, "utf8").digest("hex").slice(0, 8).toUpperCase();
+}
+
+export function integrationElectionVariableName(request: IntegrationRequest, predecessorRequestId?: string): string {
+  return `${INTEGRATION_ELECTION_PREFIX}${String(request.identity.prNumber).padStart(10, "0")}_${integrationIdentityToken(request)}_${predecessorToken(predecessorRequestId)}`;
+}
+
+export function integrationAnchorVariableName(request: IntegrationRequest): string {
+  return `${INTEGRATION_ANCHOR_PREFIX}${String(request.identity.prNumber).padStart(10, "0")}_${integrationRequestToken(request.request_id)}`;
+}
+
+export function integrationRunStartVariableName(request: IntegrationRequest): string {
+  return `${INTEGRATION_RUN_START_PREFIX}${String(request.identity.prNumber).padStart(10, "0")}_${integrationRequestToken(request.request_id)}`;
 }
 
 export function serializeIntegrationRunStartEvidence(value: IntegrationRunStartEvidence): string {
@@ -145,81 +174,115 @@ function parseIntegrationRunStart(body: string): IntegrationRunStartEvidence | n
   return parseIntegrationEvidence(body, INTEGRATION_RUN_START, integrationRunStartSchema);
 }
 
+async function verifiedIntegrationAnchor(
+  github: FugueGitHub,
+  body: string,
+  expectedIdentity?: IntegrationRequest["identity"],
+): Promise<IntegrationDispatchAnchor | undefined> {
+  let anchor: IntegrationDispatchAnchor | null;
+  try { anchor = parseIntegrationDispatchAnchor(body); } catch { return undefined; }
+  if (!anchor) return undefined;
+  const nonce = anchor.request.request_id.match(/^int-[0-9a-f]{16}-([0-9a-f]{16})$/)?.[1];
+  if (!nonce) return undefined;
+  const canonicalRequest = createIntegrationRequest(anchor.request.identity, anchor.request.created_at, nonce);
+  if (canonicalRequest.request_id !== anchor.request.request_id || canonicalRequest.created_at !== anchor.request.created_at) {
+    return undefined;
+  }
+  if (anchor.election_name !== integrationElectionVariableName(anchor.request, anchor.predecessor_request_id ?? undefined) ||
+      anchor.anchor_name !== integrationAnchorVariableName(anchor.request) ||
+      createHash("sha256").update(anchor.dispatch_secret, "utf8").digest("hex") !== anchor.secret_digest) {
+    return undefined;
+  }
+  if (expectedIdentity && !sameEvaluationIdentity(anchor.request.identity, expectedIdentity)) return undefined;
+  const timestamp = Date.parse(anchor.authorized_at);
+  if (!Number.isFinite(timestamp)) return undefined;
+  try {
+    if (!(await verifyProtocolPublicationBodyAtRevision(github, body, anchor.request.identity.baseSha, timestamp))) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  return anchor;
+}
+
 export async function authorizeIntegrationDispatch(
   github: FugueGitHub,
   request: IntegrationRequest,
   authorizedAt = new Date().toISOString(),
   secret = randomBytes(32).toString("hex"),
-): Promise<{ secret: string; authorization: IntegrationDispatchAuthorization }> {
+  predecessorRequestId?: string,
+): Promise<{ secret: string; authorization: IntegrationDispatchAuthorization; request: IntegrationRequest; electionName: string }> {
   if (!/^[0-9a-f]{64}$/i.test(secret)) throw new Error("Integration dispatch secret must be 256-bit hexadecimal.");
-  const secretDigest = createHash("sha256").update(secret, "utf8").digest("hex");
-  const authorization = integrationDispatchAuthorizationSchema.parse({ secret_digest: secretDigest, authorized_at: authorizedAt });
-  const anchor = integrationDispatchAnchorSchema.parse({
+  const timestamp = Date.parse(authorizedAt);
+  if (!Number.isFinite(timestamp)) throw new Error("Integration dispatch authorization time is invalid.");
+  await reclaimOrphanIntegrationAuthorityVariables(github, timestamp);
+  await compactFugueRecoveryAuthorityVariables(github, undefined, 2);
+  await assertRepositoryDefaultBranchRevision(github, request.identity.baseSha);
+
+  const electionName = integrationElectionVariableName(request, predecessorRequestId);
+  const candidateAnchor = integrationDispatchAnchorSchema.parse({
     version: 1,
     kind: "integration_dispatch_anchor",
-    request_id: request.request_id,
-    pr_number: request.identity.prNumber,
-    head_sha: request.identity.headSha,
-    base_sha: request.identity.baseSha,
-    secret_digest: secretDigest,
+    election_name: electionName,
+    anchor_name: integrationAnchorVariableName(request),
+    predecessor_request_id: predecessorRequestId ?? null,
+    request,
+    secret_digest: createHash("sha256").update(secret, "utf8").digest("hex"),
+    dispatch_secret: secret,
     authorized_at: authorizedAt,
   });
-  await createIntegrationDispatchAnchor(github, request, anchor);
-  return { secret, authorization };
-}
-
-async function createIntegrationDispatchAnchor(
-  github: FugueGitHub,
-  request: IntegrationRequest,
-  anchor: IntegrationDispatchAnchor,
-): Promise<void> {
-  await assertRepositoryDefaultBranchRevision(github, request.identity.baseSha);
-  const signed = await signProtocolBody(github, serializeIntegrationDispatchAnchor(anchor));
-  const timestamp = Date.parse(anchor.authorized_at);
-  if (!(await verifyProtocolPublicationBodyAtRevision(github, signed, request.identity.baseSha, timestamp))) {
-    throw new Error("Protected Integration dispatch anchor failed publisher self-check.");
+  const signedCandidate = await signProtocolBody(github, serializeIntegrationDispatchAnchor(candidateAnchor));
+  if (!(await verifyProtocolPublicationBodyAtRevision(github, signedCandidate, request.identity.baseSha, timestamp))) {
+    throw new Error("Protected Integration election anchor failed publisher self-check.");
   }
-  await assertRepositoryDefaultBranchRevision(github, request.identity.baseSha);
-  const name = integrationEvidenceVariableName(request.identity.prNumber);
-  await compactFugueRecoveryAuthorityVariables(github, undefined, 1);
-  let existing = await getFugueAuthorityVariable(github, name);
-  if (!existing) {
-    const active = await listFugueAuthorityVariables(github, INTEGRATION_AUTHORITY_PREFIX);
+
+  let electionBody = await getFugueAuthorityVariable(github, electionName);
+  if (!electionBody) {
+    const active = await listFugueAuthorityVariables(github, INTEGRATION_ANCHOR_PREFIX);
     if (active.length >= INTEGRATION_AUTHORITY_SLOT_LIMIT) {
-      throw new IntegrationAuthorityCapacityPendingError(
-        `Protected Integration authority has ${active.length} active PR slots; scheduled reconciliation will retry after an existing slot binds or aborts.`,
-      );
+      await reclaimOrphanIntegrationAuthorityVariables(github, timestamp);
+      const remaining = await listFugueAuthorityVariables(github, INTEGRATION_ANCHOR_PREFIX);
+      if (remaining.length >= INTEGRATION_AUTHORITY_SLOT_LIMIT) {
+        throw new IntegrationAuthorityCapacityPendingError(
+          `Protected Integration authority has ${remaining.length} active request anchors; scheduled reclamation found no safe pre-d3 orphan to reclaim.`,
+        );
+      }
     }
-    const created = await createFugueAuthorityVariable(github, name, signed);
-    if (created) existing = signed;
-    else existing = await getFugueAuthorityVariable(github, name);
-    if (!existing) {
+    const created = await createFugueAuthorityVariable(github, electionName, signedCandidate);
+    electionBody = created ? signedCandidate : await getFugueAuthorityVariable(github, electionName);
+    if (!electionBody) {
       throw new IntegrationAuthorityCapacityPendingError(
-        "Repository Authority-variable capacity is temporarily full; Fugue reclaimed recovery checkpoints where safe and will retry without Human repository surgery.",
+        "Repository Authority-variable capacity is temporarily full; Fugue retained every live d3 cursor/request authority and will retry after safe reclamation.",
       );
     }
   }
 
-  const parsedAnchor = (() => { try { return parseIntegrationDispatchAnchor(existing!); } catch { return null; } })();
-  if (parsedAnchor && JSON.stringify(parsedAnchor) === JSON.stringify(anchor) &&
-      await verifyProtocolPublicationBodyAtRevision(github, existing, request.identity.baseSha, timestamp)) return;
-  const parsedStart = (() => { try { return parseIntegrationRunStart(existing!); } catch { return null; } })();
-  const sameStartIdentity = parsedStart && parsedStart.pr_number === request.identity.prNumber &&
-    parsedStart.head_sha === request.identity.headSha && parsedStart.base_sha === request.identity.baseSha;
-  if (sameStartIdentity && parsedStart.request_id !== request.request_id) {
-    throw new Error(`Integration authority slot ${name} was already consumed by run ${parsedStart.run_id} for request ${parsedStart.request_id}.`);
+  const winner = await verifiedIntegrationAnchor(github, electionBody, request.identity);
+  if (!winner || winner.election_name !== electionName ||
+      (winner.predecessor_request_id ?? undefined) !== predecessorRequestId) {
+    throw new Error(`Protected Integration election ${electionName} is malformed or belongs to another retry generation.`);
   }
 
-  // authorizeIntegrationDispatch creates the anchor before d3 publishes the request and only the
-  // caller dispatches after that publication succeeds. Therefore a different same-identity *anchor*
-  // with no run-start is a crash residue that can never have been legitimately consumed; reclaiming
-  // it prevents a crash between anchor creation and d3 request publication from wedging the PR.
-  // A same-identity run-start above is never reclaimed because it proves the protected start boundary
-  // was crossed and must remain fail-closed until d3 recovery resolves that request.
-  // Different-head/base or malformed slots are stale presentation/working state and are also reclaimable.
-  await updateFugueAuthorityVariable(github, name, signed);
-  const committed = await getFugueAuthorityVariable(github, name);
-  if (committed !== signed) throw new Error(`Integration dispatch authority slot ${name} was not durably replaced.`);
+  let anchorBody = await getFugueAuthorityVariable(github, winner.anchor_name);
+  if (!anchorBody) {
+    const created = await createFugueAuthorityVariable(github, winner.anchor_name, electionBody);
+    anchorBody = created ? electionBody : await getFugueAuthorityVariable(github, winner.anchor_name);
+  }
+  if (anchorBody !== electionBody) {
+    throw new Error(`Protected Integration request anchor ${winner.anchor_name} did not preserve the elected immutable value.`);
+  }
+
+  return {
+    secret: winner.dispatch_secret,
+    request: winner.request,
+    electionName,
+    authorization: integrationDispatchAuthorizationSchema.parse({
+      secret_digest: winner.secret_digest,
+      authorized_at: winner.authorized_at,
+      anchor_name: winner.anchor_name,
+    }),
+  };
 }
 
 async function verifyIntegrationDispatchAnchor(
@@ -227,15 +290,12 @@ async function verifyIntegrationDispatchAnchor(
   record: IntegrationRecord,
   body: string,
 ): Promise<IntegrationDispatchAnchor | undefined> {
-  let anchor: IntegrationDispatchAnchor | null;
-  try { anchor = parseIntegrationDispatchAnchor(body); } catch { return undefined; }
+  const anchor = await verifiedIntegrationAnchor(github, body, record.identity);
   if (!anchor || !record.dispatch) return undefined;
-  if (anchor.request_id !== record.request.request_id || anchor.pr_number !== record.identity.prNumber ||
-      anchor.head_sha !== record.identity.headSha || anchor.base_sha !== record.identity.baseSha ||
-      anchor.secret_digest !== record.dispatch.secret_digest || anchor.authorized_at !== record.dispatch.authorized_at) return undefined;
-  const timestamp = Date.parse(anchor.authorized_at);
-  if (!Number.isFinite(timestamp) ||
-      !(await verifyProtocolPublicationBodyAtRevision(github, body, record.identity.baseSha, timestamp))) return undefined;
+  if (anchor.request.request_id !== record.request.request_id ||
+      anchor.secret_digest !== record.dispatch.secret_digest ||
+      anchor.authorized_at !== record.dispatch.authorized_at ||
+      anchor.anchor_name !== record.dispatch.anchor_name) return undefined;
   return anchor;
 }
 
@@ -244,40 +304,109 @@ export async function getIntegrationRunStartEvidence(
   record: IntegrationRecord,
 ): Promise<IntegrationRunStartEvidence | undefined> {
   if (!record.dispatch) return undefined;
-  const name = integrationEvidenceVariableName(record.identity.prNumber);
-  const body = await getFugueAuthorityVariable(github, name);
-  if (!body) throw new Error(`Protected Integration authority variable ${name} is missing.`);
+  const anchorBody = await getFugueAuthorityVariable(github, record.dispatch.anchor_name);
+  const startName = integrationRunStartVariableName(record.request);
+  const body = await getFugueAuthorityVariable(github, startName);
+  if (!anchorBody) {
+    // Once request-specific run-start exists it is independently signed and bound to the d3 dispatch
+    // digest/name; the transient secret anchor is no longer required for durable authority.
+    if (!body) return undefined;
+  } else if (!(await verifyIntegrationDispatchAnchor(github, record, anchorBody))) {
+    throw new Error(`Protected Integration request anchor ${record.dispatch.anchor_name} does not match its durable request.`);
+  }
+  if (!body) return undefined;
   let start: IntegrationRunStartEvidence | null;
   try { start = parseIntegrationRunStart(body); } catch { start = null; }
-  if (!start) {
-    if (!(await verifyIntegrationDispatchAnchor(github, record, body))) {
-      throw new Error(`Protected Integration authority variable ${name} is not a valid dispatch anchor.`);
-    }
-    return undefined;
-  }
-  if (start.request_id !== record.request.request_id || start.pr_number !== record.identity.prNumber ||
+  if (!start || start.request_id !== record.request.request_id || start.pr_number !== record.identity.prNumber ||
       start.head_sha !== record.identity.headSha || start.base_sha !== record.identity.baseSha ||
-      start.secret_digest !== record.dispatch.secret_digest || start.run_attempt !== 1) {
-    throw new Error(`Protected Integration run-start evidence ${name} does not match its durable request.`);
+      start.secret_digest !== record.dispatch.secret_digest || start.anchor_name !== record.dispatch.anchor_name ||
+      start.run_attempt !== 1) {
+    throw new Error(`Protected Integration run-start evidence ${startName} does not match its durable request.`);
   }
-  const timestamp = Date.parse(start.created_at);
-  if (!Number.isFinite(timestamp) ||
-      !(await verifyProtocolPublicationBodyAtRevision(github, body, record.identity.baseSha, timestamp))) {
-    throw new Error(`Protected Integration run-start evidence ${name} has invalid provenance.`);
+  const startTimestamp = Date.parse(start.created_at);
+  if (!Number.isFinite(startTimestamp) ||
+      !(await verifyProtocolPublicationBodyAtRevision(github, body, record.identity.baseSha, startTimestamp))) {
+    throw new Error(`Protected Integration run-start evidence ${startName} has invalid provenance.`);
   }
   return start;
 }
 
 export async function releaseIntegrationAuthorityVariable(github: FugueGitHub, record: IntegrationRecord): Promise<void> {
   if (!record.dispatch) return;
-  const name = integrationEvidenceVariableName(record.identity.prNumber);
-  const body = await getFugueAuthorityVariable(github, name);
-  if (!body) return;
-  let current: IntegrationDispatchAnchor | IntegrationRunStartEvidence | null = null;
-  try { current = parseIntegrationRunStart(body) ?? parseIntegrationDispatchAnchor(body); } catch { current = null; }
-  if (!current || current.request_id !== record.request.request_id ||
-      current.secret_digest !== record.dispatch.secret_digest) return;
-  await deleteFugueAuthorityVariable(github, name);
+  // Request-specific immutable names are never reused. A stale cleanup for request A therefore
+  // cannot erase request/run-start B; no read/check/delete CAS assumption is involved.
+  await deleteFugueAuthorityVariable(github, integrationRunStartVariableName(record.request));
+  await deleteFugueAuthorityVariable(github, record.dispatch.anchor_name);
+}
+
+async function retireIntegrationElection(github: FugueGitHub, electionName: string): Promise<void> {
+  await deleteFugueAuthorityVariable(github, electionName);
+}
+
+async function abandonIntegrationAuthorization(
+  github: FugueGitHub,
+  electionName: string,
+  request: IntegrationRequest,
+): Promise<void> {
+  await deleteFugueAuthorityVariable(github, integrationAnchorVariableName(request));
+  await deleteFugueAuthorityVariable(github, electionName);
+}
+
+function integrationAuthorizationAge(anchor: IntegrationDispatchAnchor, now: number): number {
+  const timestamp = Date.parse(anchor.authorized_at);
+  return Number.isFinite(timestamp) ? now - timestamp : Number.POSITIVE_INFINITY;
+}
+
+export async function reclaimOrphanIntegrationAuthorityVariables(
+  github: FugueGitHub,
+  now = Date.now(),
+): Promise<void> {
+  const variables = await listFugueAuthorityVariables(github, "FUGUE_INT_");
+  const anchors = new Map<string, IntegrationDispatchAnchor>();
+  for (const variable of variables) {
+    if (!variable.name.startsWith(INTEGRATION_ELECTION_PREFIX) && !variable.name.startsWith(INTEGRATION_ANCHOR_PREFIX)) continue;
+    const anchor = await verifiedIntegrationAnchor(github, variable.value);
+    if (!anchor) {
+      await deleteFugueAuthorityVariable(github, variable.name);
+      continue;
+    }
+    if (variable.name.startsWith(INTEGRATION_ANCHOR_PREFIX)) anchors.set(variable.name, anchor);
+  }
+
+  for (const variable of variables.filter((entry) => entry.name.startsWith(INTEGRATION_ELECTION_PREFIX))) {
+    const anchor = await verifiedIntegrationAnchor(github, variable.value);
+    if (!anchor || integrationAuthorizationAge(anchor, now) < INTEGRATION_REQUEST_RECOVERY_GRACE_MS) continue;
+    let current: IntegrationRecord | undefined;
+    try { current = await getCurrentIntegrationRecord(github, anchor.request.identity); }
+    catch (error) {
+      if (error instanceof DurableProtocolRecoveryPendingError) continue;
+      throw error;
+    }
+    if (current?.request.request_id === anchor.request.request_id && !current.terminal) {
+      // The request is durable. The election is no longer needed, but its request anchor remains
+      // live until run binding/terminal publication has replaced transient authority with d3.
+      await deleteFugueAuthorityVariable(github, variable.name);
+      continue;
+    }
+    // No matching durable request exists after the grace window. Since dispatch happens only after
+    // d3 request publication, this is a pre-d3 orphan. Deleting only its own immutable names cannot
+    // affect a newer request. A very late stale writer is fenced by the d3 re-read before publish;
+    // if it still publishes after reclamation, missing anchor is treated as unstarted and aborted.
+    await deleteFugueAuthorityVariable(github, variable.name);
+    await deleteFugueAuthorityVariable(github, anchor.anchor_name);
+  }
+
+  for (const [name, anchor] of anchors) {
+    if (integrationAuthorizationAge(anchor, now) < INTEGRATION_REQUEST_RECOVERY_GRACE_MS) continue;
+    let current: IntegrationRecord | undefined;
+    try { current = await getCurrentIntegrationRecord(github, anchor.request.identity); }
+    catch (error) {
+      if (error instanceof DurableProtocolRecoveryPendingError) continue;
+      throw error;
+    }
+    if (current?.request.request_id === anchor.request.request_id && !current.terminal) continue;
+    await deleteFugueAuthorityVariable(github, name);
+  }
 }
 
 function integrationRunBindingFromEvidence(github: FugueGitHub, evidence: IntegrationRunStartEvidence): IntegrationRunBinding {
@@ -502,7 +631,7 @@ export async function ensureIntegrationDispatch(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
   now = Date.now(),
-): Promise<{ request?: IntegrationRequest; dispatch: boolean; dispatchSecret?: string }> {
+): Promise<{ request?: IntegrationRequest; dispatch: boolean; dispatchSecret?: string; authorityAnchor?: string }> {
   let current: IntegrationRecord | undefined;
   try {
     current = await getCurrentIntegrationRecord(github, snapshot.identity);
@@ -510,11 +639,13 @@ export async function ensureIntegrationDispatch(
     if (error instanceof DurableProtocolRecoveryPendingError) return { dispatch: false };
     throw error;
   }
+  let predecessorRequestId: string | undefined;
   if (current?.terminal && current.terminal.state !== "aborted") {
     await releaseIntegrationAuthorityVariable(github, current);
     return { request: current.request, dispatch: false };
   }
   if (current?.terminal?.state === "aborted") {
+    predecessorRequestId = current.request.request_id;
     await releaseIntegrationAuthorityVariable(github, current);
     current = undefined;
   }
@@ -553,6 +684,7 @@ export async function ensureIntegrationDispatch(
           terminal: { state: "aborted", detail: `Protected attempt 1 concluded ${bound.conclusion}.`, created_at: new Date(now).toISOString() },
           created_at: new Date(now).toISOString(),
         });
+        predecessorRequestId = current.request.request_id;
         current = undefined;
       } else if (bound.conclusion === "failure") {
         await publishIntegrationRecord(github, {
@@ -583,6 +715,7 @@ export async function ensureIntegrationDispatch(
         },
         created_at: new Date(now).toISOString(),
       });
+      predecessorRequestId = current.request.request_id;
       current = undefined;
     }
   }
@@ -591,21 +724,53 @@ export async function ensureIntegrationDispatch(
   const authorizedAt = new Date(now).toISOString();
   let authorized: Awaited<ReturnType<typeof authorizeIntegrationDispatch>>;
   try {
-    authorized = await authorizeIntegrationDispatch(github, request, authorizedAt);
+    authorized = await authorizeIntegrationDispatch(github, request, authorizedAt, undefined, predecessorRequestId);
   } catch (error) {
     if (error instanceof IntegrationAuthorityCapacityPendingError) return { dispatch: false };
     throw error;
   }
-  await publishIntegrationRecord(github, createIntegrationRecord(request, {
+
+  const anchorBody = await getFugueAuthorityVariable(github, authorized.authorization.anchor_name);
+  if (!anchorBody || !(await verifyIntegrationDispatchAnchor(github, createIntegrationRecord(authorized.request, {
     dispatch: authorized.authorization,
-    createdAt: authorizedAt,
-  }));
+    createdAt: authorized.authorization.authorized_at,
+  }), anchorBody))) {
+    await abandonIntegrationAuthorization(github, authorized.electionName, authorized.request);
+    return { dispatch: false };
+  }
+
+  let afterElection = await getCurrentIntegrationRecord(github, snapshot.identity);
+  const predecessorStillCurrent = predecessorRequestId
+    ? afterElection?.request.request_id === predecessorRequestId && afterElection.terminal?.state === "aborted"
+    : afterElection === undefined;
+  if (afterElection && afterElection.request.request_id === authorized.request.request_id && !afterElection.terminal) {
+    // A concurrent protected writer already published the elected request; converge on it.
+  } else if (!predecessorStillCurrent) {
+    await abandonIntegrationAuthorization(github, authorized.electionName, authorized.request);
+    return afterElection ? { request: afterElection.request, dispatch: false } : { dispatch: false };
+  } else {
+    afterElection = await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+      dispatch: authorized.authorization,
+      createdAt: authorized.authorization.authorized_at,
+    }));
+  }
+  const confirmed = await getCurrentIntegrationRecord(github, snapshot.identity);
+  if (!confirmed || confirmed.request.request_id !== authorized.request.request_id || confirmed.terminal) {
+    await abandonIntegrationAuthorization(github, authorized.electionName, authorized.request);
+    return confirmed ? { request: confirmed.request, dispatch: false } : { dispatch: false };
+  }
+  await retireIntegrationElection(github, authorized.electionName);
   await createProtocolComment(
     github,
     snapshot.identity.prNumber,
-    `INTEGRATION — REQUESTED\n\nHead: \`${snapshot.identity.headSha}\`\nRequest: \`${request.request_id}\`\n\n<!-- fugue-integration-request-mirror\nversion: 1\nrequest_id: ${request.request_id}\n-->`,
+    `INTEGRATION — REQUESTED\n\nHead: \`${snapshot.identity.headSha}\`\nRequest: \`${authorized.request.request_id}\`\n\n<!-- fugue-integration-request-mirror\nversion: 1\nrequest_id: ${authorized.request.request_id}\n-->`,
   );
-  return { request, dispatch: true, dispatchSecret: authorized.secret };
+  return {
+    request: confirmed.request,
+    dispatch: true,
+    dispatchSecret: authorized.secret,
+    authorityAnchor: authorized.authorization.anchor_name,
+  };
 }
 
 export async function bindIntegrationRun(
