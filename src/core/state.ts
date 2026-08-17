@@ -42,6 +42,9 @@ const DURABLE_WRITE_ATTEMPTS = 4;
 const STATUS_PAGE_SIZE = 100;
 const MANIFEST_PROOFS_PER_RECOVERY_SLICE = 8;
 const STATUS_PAGES_PER_RECOVERY_SLICE = 32;
+// Page numbers are reverse-chronological presentation coordinates and shift under append.
+// Each slice may spend a separate bounded seek budget to relocate its signed before_id.
+const STATUS_PAGE_SEEK_PROBE_LIMIT = 112;
 const REPOSITORY_AUTHORITY_VARIABLE_CAPACITY = 500;
 const RECOVERY_AUTHORITY_PREFIX = "FUGUE_D3_";
 const RECOVERY_PACK_PREFIX = "FUGUE_D3P_";
@@ -452,8 +455,9 @@ export async function publishDurableProtocolRecord(
 }
 
 /**
- * Recover bounded d3 work from a frozen status-ID ceiling. The signed cursor keeps the ceiling,
- * low-water ID and page progress stable while newer hostile statuses are appended. Manifest proof
+ * Recover bounded d3 work from a frozen status-ID ceiling. The signed cursor keeps the ceiling
+ * and low-water status ID stable while newer hostile statuses are appended. API page numbers are
+ * never durable progress: each slice re-seeks the signed before_id by bounded ID search. Manifest proof
  * verification and chunk materialization each have fixed per-call budgets; locators never select
  * authority. A completed slice advances the durable ceiling monotonically instead of restarting.
  */
@@ -462,7 +466,7 @@ export async function recoverDurableProtocolRecord<T>(
   options: DurableRecordOptions<T>,
 ): Promise<DurableRecoveryResult<T>> {
   const firstPage = await statusPage(github, options.storageSha, 1);
-  const topId = firstPage[0]?.id ?? 0;
+  const topId = firstPage.statuses[0]?.id ?? 0;
   let cursorEntry = await findRecoveryCursor(github, options);
   let cursor = cursorEntry?.cursor;
   let bestBody = cursor?.best_body_b64
@@ -512,7 +516,6 @@ export async function recoverDurableProtocolRecord<T>(
       cursor.scan_top_id,
       cursor.scan_floor_id,
       cursor.before_id,
-      cursor.page,
       async (status) => {
         if (!status.context.startsWith(`${durablePrefix(options.scope)}/m/`)) return true;
         if (proofBudget <= 0) return false;
@@ -526,7 +529,7 @@ export async function recoverDurableProtocolRecord<T>(
     cursor = recoveryCursorSchema.parse({
       ...cursor,
       before_id: scan.beforeId,
-      page: scan.page,
+      page: 1,
       ...(bestManifest ? { best_manifest: bestManifest } : { best_manifest: undefined }),
     });
     if (!scan.exhausted) {
@@ -577,7 +580,6 @@ export async function recoverDurableProtocolRecord<T>(
     manifest.last_status_id,
     manifest.first_status_id - 1,
     cursor.before_id,
-    cursor.page,
     async (status) => {
       const protectedChunk = expected.get(status.id);
       if (protectedChunk && status.context === protectedChunk.context && chunks[protectedChunk.index] == null && status.description) {
@@ -586,7 +588,7 @@ export async function recoverDurableProtocolRecord<T>(
       return true;
     },
   );
-  cursor = recoveryCursorSchema.parse({ ...cursor, before_id: materialized.beforeId, page: materialized.page, chunks });
+  cursor = recoveryCursorSchema.parse({ ...cursor, before_id: materialized.beforeId, page: 1, chunks });
   if (!materialized.exhausted) {
     await writeRecoveryCursor(github, options, cursor);
     return { exhausted: false };
@@ -728,28 +730,29 @@ async function scanFrozenStatuses(
   topId: number,
   floorId: number,
   startingBeforeId: number,
-  startingPage: number,
   visit: (status: CommitStatusRecord) => Promise<boolean>,
-): Promise<{ beforeId: number; page: number; exhausted: boolean }> {
+): Promise<{ beforeId: number; exhausted: boolean }> {
   let beforeId = startingBeforeId;
-  let page = startingPage;
+  const located = await seekFrozenStatusPage(github, sha, beforeId);
+  let page = located.page;
+  let statuses = located.statuses;
   for (let pages = 0; pages < STATUS_PAGES_PER_RECOVERY_SLICE; pages += 1) {
-    const statuses = await statusPage(github, sha, page);
-    if (!statuses.length) return { beforeId, page, exhausted: true };
+    if (pages > 0) statuses = (await statusPage(github, sha, page)).statuses;
+    if (!statuses.length) return { beforeId, exhausted: true };
     const eligible = statuses
       .filter((status) => status.id <= topId && status.id > floorId && status.id < beforeId)
       .sort((left, right) => right.id - left.id);
     for (const status of eligible) {
       const shouldContinue = await visit(status);
-      if (!shouldContinue) return { beforeId: status.id + 1, page, exhausted: false };
+      if (!shouldContinue) return { beforeId: status.id + 1, exhausted: false };
       beforeId = status.id;
     }
     if (statuses.some((status) => status.id <= floorId) || statuses.length < STATUS_PAGE_SIZE) {
-      return { beforeId, page, exhausted: true };
+      return { beforeId, exhausted: true };
     }
     page += 1;
   }
-  return { beforeId, page, exhausted: false };
+  return { beforeId, exhausted: false };
 }
 
 function encodeStatusIds(ids: readonly number[]): string {
@@ -819,7 +822,99 @@ function compareAuthorityOrder(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-async function statusPage(github: FugueGitHub, sha: string, page: number): Promise<CommitStatusRecord[]> {
+interface CommitStatusPageResult {
+  statuses: CommitStatusRecord[];
+  lastPage?: number;
+}
+
+function lastStatusPageFromLink(link: string | undefined): number | undefined {
+  if (!link) return undefined;
+  for (const part of link.split(",")) {
+    if (!/rel="last"/.test(part)) continue;
+    const href = part.match(/<([^>]+)>/)?.[1];
+    if (!href) continue;
+    try {
+      const page = Number(new URL(href).searchParams.get("page"));
+      if (Number.isSafeInteger(page) && page > 0) return page;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function statusPageReachesBefore(statuses: readonly CommitStatusRecord[], beforeId: number): boolean {
+  return statuses.length === 0 || statuses.some((status) => status.id < beforeId);
+}
+
+async function seekFrozenStatusPage(
+  github: FugueGitHub,
+  sha: string,
+  beforeId: number,
+): Promise<{ page: number; statuses: CommitStatusRecord[] }> {
+  const cache = new Map<number, CommitStatusPageResult>();
+  let probes = 0;
+  const read = async (page: number): Promise<CommitStatusPageResult> => {
+    const cached = cache.get(page);
+    if (cached) return cached;
+    if (!Number.isSafeInteger(page) || page <= 0 || probes >= STATUS_PAGE_SEEK_PROBE_LIMIT) {
+      throw new CanonicalWorkStateIntegrityError(
+        `Durable recovery could not relocate frozen status ID ${beforeId} within the bounded seek budget.`,
+      );
+    }
+    probes += 1;
+    const value = await statusPage(github, sha, page);
+    cache.set(page, value);
+    return value;
+  };
+
+  const first = await read(1);
+  if (statusPageReachesBefore(first.statuses, beforeId)) return { page: 1, statuses: first.statuses };
+
+  let low = 2;
+  let high: number | undefined;
+  if (first.lastPage !== undefined) {
+    if (first.lastPage >= Number.MAX_SAFE_INTEGER) {
+      throw new CanonicalWorkStateIntegrityError("Durable status pagination exceeds the supported safe-integer range.");
+    }
+    // lastPage + 1 is an empty sentinel, so exhaustion below beforeId is searchable too.
+    high = first.lastPage + 1;
+  } else {
+    let probe = 2;
+    while (high === undefined) {
+      const candidate = await read(probe);
+      if (statusPageReachesBefore(candidate.statuses, beforeId)) {
+        high = probe;
+        break;
+      }
+      low = probe + 1;
+      if (probe > Math.floor(Number.MAX_SAFE_INTEGER / 2)) {
+        throw new CanonicalWorkStateIntegrityError("Durable status pagination exceeds the supported safe-integer range.");
+      }
+      probe *= 2;
+    }
+  }
+
+  let best: { page: number; statuses: CommitStatusRecord[] } | undefined;
+  while (low <= high) {
+    const middle: number = low + Math.floor((high - low) / 2);
+    const candidate = await read(middle);
+    if (statusPageReachesBefore(candidate.statuses, beforeId)) {
+      best = { page: middle, statuses: candidate.statuses };
+      high = middle - 1;
+    } else {
+      low = middle + 1;
+    }
+  }
+  if (!best) {
+    throw new CanonicalWorkStateIntegrityError(
+      `Durable recovery could not relocate frozen status ID ${beforeId} without using an append-unstable page cursor.`,
+    );
+  }
+  return best;
+}
+
+async function statusPage(github: FugueGitHub, sha: string, page: number): Promise<CommitStatusPageResult> {
   const { owner, repo } = github.repository;
   const response = await github.octokit.rest.repos.listCommitStatusesForRef({
     owner,
@@ -828,13 +923,16 @@ async function statusPage(github: FugueGitHub, sha: string, page: number): Promi
     per_page: STATUS_PAGE_SIZE,
     page,
   });
-  return response.data.map((status) => ({
+  const statuses = response.data.map((status) => ({
     id: status.id,
     context: status.context,
     description: status.description,
     targetUrl: status.target_url,
     createdAt: status.created_at,
   }));
+  const link = typeof response.headers?.link === "string" ? response.headers.link : undefined;
+  const lastPage = lastStatusPageFromLink(link);
+  return { statuses, ...(lastPage !== undefined ? { lastPage } : {}) };
 }
 
 interface FugueAuthorityVariable {
@@ -1011,7 +1109,7 @@ function compareRecoveryProgress(left: RecoveryCursor, right: RecoveryCursor): n
   if (left.scan_top_id !== right.scan_top_id) return left.scan_top_id - right.scan_top_id;
   if (left.phase !== right.phase) return left.phase === "materialize" ? 1 : -1;
   if (left.before_id !== right.before_id) return right.before_id - left.before_id;
-  if (left.page !== right.page) return left.page - right.page;
+  // Reverse-chronological API page numbers are deliberately not progress coordinates.
   const leftChunks = left.chunks?.filter((chunk) => chunk != null).length ?? 0;
   const rightChunks = right.chunks?.filter((chunk) => chunk != null).length ?? 0;
   return leftChunks - rightChunks;
@@ -1249,8 +1347,10 @@ async function compactRecoveryBucket(
  * one greatest signed cursor. Capacity is reduced by packing greatest cursors into immutable,
  * bucket-sharded Authority variables; a pack is created and re-read before any source containing
  * its progress is deleted. No cross-scope cursor is ever reclaimed merely because it is caught up.
- * Reserved empty Authority slots let a full Fugue-owned namespace publish a replacement pack first,
- * and concurrent compactors converge because pack names are content-addressed and never mutated.
+ * Reserved empty Authority slots let a full Fugue-owned namespace publish a replacement pack first.
+ * If crashes consume every reserve, a required allocation performs repository-wide safe dedup/packing
+ * before failing, so redundant recovery state in another bucket can replenish capacity without deleting
+ * any scope's sole greatest cursor. Concurrent compactors converge on content-addressed immutable packs.
  */
 export async function compactFugueRecoveryAuthorityVariables(
   github: FugueGitHub,
@@ -1298,10 +1398,17 @@ async function writeRecoveryCursor<T>(
     created = await createFugueAuthorityVariable(github, name, signed);
     existing = created ? signed : await getFugueAuthorityVariable(github, name);
   }
+  if (!created && existing === undefined) {
+    // Reserve slots may all have been consumed by crashes after create in other buckets. Before
+    // refusing this required checkpoint, compact repository-wide redundant recovery sources.
+    await compactFugueRecoveryAuthorityVariables(github, undefined, 1);
+    created = await createFugueAuthorityVariable(github, name, signed);
+    existing = created ? signed : await getFugueAuthorityVariable(github, name);
+  }
   if (!created && existing !== signed) {
     throw new CanonicalWorkStateIntegrityError(
       existing === undefined
-        ? "Protected Fugue Authority-variable namespace is full after immutable recovery packing/reserve reclamation; refusing to corrupt unrelated repository variables."
+        ? "Protected Fugue Authority-variable namespace is full after bucket-local and repository-wide immutable recovery packing/reserve reclamation; refusing to corrupt unrelated repository variables."
         : `Protected Fugue authority variable collision at ${name}.`,
     );
   }

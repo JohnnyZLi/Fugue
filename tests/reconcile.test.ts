@@ -207,6 +207,40 @@ function explodeRecoveryPacksToLeaves(github: TestGithub): void {
   }
 }
 
+function recoveryBucketForScope(scope: string): string {
+  return createHash("sha256")
+    .update(`${BASE.toLowerCase()}\0${BASE.toLowerCase()}\0${scope}`, "utf8")
+    .digest("hex")
+    .slice(0, 2)
+    .toUpperCase();
+}
+
+function distinctRecoveryScopes(count: number, excludedBuckets: ReadonlySet<string>): string[] {
+  const scopes: string[] = [];
+  const buckets = new Set(excludedBuckets);
+  for (let index = 0; scopes.length < count; index += 1) {
+    const scope = `crash-bucket/${index}`;
+    const bucket = recoveryBucketForScope(scope);
+    if (buckets.has(bucket)) continue;
+    buckets.add(bucket);
+    scopes.push(scope);
+  }
+  return scopes;
+}
+
+class CrashAfterRecoveryLeafMap extends Map<string, string> {
+  crashNextLeaf = false;
+
+  override set(key: string, value: string): this {
+    super.set(key, value);
+    if (this.crashNextLeaf && /^FUGUE_D3_[0-9A-F]{16}_[0-9A-F]{16}$/i.test(key)) {
+      this.crashNextLeaf = false;
+      throw new Error("simulated crash after recovery checkpoint leaf creation");
+    }
+    return this;
+  }
+}
+
 describe("d3 protected durable authority", () => {
   it("does not expose an authority commit capability before the protected manifest write", async () => {
     const github = makeGithub({ failManifestAlways: true });
@@ -326,13 +360,15 @@ describe("d3 protected durable authority", () => {
     expect(canonicalRequirements(recovered!)).toBe("interleaving-safe");
   });
 
-  it("makes monotonic recovery progress while newer hostile statuses keep arriving", async () => {
+  it("re-seeks frozen recovery by status ID while 3200 newer statuses arrive between every slice", async () => {
     const github = makeGithub();
     await publishCanonicalWorkState(github, canonicalWork("older-valid-authority"));
     github.__comments.splice(0);
     for (let index = 0; index < 3400; index += 1) {
       github.__statuses.push({ id: ++github.__nextStatusId, sha: BASE, context: `hostile/${index}`, description: "noise" });
     }
+    const frozenTop = github.__nextStatusId;
+    const durableBeforeIds: number[] = [];
     let recovered;
     for (let attempt = 0; attempt < 8 && !recovered?.record; attempt += 1) {
       recovered = await recoverDurableProtocolRecord(github, {
@@ -340,14 +376,28 @@ describe("d3 protected durable authority", () => {
         parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
       });
       if (!recovered.record) {
+        const beforeIds = recoveryCheckpointBodies(github)
+          .map(recoveryCursorBody)
+          .filter((cursor) => cursor?.scope === "work/18" && Number(cursor.scan_top_id) === frozenTop)
+          .map((cursor) => Number(cursor?.before_id))
+          .filter((value) => Number.isFinite(value));
+        if (beforeIds.length) durableBeforeIds.push(Math.min(...beforeIds));
         github.__comments.splice(0);
-        for (let index = 0; index < 300; index += 1) {
+        for (let index = 0; index < 3200; index += 1) {
           github.__statuses.push({ id: ++github.__nextStatusId, sha: BASE, context: `continuous/${attempt}/${index}`, description: "new-noise" });
         }
       }
     }
     expect(recovered?.record).toBeDefined();
     expect(canonicalRequirements(recovered!.record!.value)).toBe("older-valid-authority");
+    expect(durableBeforeIds.length).toBeGreaterThan(0);
+    for (let index = 1; index < durableBeforeIds.length; index += 1) {
+      expect(durableBeforeIds[index]).toBeLessThanOrEqual(durableBeforeIds[index - 1]!);
+    }
+    expect(recoveryCheckpointBodies(github)
+      .map(recoveryCursorBody)
+      .filter((cursor) => cursor?.scope === "work/18")
+      .every((cursor) => Number(cursor?.page ?? 1) === 1)).toBe(true);
     expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3_"))).toBe(true);
     expect([...github.__refs.keys()].some((ref) => ref.startsWith("fugue/recovery/"))).toBe(false);
   });
@@ -498,6 +548,67 @@ describe("d3 protected durable authority", () => {
     expect(Number(cursor?.complete_top_id ?? 0)).toBeGreaterThanOrEqual(frozenTop);
     const pages = github.__listStatus.mock.calls.map((call) => call[0]?.page ?? 1);
     expect(pages.some((page) => page > 1)).toBe(true);
+  });
+
+  it("self-heals after all reserve slots are consumed by interrupted writes in distinct buckets", async () => {
+    const github = makeGithub();
+    await publishCanonicalWorkState(github, canonicalWork("reserve-drain-recovery"));
+    github.__comments.splice(0);
+    for (let index = 0; index < 3400; index += 1) {
+      github.__statuses.push({ id: ++github.__nextStatusId, sha: BASE, context: `reserve-drain/${index}`, description: "noise" });
+    }
+
+    const workFirst = await recoverDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: "work/18", issueNumber: 18,
+      parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
+    });
+    expect(workFirst.exhausted).toBe(false);
+
+    const crashScopes = distinctRecoveryScopes(8, new Set([recoveryBucketForScope("work/18")]));
+    for (const [index, scope] of crashScopes.entries()) {
+      const first = await recoverDurableProtocolRecord(github, {
+        storageSha: BASE, publisherSha: BASE, scope, issueNumber: 2000 + index,
+        parse: () => null, timestamp: () => 0, order: () => "",
+      });
+      expect(first.exhausted).toBe(false);
+    }
+    expect(new Set(crashScopes.map(recoveryBucketForScope)).size).toBe(8);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_D3R_"))).toHaveLength(8);
+
+    const crashMap = new CrashAfterRecoveryLeafMap(github.__authorityVariables);
+    github.__authorityVariables = crashMap;
+    let unrelated = 0;
+    while (github.__authorityVariables.size < 500) {
+      github.__authorityVariables.set(`UNRELATED_CRASH_${String(unrelated++).padStart(4, "0")}`, "unrelated");
+    }
+    const unrelatedBefore = [...github.__authorityVariables.keys()].filter((name) => name.startsWith("UNRELATED_CRASH_")).length;
+    expect(github.__authorityVariables.size).toBe(500);
+
+    for (const [index, scope] of crashScopes.entries()) {
+      crashMap.crashNextLeaf = true;
+      await expect(recoverDurableProtocolRecord(github, {
+        storageSha: BASE, publisherSha: BASE, scope, issueNumber: 2000 + index,
+        parse: () => null, timestamp: () => 0, order: () => "",
+      })).rejects.toThrow(/simulated crash after recovery checkpoint leaf creation/);
+      expect(crashMap.crashNextLeaf).toBe(false);
+    }
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_D3R_"))).toHaveLength(0);
+    expect(github.__authorityVariables.size).toBe(500);
+    for (const scope of crashScopes) expect(recoveryScopes(github).has(scope)).toBe(true);
+
+    let recovered = workFirst;
+    for (let attempt = 0; attempt < 8 && !recovered.record; attempt += 1) {
+      recovered = await recoverDurableProtocolRecord(github, {
+        storageSha: BASE, publisherSha: BASE, scope: "work/18", issueNumber: 18,
+        parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
+      });
+    }
+    expect(recovered.record).toBeDefined();
+    expect(canonicalRequirements(recovered.record!.value)).toBe("reserve-drain-recovery");
+    expect(recoveryScopes(github).has("work/18")).toBe(true);
+    for (const scope of crashScopes) expect(recoveryScopes(github).has(scope)).toBe(true);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("UNRELATED_CRASH_")).length).toBe(unrelatedBefore);
+    expect(github.__authorityVariables.size).toBeLessThanOrEqual(500);
   });
 
   it("ignores pre-created, deleted, rewound, fast-forwarded, and replayed custom recovery refs after presentation loss", async () => {
@@ -909,7 +1020,9 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
     const perPage = args.per_page ?? 100;
     const page = args.page ?? 1;
     const filtered = statuses.filter((status) => status.sha === args.ref).sort((a, b) => b.id - a.id);
-    return { data: filtered.slice((page - 1) * perPage, page * perPage) };
+    const lastPage = Math.max(1, Math.ceil(filtered.length / perPage));
+    const link = lastPage > 1 ? `<https://example.test/statuses?per_page=${perPage}&page=${lastPage}>; rel="last"` : undefined;
+    return { data: filtered.slice((page - 1) * perPage, page * perPage), headers: { link } };
   });
   const listComments = vi.fn(async (args: { issue_number: number; page?: number; per_page?: number }) => {
     const perPage = args.per_page ?? 100;
