@@ -115,6 +115,12 @@ export async function findCurrentIntegrationRequest(
   return latestCurrentRequest(integrationRequests(trusted), snapshot);
 }
 
+/**
+ * Discover the latest causally valid Integration run. Completed runs whose conclusion represents
+ * cancellation/abortion rather than a protected Integration decision are ignored so shared
+ * Actions authority cannot strand the durable request. A prior success/failure remains visible;
+ * if cancellation was the only run, recovery proceeds after the request grace period.
+ */
 export async function findIntegrationWorkflowRun(
   github: FugueGitHub,
   request: IntegrationRequest,
@@ -130,21 +136,34 @@ export async function findIntegrationWorkflowRun(
     head_sha: request.identity.baseSha,
     per_page: 100,
   });
-  const match = runs.data.workflow_runs.find((run) => {
-    const runCreated = Date.parse(run.created_at ?? "");
-    return isTrustedProtocolWorkflowRun(run) &&
-      run.event === "workflow_dispatch" &&
-      run.head_sha === request.identity.baseSha &&
-      run.display_title === integrationRunTitle(request.request_id, request.identity.prNumber) &&
-      Number.isFinite(runCreated) &&
-      runCreated >= requestCreated;
-  });
+  const matches = runs.data.workflow_runs
+    .filter((run) => {
+      const runCreated = Date.parse(run.created_at ?? "");
+      return isTrustedProtocolWorkflowRun(run) &&
+        normalizedRunAttempt(run.run_attempt) === 1 &&
+        run.event === "workflow_dispatch" &&
+        run.head_sha === request.identity.baseSha &&
+        run.display_title === integrationRunTitle(request.request_id, request.identity.prNumber) &&
+        Number.isFinite(runCreated) &&
+        runCreated >= requestCreated &&
+        !isRecoverableAbortedRun(run.status, run.conclusion);
+    })
+    .sort((left, right) => Date.parse(right.created_at ?? "") - Date.parse(left.created_at ?? ""));
+  const match = matches[0];
   if (!match) return undefined;
   return {
     status: match.status,
     conclusion: match.conclusion,
     htmlUrl: match.html_url,
   };
+}
+
+function isRecoverableAbortedRun(status: string | null, conclusion: string | null): boolean {
+  return status === "completed" && conclusion !== null && conclusion !== "success" && conclusion !== "failure";
+}
+
+function normalizedRunAttempt(value: number | undefined): number | null {
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
 }
 
 function integrationRequests(comments: IntegrationComment[]): IntegrationRequest[] {

@@ -1,6 +1,7 @@
 import type { FugueGitHub } from "./github.js";
 import {
   createProtocolComment,
+  escapeProtocolMarkers,
   isTrustedProtocolActor,
   stripProtocolPublisherProof,
   updateProtocolComment,
@@ -16,24 +17,36 @@ export function renderStateComment(
   work: WorkState,
   action: WorkflowAction,
 ): string {
-  const marker = `${START}\nversion: 1\nwork_id: ${work.metadata.work_id}\n${END}`;
+  const safe = escapeProtocolMarkers;
+  const marker = `${START}\nversion: 1\nwork_id: ${safe(work.metadata.work_id)}\n${END}`;
   const lines = [
     marker,
     "",
     "## FUGUE STATE",
     "",
-    `- Work: \`${work.metadata.work_id}\``,
+    `- Work: \`${safe(work.metadata.work_id)}\``,
     `- Issue: #${work.issueNumber}`,
-    `- Worker: ${work.metadata.execution.worker_id ? `\`${work.metadata.execution.worker_id}\`` : "unclaimed"}`,
-    `- Branch: ${work.metadata.execution.branch ? `\`${work.metadata.execution.branch}\`` : "not allocated"}`,
-    `- PR: ${work.pr ? `#${work.pr.number} @ \`${work.pr.headSha.slice(0, 8)}\`${work.pr.draft ? " (draft)" : ""}` : "none"}`,
-    `- Next: **${actionLabel(action)}**`,
+    `- Worker: ${work.metadata.execution.worker_id ? `\`${safe(work.metadata.execution.worker_id)}\`` : "unclaimed"}`,
+    `- Branch: ${work.metadata.execution.branch ? `\`${safe(work.metadata.execution.branch)}\`` : "not allocated"}`,
+    `- PR: ${work.pr ? `#${work.pr.number} @ \`${safe(work.pr.headSha.slice(0, 8))}\`${work.pr.draft ? " (draft)" : ""}` : "none"}`,
+    `- Next: **${safe(actionLabel(action))}**`,
     "",
   ];
 
   const instruction = externalInstruction(repository, work, action);
   if (instruction) {
-    lines.push("## HUMAN ACTION", "", instruction.heading, "", "Paste into a fresh ChatGPT chat:", "", "```text", instruction.prompt, "```", "");
+    lines.push(
+      "## HUMAN ACTION",
+      "",
+      safe(instruction.heading),
+      "",
+      "Paste into a fresh ChatGPT chat:",
+      "",
+      "```text",
+      safe(instruction.prompt),
+      "```",
+      "",
+    );
   } else if (action.kind === "human_control_plane_ack") {
     lines.push(
       "## HUMAN ACTION",
@@ -49,7 +62,7 @@ export function renderStateComment(
       "",
     );
   } else if (action.kind === "blocked") {
-    lines.push("## BLOCKED", "", action.reason, "");
+    lines.push("## BLOCKED", "", safe(action.reason), "");
   } else {
     lines.push("No Human action is currently required.", "");
   }

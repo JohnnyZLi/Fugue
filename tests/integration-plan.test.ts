@@ -84,12 +84,13 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).not.toContain('integration-runtime prepare "${{ inputs.pr }}"');
   });
 
-  it("uses base-trusted PR reconciliation and binds issue canonicalization to the event sender", async () => {
+  it("uses base-trusted PR reconciliation and the immutable Actions event payload for Coordinator intent", async () => {
     const workflow = await readFile(".github/workflows/fugue-control-plane.yml", "utf8");
     expect(workflow).toContain("pull_request_target:");
     expect(workflow).not.toContain("pull_request:\n");
     expect(workflow).toContain("ref: ${{ github.event.repository.default_branch }}");
-    expect(workflow).toContain("FUGUE_EVENT_ACTOR: ${{ github.event.sender.login }}");
+    expect(workflow).not.toContain("FUGUE_EVENT_ACTOR:");
+    expect(workflow).not.toContain("FUGUE_EVENT_ISSUE:");
   });
 
   it("covers every direct security trust primitive in conditional Security QA policy", async () => {
@@ -99,6 +100,9 @@ describe("GitHub-hosted Integration plan", () => {
       "src/core/metadata.ts",
       "src/core/pr-metadata.ts",
       "src/core/hash.ts",
+      "src/core/glob.ts",
+      "src/core/worker.ts",
+      "src/core/dependencies.ts",
       "src/core/state.ts",
       "src/core/evaluation.ts",
       "src/core/review-activity.ts",

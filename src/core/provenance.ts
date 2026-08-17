@@ -39,7 +39,7 @@ export interface GitHubCommitStatusLike {
 }
 
 export interface ProtocolCommentResponse {
-  data: { html_url: string };
+  data: { id: number; html_url: string; body: string };
 }
 
 interface OidcHeader {
@@ -87,8 +87,8 @@ export function isTrustedProtocolWorkflowRun(run: GitHubWorkflowRunLike): boolea
 
 /**
  * Commit-status actor identity alone is not canonical protocol provenance. Commit statuses are
- * presentation/merge-gate signals only; Fugue's durable state readers use signed comments and
- * protected workflow-run identity instead.
+ * presentation/merge-gate signals unless a protocol reader gives them an explicit fail-closed
+ * transaction role, as canonical work-state does.
  */
 export function isTrustedProtocolCommitStatus(status: GitHubCommitStatusLike): boolean {
   return isTrustedProtocolActor(status.creator);
@@ -126,16 +126,15 @@ export async function isTrustedProtocolComment(
 }
 
 /**
- * Verify that a comment was genuinely content-bound to an approved Fugue workflow revision,
- * without treating that historical revision as current protocol authority. This is ONLY for
- * locating a historical protocol object that current protected code may safely roll forward or
- * overwrite. Historical proofs are accepted only from the first attempt of a default-branch run,
- * so a revoked workflow revision cannot regain authority by re-running after protection changes.
- * Immutable QA, Integration, and acknowledgement readers still use isTrustedProtocolComment.
+ * Verify that a historical protocol comment was originally published by the protected Fugue
+ * workflow revision named by the caller. This is ONLY for state rollover performed by current
+ * protected code. The explicit SHA binding prevents a stale workflow revision from publishing
+ * state for a later base and then being re-authorized by rollover.
  */
 export async function isReusableProtocolComment(
   github: FugueGitHub,
   comment: GitHubCommentLike,
+  protectedWorkflowSha: string,
 ): Promise<boolean> {
   const context = await protocolCommentVerificationContext(github, comment);
   if (!context) return false;
@@ -144,7 +143,7 @@ export async function isReusableProtocolComment(
     context.audience,
     github.repository.fullName,
     context.protectedBase.branch,
-    undefined,
+    protectedWorkflowSha,
     context.timestamp,
     context.jwks,
   );
@@ -163,7 +162,13 @@ export async function createProtocolComment(
     issue_number: issueNumber,
     body: signed,
   });
-  return { data: { html_url: response.data.html_url } };
+  return {
+    data: {
+      id: response.data.id,
+      html_url: response.data.html_url,
+      body: response.data.body ?? signed,
+    },
+  };
 }
 
 export async function updateProtocolComment(
@@ -179,7 +184,13 @@ export async function updateProtocolComment(
     comment_id: commentId,
     body: signed,
   });
-  return { data: { html_url: response.data.html_url } };
+  return {
+    data: {
+      id: response.data.id,
+      html_url: response.data.html_url,
+      body: response.data.body ?? signed,
+    },
+  };
 }
 
 export function stripProtocolPublisherProof(body: string): string {

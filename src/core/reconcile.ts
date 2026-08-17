@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import {
   assertWorkMetadataForIssue,
   parseWorkMetadata,
@@ -49,6 +50,10 @@ export interface CoordinatorIssueEvent {
   actor: string;
   issueNumber?: number;
   label?: string;
+  issueTitle?: string;
+  issueBody?: string;
+  issueLabels?: string[];
+  issueIsPullRequest?: boolean;
 }
 
 const MAX_TRANSITIONS_PER_WORK = 12;
@@ -162,9 +167,9 @@ async function applyAction(
 }
 
 /**
- * Convert a Coordinator-authored issue event into protected canonical Fugue state. Issue bodies
- * and labels are inputs/presentation only: the protected workflow re-publishes accepted values in
- * a signed work-state record, and later readers consume only that record.
+ * Convert an authorized Coordinator issue event snapshot into protected canonical Fugue state.
+ * The body/title/labels used here come from GITHUB_EVENT_PATH, not a later mutable issue fetch, so
+ * Human authorization cannot be paired with Actions-authored contents substituted after the event.
  */
 export async function ingestCoordinatorIssueEvent(
   github: FugueGitHub,
@@ -172,22 +177,21 @@ export async function ingestCoordinatorIssueEvent(
   event: CoordinatorIssueEvent | undefined,
 ): Promise<boolean> {
   if (!event || event.eventName !== "issues" || !event.issueNumber) return false;
+  if (event.issueIsPullRequest) return false;
   if (!event.actor || event.actor === FUGUE_PROTOCOL_ACTOR) return false;
   if (!(await canCanonicalizeCoordinatorEvent(github, event.actor))) return false;
   const supported = new Set(["opened", "edited", "labeled", "unlabeled"]);
   if (!supported.has(event.action)) return false;
 
-  const { owner, repo } = github.repository;
-  const issue = await github.octokit.rest.issues.get({ owner, repo, issue_number: event.issueNumber });
-  if (issue.data.pull_request) return false;
-  const existing = await loadCurrentCanonicalWorkState(github, event.issueNumber);
+  const existing = await loadCurrentCanonicalWorkState(github, event.issueNumber, policy.identity.baseSha);
 
   if (event.action === "labeled" || event.action === "unlabeled") {
     if (!existing || !event.label) return false;
     let state = existing.state;
     let agentReady = existing.agent_ready;
     if (STATE_LABELS.has(event.label as WorkState["stateLabel"]) && event.action === "labeled") {
-      state = event.label as WorkState["stateLabel"];
+      if (!event.issueLabels) return false;
+      state = singleStateLabel(event.issueLabels, event.issueNumber);
     }
     if (event.label === "agent:ready") agentReady = event.action === "labeled";
     return publishCanonicalWorkState(github, createCanonicalWorkState({
@@ -202,21 +206,20 @@ export async function ingestCoordinatorIssueEvent(
     }));
   }
 
-  const body = issue.data.body ?? "";
-  const metadata = parseWorkMetadata(body);
+  if (event.issueTitle === undefined || event.issueBody === undefined || !event.issueLabels) return false;
+  const metadata = parseWorkMetadata(event.issueBody);
   if (!metadata) return false;
   assertWorkMetadataForIssue(metadata, event.issueNumber);
-  const requirements = stripWorkMetadata(body);
+  const requirements = stripWorkMetadata(event.issueBody);
   if (!existing && (metadata.execution.worker_id || metadata.execution.branch)) {
     throw new Error(`Issue #${event.issueNumber} cannot bootstrap canonical Fugue state from pre-populated Worker execution metadata.`);
   }
-  const labels = issue.data.labels.map(labelName);
-  const state = existing?.state ?? singleStateLabel(labels, event.issueNumber);
-  const agentReady = existing?.agent_ready ?? labels.includes("agent:ready");
+  const state = existing?.state ?? singleStateLabel(event.issueLabels, event.issueNumber);
+  const agentReady = existing?.agent_ready ?? event.issueLabels.includes("agent:ready");
   const acceptedMetadata = existing ? { ...metadata, execution: existing.metadata.execution } : metadata;
   return publishCanonicalWorkState(github, createCanonicalWorkState({
     issue: event.issueNumber,
-    title: issue.data.title,
+    title: event.issueTitle,
     state,
     agentReady,
     requirements,
@@ -419,14 +422,53 @@ async function canCanonicalizeCoordinatorEvent(github: FugueGitHub, actor: strin
   }
 }
 
-function coordinatorIssueEventFromEnvironment(): CoordinatorIssueEvent | undefined {
-  const eventName = process.env.FUGUE_EVENT_NAME ?? "";
-  const action = process.env.FUGUE_EVENT_ACTION ?? "";
-  const actor = process.env.FUGUE_EVENT_ACTOR ?? "";
-  const issueNumber = Number(process.env.FUGUE_EVENT_ISSUE ?? "");
-  const label = process.env.FUGUE_EVENT_LABEL ?? "";
-  if (!eventName) return undefined;
-  return { eventName, action, actor, ...(Number.isInteger(issueNumber) && issueNumber > 0 ? { issueNumber } : {}), ...(label ? { label } : {}) };
+export function coordinatorIssueEventFromEnvironment(): CoordinatorIssueEvent | undefined {
+  const eventName = process.env.GITHUB_EVENT_NAME ?? "";
+  const eventPath = process.env.GITHUB_EVENT_PATH ?? "";
+  if (eventName !== "issues" || !eventPath) return undefined;
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(readFileSync(eventPath, "utf8")) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!payload || typeof payload !== "object") return undefined;
+  const value = payload as {
+    action?: unknown;
+    sender?: { login?: unknown };
+    label?: { name?: unknown } | null;
+    issue?: {
+      number?: unknown;
+      title?: unknown;
+      body?: unknown;
+      labels?: Array<string | { name?: unknown }>;
+      pull_request?: unknown;
+    };
+  };
+  const issue = value.issue;
+  const issueNumber = typeof issue?.number === "number" && Number.isInteger(issue.number) && issue.number > 0
+    ? issue.number
+    : undefined;
+  const action = typeof value.action === "string" ? value.action : "";
+  const actor = typeof value.sender?.login === "string" ? value.sender.login : "";
+  const label = typeof value.label?.name === "string" ? value.label.name : undefined;
+  const issueTitle = typeof issue?.title === "string" ? issue.title : undefined;
+  const issueBody = typeof issue?.body === "string" ? issue.body : issue?.body === null ? "" : undefined;
+  const issueLabels = Array.isArray(issue?.labels)
+    ? issue.labels.map((item) => typeof item === "string" ? item : typeof item.name === "string" ? item.name : "").filter(Boolean)
+    : undefined;
+  return {
+    eventName,
+    action,
+    actor,
+    ...(issueNumber ? { issueNumber } : {}),
+    ...(label ? { label } : {}),
+    ...(issueTitle !== undefined ? { issueTitle } : {}),
+    ...(issueBody !== undefined ? { issueBody } : {}),
+    ...(issueLabels ? { issueLabels } : {}),
+    issueIsPullRequest: Boolean(issue?.pull_request),
+  };
 }
 
 function singleStateLabel(labels: string[], issueNumber: number): WorkState["stateLabel"] {

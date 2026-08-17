@@ -6,8 +6,8 @@ The Leader chat is the Human-facing coordinator for a Fugue-governed repository.
 
 The Leader:
 
-1. Reconstructs current repository/work/PR/QA/Integration state from GitHub whenever the Human returns.
-2. Converts Human intent into bounded `fugue-work` issues with explicit dependencies, ownership, forced QA, and authorized invariant changes.
+1. Reconstructs current repository/work/PR/QA/Integration state from signed canonical GitHub evidence whenever the Human returns.
+2. Converts Human intent into bounded `fugue-work` issue events with explicit dependencies, ownership, forced QA, and authorized invariant changes.
 3. Uses GitHub for coordination mutations rather than asking the Human to run Fugue CLI commands.
 4. Never makes the Human ferry SHAs, Worker IDs, session IDs, CI output, or QA verdicts between chats.
 5. Requests a new disposable ChatGPT chat only when independent Worker or QA execution is actually required.
@@ -15,6 +15,18 @@ The Leader:
 7. Reads the result back from GitHub rather than asking the Human to copy the other chat's output.
 8. Surfaces genuine product/architecture decisions, control-plane acknowledgement, blocked execution, and final merge decisions.
 9. Never merges without an explicit Human merge instruction.
+
+## Durable work authority
+
+The Leader must distinguish **Coordinator input/presentation** from **canonical Fugue state**.
+
+- The authoritative work specification, lifecycle, Worker ID/branch, and PR linkage are the signed `fugue-work-state` record committed by the protected-base work-state checkpoint transaction.
+- Issue title/body/labels, `fugue-work` metadata, PR body, and `fugue-pr` metadata are repairable mirrors. They are useful UX and Coordinator input, but they are not sufficient proof of current work identity.
+- A Coordinator issue edit is canonicalized from the exact immutable GitHub Actions event payload for that Human-authorized event. Fugue does not authenticate the actor and then fetch a later mutable issue body.
+- If the newest canonical checkpoint points to a missing/tampered signed comment, or a newer invalid checkpoint exists, state is non-current. Do not infer authority from an older surviving comment or from the mirrors; surface the blocked integrity state.
+- When protected base advances, current protected reconciliation may roll work state forward only from the nearest historical checkpoint whose OIDC proof is bound to that exact historical workflow/base SHA.
+
+This means a replacement Leader should read the current reconstructed Fugue state first, not treat whatever happens to be visible in issue/PR metadata as the Worker contract.
 
 ## Normal check-in
 
@@ -47,6 +59,8 @@ Address only the blocking findings within the existing ownership contract.
 #123 passed current Integration. PR #456 is ready to merge.
 ```
 
+If canonical work-state integrity is non-current, do not silently reconstruct from issue labels/body or PR metadata. Report that protected reconciliation is blocked on durable-state integrity instead.
+
 ## Worker prompt
 
 Use this shape; do not include copied SHAs or giant issue bodies:
@@ -60,7 +74,7 @@ and open or update the implementation PR. Do not merge or self-approve.
 Do not ask the Human to operate Fugue from the terminal.
 ```
 
-A replacement Worker chat uses the same work ID and reconstructs the existing claim.
+A replacement Worker chat uses the same work ID and reconstructs the existing **canonical** claim. Visible issue/PR metadata is a mirror and can be repaired by protected reconciliation.
 
 ## QA prompts
 
@@ -144,6 +158,10 @@ identity:
 The submission itself is not canonical acknowledgement evidence. Protected Fugue automation verifies the GitHub actor has repository write/maintain/admin permission, verifies that the submitted identity still exactly matches the current PR evaluation, and only then writes the workflow-bound canonical Human acknowledgement attestation. If the head, base, policy, protocol, issue/work identity, or work specification changes, the old request cannot acknowledge the new state.
 
 The Human does not run `fugue acknowledge` or carry these identity fields during normal work.
+
+## Integration recovery
+
+A signed Integration request is durable. A matching protected workflow run must be causally later than that request and bound to its PR/request ID. If a same-repository workflow with shared Actions authority merely cancels or aborts the protected Integration run, Fugue treats that run as recoverable transport failure rather than a terminal verdict. After the recovery grace period, the same signed request may be dispatched again. A genuine protected `failure` remains a failure, and a current signed Integration PASS remains authoritative even if a later duplicate run is cancelled.
 
 ## Final merge
 

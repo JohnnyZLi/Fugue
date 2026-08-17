@@ -1,4 +1,5 @@
 import type { FugueGitHub } from "./github.js";
+import { resolveActivePolicy } from "./policy.js";
 import { loadCurrentCanonicalWorkState } from "./state.js";
 
 export class IntegrationGateFailure extends Error {
@@ -39,12 +40,14 @@ export async function verifyBaseCurrent(
 export async function verifyDependenciesSatisfied(
   github: FugueGitHub,
   dependencies: readonly number[],
+  baseSha?: string,
 ): Promise<void> {
   if (!dependencies.length) return;
+  const protectedBaseSha = baseSha ?? (await resolveActivePolicy(github)).identity.baseSha;
   const { owner, repo } = github.repository;
 
   for (const dependency of dependencies) {
-    const canonical = await loadCurrentCanonicalWorkState(github, dependency);
+    const canonical = await loadCurrentCanonicalWorkState(github, dependency, protectedBaseSha);
     if (!canonical) {
       throw new IntegrationGateFailure(
         "dependencies",

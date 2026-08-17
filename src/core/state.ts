@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { FugueGitHub } from "./github.js";
 import { assertAcyclicDependencies } from "./dependencies.js";
@@ -15,11 +16,13 @@ import {
   createProtocolComment,
   isReusableProtocolComment,
   isTrustedProtocolComment,
-  type GitHubCommentLike,
 } from "./provenance.js";
 
 const WORK_STATE_START = "<!-- fugue-work-state";
 const END = "-->";
+const WORK_STATE_HEAD_CONTEXT_PREFIX = "fugue/work-state/";
+const WORK_STATE_STAGE_CONTEXT_PREFIX = "fugue/work-state-stage/";
+const CHECKPOINT_PATTERN = /^stage=(\d+);comment=(\d+);digest=([0-9a-f]{64})$/;
 
 const stateLabelSchema = z.enum(["state:ready", "state:working", "state:blocked"]);
 const canonicalPrSchema = z.object({
@@ -39,11 +42,19 @@ export const canonicalWorkStateSchema = z.object({
   metadata: workMetadataSchema,
   pr: canonicalPrSchema.nullable(),
   base_sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  checkpoint_id: z.number().int().positive().optional(),
   created_at: z.string().min(1),
 });
 
 export type CanonicalWorkState = z.infer<typeof canonicalWorkStateSchema>;
 export type CanonicalPrState = z.infer<typeof canonicalPrSchema>;
+
+export class CanonicalWorkStateIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CanonicalWorkStateIntegrityError";
+  }
+}
 
 export interface WorkPrState {
   number: number;
@@ -75,9 +86,24 @@ export interface RepositoryState {
   drift: string[];
 }
 
-interface CanonicalComment extends GitHubCommentLike {
-  id?: number;
-  body?: string | null;
+interface CommitStatusRecord {
+  id: number;
+  context: string;
+  description?: string | null;
+}
+
+interface CheckpointPointer {
+  stageId: number;
+  commentId: number;
+  digest: string;
+}
+
+export function workStateHeadContext(issueNumber: number): string {
+  return `${WORK_STATE_HEAD_CONTEXT_PREFIX}${issueNumber}`;
+}
+
+export function workStateStageContext(issueNumber: number): string {
+  return `${WORK_STATE_STAGE_CONTEXT_PREFIX}${issueNumber}`;
 }
 
 export function createCanonicalWorkState(input: {
@@ -89,6 +115,7 @@ export function createCanonicalWorkState(input: {
   metadata: WorkMetadata;
   pr?: CanonicalPrState | null;
   baseSha: string;
+  checkpointId?: number;
   createdAt?: string;
 }): CanonicalWorkState {
   assertWorkMetadataForIssue(input.metadata, input.issue);
@@ -103,6 +130,7 @@ export function createCanonicalWorkState(input: {
     metadata: input.metadata,
     pr: input.pr ?? null,
     base_sha: input.baseSha,
+    ...(input.checkpointId ? { checkpoint_id: input.checkpointId } : {}),
     created_at: input.createdAt ?? new Date().toISOString(),
   });
 }
@@ -152,39 +180,85 @@ export function sameCanonicalWorkState(left: CanonicalWorkState, right: Canonica
     JSON.stringify(left.pr) === JSON.stringify(right.pr);
 }
 
+/**
+ * Publish a canonical work-state transaction. The staging and head commit statuses are append-only
+ * server-assigned checkpoints on the protected base. The signed comment embeds the staging ID;
+ * the head status commits that exact comment ID and digest. Readers always validate the newest
+ * head and never fall back, so deletion/tampering or forged later pointers fail closed instead of
+ * rolling authority backward.
+ */
 export async function publishCanonicalWorkState(
   github: FugueGitHub,
   state: CanonicalWorkState,
 ): Promise<boolean> {
   const parsed = canonicalWorkStateSchema.parse(state);
   assertWorkMetadataForIssue(parsed.metadata, parsed.issue);
-  const current = await loadCurrentCanonicalWorkState(github, parsed.issue);
+  const current = await loadCanonicalWorkStateAtBase(github, parsed.issue, parsed.base_sha, "current");
   if (current && sameCanonicalWorkState(current, parsed)) return false;
-  await createProtocolComment(
+
+  const { owner, repo } = github.repository;
+  const stage = await github.octokit.rest.repos.createCommitStatus({
+    owner,
+    repo,
+    sha: parsed.base_sha,
+    state: "success",
+    context: workStateStageContext(parsed.issue),
+    description: `Fugue work-state staging generation for Issue #${parsed.issue}`,
+  });
+  const stageId = stage.data.id;
+  const staged = canonicalWorkStateSchema.parse({ ...parsed, checkpoint_id: stageId });
+  const comment = await createProtocolComment(
     github,
-    parsed.issue,
-    `${serializeCanonicalWorkState(parsed)}\n\nFUGUE WORK STATE — CANONICAL\n\nWork: \`${parsed.metadata.work_id}\`\nIssue: #${parsed.issue}`,
+    staged.issue,
+    `${serializeCanonicalWorkState(staged)}\n\nFUGUE WORK STATE — CANONICAL\n\nWork: \`${staged.metadata.work_id}\`\nIssue: #${staged.issue}`,
   );
+  const digest = createHash("sha256").update(comment.data.body, "utf8").digest("hex");
+  await github.octokit.rest.repos.createCommitStatus({
+    owner,
+    repo,
+    sha: staged.base_sha,
+    state: "success",
+    context: workStateHeadContext(staged.issue),
+    description: checkpointDescription(stageId, comment.data.id, digest),
+    target_url: comment.data.html_url,
+  });
   return true;
 }
 
 export async function loadCurrentCanonicalWorkState(
   github: FugueGitHub,
   issueNumber: number,
+  baseSha: string,
 ): Promise<CanonicalWorkState | undefined> {
-  return loadCanonicalWorkState(github, issueNumber, isTrustedProtocolComment);
+  return loadCanonicalWorkStateAtBase(github, issueNumber, baseSha, "current");
 }
 
 /**
- * Load the latest work-state object from an originally trusted first-attempt protected workflow
- * revision. This is used only by current protected code to roll durable work truth forward after
- * the default branch advances; normal state/evaluation readers consume the current re-publication.
+ * Locate the nearest historical canonical checkpoint on the protected branch and verify that its
+ * signed publisher proof was minted by that exact historical base SHA. Newer invalid checkpoints
+ * are fatal; rollover never skips backward to older evidence.
  */
 export async function loadReusableCanonicalWorkState(
   github: FugueGitHub,
   issueNumber: number,
+  currentBaseSha: string,
+  baseBranch: string,
 ): Promise<CanonicalWorkState | undefined> {
-  return loadCanonicalWorkState(github, issueNumber, isReusableProtocolComment);
+  const { owner, repo } = github.repository;
+  const commits = await github.octokit.paginate(github.octokit.rest.repos.listCommits, {
+    owner,
+    repo,
+    sha: baseBranch,
+    per_page: 100,
+  });
+  for (const commit of commits) {
+    const sha = commit.sha;
+    if (sha.toLowerCase() === currentBaseSha.toLowerCase()) continue;
+    const hasHead = (await listStatuses(github, sha, workStateHeadContext(issueNumber))).length > 0;
+    if (!hasHead) continue;
+    return loadCanonicalWorkStateAtBase(github, issueNumber, sha, "reusable");
+  }
+  return undefined;
 }
 
 export async function rollCanonicalWorkStatesToCurrentBase(
@@ -201,8 +275,19 @@ export async function rollCanonicalWorkStatesToCurrentBase(
   const rolled: number[] = [];
   for (const issue of issues) {
     if (issue.pull_request) continue;
-    if (await loadCurrentCanonicalWorkState(github, issue.number)) continue;
-    const previous = await loadReusableCanonicalWorkState(github, issue.number);
+    const current = await loadCanonicalWorkStateAtBase(
+      github,
+      issue.number,
+      policy.identity.baseSha,
+      "current",
+    );
+    if (current) continue;
+    const previous = await loadReusableCanonicalWorkState(
+      github,
+      issue.number,
+      policy.identity.baseSha,
+      policy.identity.baseBranch,
+    );
     if (!previous) continue;
     const next = createCanonicalWorkState({
       issue: previous.issue,
@@ -219,31 +304,120 @@ export async function rollCanonicalWorkStatesToCurrentBase(
   return rolled;
 }
 
-async function loadCanonicalWorkState(
+async function loadCanonicalWorkStateAtBase(
   github: FugueGitHub,
   issueNumber: number,
-  verifyComment: (github: FugueGitHub, comment: GitHubCommentLike) => Promise<boolean>,
+  baseSha: string,
+  mode: "current" | "reusable",
 ): Promise<CanonicalWorkState | undefined> {
+  const heads = await listStatuses(github, baseSha, workStateHeadContext(issueNumber));
+  const head = heads[0];
+  if (!head) return undefined;
+  const pointer = parseCheckpointPointer(head.description, issueNumber, baseSha);
+
+  const stages = (await listStatuses(github, baseSha, workStateStageContext(issueNumber)))
+    .filter((status) => status.id < head.id);
+  const latestStage = stages[0];
+  if (!latestStage || latestStage.id !== pointer.stageId) {
+    throw new CanonicalWorkStateIntegrityError(
+      `Issue #${issueNumber} canonical work-state head at ${baseSha.slice(0, 8)} does not commit the latest staging generation before it.`,
+    );
+  }
+
   const { owner, repo } = github.repository;
-  const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
+  let comment;
+  try {
+    comment = await github.octokit.rest.issues.getComment({ owner, repo, comment_id: pointer.commentId });
+  } catch (error) {
+    if (isNotFound(error)) {
+      throw new CanonicalWorkStateIntegrityError(
+        `Issue #${issueNumber} canonical work-state checkpoint points to deleted comment ${pointer.commentId}; state is non-current.`,
+      );
+    }
+    throw error;
+  }
+  const body = comment.data.body ?? "";
+  const digest = createHash("sha256").update(body, "utf8").digest("hex");
+  if (digest !== pointer.digest) {
+    throw new CanonicalWorkStateIntegrityError(
+      `Issue #${issueNumber} canonical work-state comment ${pointer.commentId} no longer matches its immutable checkpoint digest.`,
+    );
+  }
+
+  const trusted = mode === "current"
+    ? await isTrustedProtocolComment(github, comment.data)
+    : await isReusableProtocolComment(github, comment.data, baseSha);
+  if (!trusted) {
+    throw new CanonicalWorkStateIntegrityError(
+      `Issue #${issueNumber} canonical work-state checkpoint does not have publisher proof for protected base ${baseSha.slice(0, 8)}.`,
+    );
+  }
+
+  let parsed: CanonicalWorkState | null;
+  try {
+    parsed = parseCanonicalWorkState(body);
+  } catch (error) {
+    throw new CanonicalWorkStateIntegrityError(
+      `Issue #${issueNumber} canonical work-state checkpoint is malformed (${message(error)}).`,
+    );
+  }
+  if (!parsed || parsed.issue !== issueNumber) {
+    throw new CanonicalWorkStateIntegrityError(
+      `Issue #${issueNumber} canonical checkpoint does not contain its work-state record.`,
+    );
+  }
+  if (parsed.base_sha.toLowerCase() !== baseSha.toLowerCase()) {
+    throw new CanonicalWorkStateIntegrityError(
+      `Issue #${issueNumber} canonical work-state claims base ${parsed.base_sha.slice(0, 8)} but checkpoint is on ${baseSha.slice(0, 8)}.`,
+    );
+  }
+  if (parsed.checkpoint_id !== pointer.stageId) {
+    throw new CanonicalWorkStateIntegrityError(
+      `Issue #${issueNumber} canonical work-state generation does not match its immutable checkpoint.`,
+    );
+  }
+  return parsed;
+}
+
+async function listStatuses(
+  github: FugueGitHub,
+  sha: string,
+  context: string,
+): Promise<CommitStatusRecord[]> {
+  const { owner, repo } = github.repository;
+  const statuses = await github.octokit.paginate(github.octokit.rest.repos.listCommitStatusesForRef, {
     owner,
     repo,
-    issue_number: issueNumber,
+    ref: sha,
     per_page: 100,
   });
-  const states: CanonicalWorkState[] = [];
-  for (const comment of comments as CanonicalComment[]) {
-    if (!(await verifyComment(github, comment))) continue;
-    try {
-      const parsed = parseCanonicalWorkState(comment.body ?? "");
-      if (parsed?.issue === issueNumber) states.push(parsed);
-    } catch {
-      // Invalid canonical-looking historical text is inert.
-    }
+  return statuses
+    .filter((status) => status.context === context)
+    .map((status) => ({ id: status.id, context: status.context, description: status.description }))
+    .sort((a, b) => b.id - a.id);
+}
+
+function checkpointDescription(stageId: number, commentId: number, digest: string): string {
+  return `stage=${stageId};comment=${commentId};digest=${digest}`;
+}
+
+function parseCheckpointPointer(
+  description: string | null | undefined,
+  issueNumber: number,
+  baseSha: string,
+): CheckpointPointer {
+  const match = description?.match(CHECKPOINT_PATTERN);
+  if (!match?.[1] || !match[2] || !match[3]) {
+    throw new CanonicalWorkStateIntegrityError(
+      `Issue #${issueNumber} latest canonical work-state head at ${baseSha.slice(0, 8)} is not a valid protected checkpoint.`,
+    );
   }
-  return states
-    .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
-    .at(-1);
+  const stageId = Number(match[1]);
+  const commentId = Number(match[2]);
+  if (!Number.isSafeInteger(stageId) || stageId <= 0 || !Number.isSafeInteger(commentId) || commentId <= 0) {
+    throw new CanonicalWorkStateIntegrityError(`Issue #${issueNumber} canonical work-state checkpoint IDs are invalid.`);
+  }
+  return { stageId, commentId, digest: match[3] };
 }
 
 export async function reconstructState(github: FugueGitHub): Promise<RepositoryState> {
@@ -271,10 +445,15 @@ export async function reconstructState(github: FugueGitHub): Promise<RepositoryS
 
   for (const issue of issues) {
     if (issue.pull_request) continue;
-    const canonical = await loadCurrentCanonicalWorkState(github, issue.number);
-    if (!canonical) continue;
-    if (canonical.base_sha.toLowerCase() !== policy.identity.baseSha.toLowerCase()) {
-      repositoryDrift.push(`Issue #${issue.number}: canonical work state is not bound to current protected base`);
+    const canonical = await loadCurrentCanonicalWorkState(github, issue.number, policy.identity.baseSha);
+    if (!canonical) {
+      const body = issue.body ?? "";
+      const looksManaged = body.includes("<!-- fugue-work") || issue.labels.map(labelName).some((label) =>
+        label === "state:ready" || label === "state:working" || label === "state:blocked" || label === "agent:ready"
+      );
+      if (looksManaged) {
+        repositoryDrift.push(`Issue #${issue.number}: presentation state exists without a current protected canonical work-state checkpoint`);
+      }
       continue;
     }
 
@@ -318,7 +497,6 @@ export async function reconstructState(github: FugueGitHub): Promise<RepositoryS
         if (pull.state !== "open") {
           const detail = await github.octokit.rest.pulls.get({ owner, repo, pull_number: pull.number });
           if (detail.data.merged) {
-            // A merged canonical PR is terminal Human state; it is no longer active work.
             continue;
           }
           presentationDrift.push(`canonical PR #${pull.number} is closed`);
@@ -382,7 +560,11 @@ export async function reconstructState(github: FugueGitHub): Promise<RepositoryS
 
       let problem = dependencyCache.get(dependency);
       if (problem === undefined) {
-        const canonicalDependency = await loadCurrentCanonicalWorkState(github, dependency);
+        const canonicalDependency = await loadCurrentCanonicalWorkState(
+          github,
+          dependency,
+          policy.identity.baseSha,
+        );
         if (!canonicalDependency) {
           problem = "has no current protected canonical Fugue work state";
         } else if (!canonicalDependency.pr) {
