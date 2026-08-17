@@ -24,6 +24,8 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    # SECURITY INVARIANT (external): configure the restrictive default-branch-only deployment
+    # policy before installing the Authority App key. The in-job audit is drift detection only.
     environment: fugue-authority
     permissions:
       checks: read
@@ -35,7 +37,7 @@ jobs:
     outputs:
       head_sha: ${{ steps.prepare.outputs.head_sha }}
     steps:
-      - name: Verify Fugue Authority environment boundary
+      - name: Audit external Fugue Authority environment invariant
         env:
           FUGUE_PROTECTED_BRANCH: ${{ github.event.repository.default_branch }}
           GITHUB_TOKEN: ${{ github.token }}
@@ -101,7 +103,7 @@ jobs:
           }
           process.stdout.write('::add-mask::' + secret + '\n');
           const digest = createHash('sha256').update(secret, 'utf8').digest('hex');
-          const variableName = `FUGUE_INT_${digest.slice(0, 32).toUpperCase()}`;
+          const variableName = `FUGUE_INT_PR_${String(prNumber).padStart(10, '0')}`;
           const apiBase = `https://api.github.com/repos/${owner}/${repo}`;
           const headers = {
             Authorization: `Bearer ${process.env.FUGUE_AUTHORITY_TOKEN}`,
@@ -256,6 +258,8 @@ jobs:
     if: always() && needs.prepare.result == 'success'
     needs: [prepare, validate]
     runs-on: ubuntu-latest
+    # SECURITY INVARIANT (external): configure the restrictive default-branch-only deployment
+    # policy before installing the Authority App key. The in-job audit is drift detection only.
     environment: fugue-authority
     permissions:
       actions: write
@@ -266,7 +270,7 @@ jobs:
       pull-requests: write
       statuses: write
     steps:
-      - name: Verify Fugue Authority environment boundary
+      - name: Audit external Fugue Authority environment invariant
         env:
           FUGUE_PROTECTED_BRANCH: ${{ github.event.repository.default_branch }}
           GITHUB_TOKEN: ${{ github.token }}

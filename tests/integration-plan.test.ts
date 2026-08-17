@@ -123,7 +123,7 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).toContain("FUGUE_RUNTIME_SHA: ${{ github.sha }}");
     expect(workflow).toContain("dispatch_secret:");
     expect(workflow).toContain("environment: fugue-authority");
-    expect(workflow).toContain("Verify Fugue Authority environment boundary");
+    expect(workflow).toContain("Audit external Fugue Authority environment invariant");
     expect(workflow).toContain("deployment-branch-policies?per_page=100");
     expect(workflow).toContain("names.length !== 1 || names[0] !== branch");
     expect(workflow).toContain("actions/create-github-app-token@v3");
@@ -131,7 +131,7 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).toContain("FUGUE_AUTHORITY_APP_PRIVATE_KEY");
     expect(workflow).toContain("FUGUE_AUTHORITY_TOKEN");
     expect(workflow).toContain("Commit protected Integration run-start evidence");
-    expect(workflow).toContain("FUGUE_INT_${digest.slice(0, 32).toUpperCase()}");
+    expect(workflow).toContain("FUGUE_INT_PR_${String(prNumber).padStart(10, '0')}");
     expect(workflow).toContain("/actions/variables/${variableName}");
     expect(workflow).not.toContain("/git/refs/");
     expect(workflow).not.toContain("fugue/integration/${digest}");
@@ -147,7 +147,7 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).toContain("ref: ${{ github.workflow_sha }}");
     expect(workflow).toContain("FUGUE_WORKFLOW_SHA: ${{ github.workflow_sha }}");
     expect(workflow).toContain("environment: fugue-authority");
-    expect(workflow).toContain("Verify Fugue Authority environment boundary");
+    expect(workflow).toContain("Audit external Fugue Authority environment invariant");
     expect(workflow).toContain("deployment-branch-policies?per_page=100");
     expect(workflow).toContain("names.length !== 1 || names[0] !== branch");
     expect(workflow).toContain("actions/create-github-app-token@v3");
@@ -204,5 +204,13 @@ describe("GitHub-hosted Integration plan", () => {
     const source = await readFile("src/core/integration-status.ts", "utf8");
     expect(source).not.toContain("listWorkflowRuns");
     expect(source).toContain("getIntegrationRunStartEvidence");
+  });
+
+  it("documents the external Authority bootstrap invariant and safe local read path", async () => {
+    const readme = await readFile("README.md", "utf8");
+    expect(readme).toContain("Before the App private key is installed");
+    expect(readme).toContain("FUGUE_AUTHORITY_TOKEN");
+    expect(readme).toContain("Variables: read");
+    expect(readme).not.toContain("Integration scans all workflow-run pages");
   });
 });

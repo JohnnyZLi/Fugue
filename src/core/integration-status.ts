@@ -24,11 +24,15 @@ import {
   verifyProtocolPublicationBodyAtRevision,
 } from "./provenance.js";
 import {
+  compactFugueRecoveryAuthorityVariables,
   createFugueAuthorityVariable,
+  deleteFugueAuthorityVariable,
   DurableProtocolRecoveryPendingError,
   getFugueAuthorityVariable,
+  listFugueAuthorityVariables,
   publishDurableProtocolRecord,
   recoverDurableProtocolRecord,
+  updateFugueAuthorityVariable,
 } from "./state.js";
 
 export type IntegrationState = "none" | "pending" | "success" | "failure" | "error" | "stale";
@@ -67,6 +71,15 @@ export const INTEGRATION_REQUEST_RECOVERY_GRACE_MS = 10 * 60 * 1000;
 const INTEGRATION_DISPATCH_ANCHOR_START = "<!-- fugue-integration-dispatch-anchor";
 const INTEGRATION_RUN_START = "<!-- fugue-integration-run-start";
 const PROTOCOL_END = "-->";
+const INTEGRATION_AUTHORITY_PREFIX = "FUGUE_INT_PR_";
+export const INTEGRATION_AUTHORITY_SLOT_LIMIT = 64;
+
+export class IntegrationAuthorityCapacityPendingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IntegrationAuthorityCapacityPendingError";
+  }
+}
 
 const integrationDispatchAnchorSchema = z.object({
   version: z.literal(1),
@@ -111,9 +124,9 @@ function parseIntegrationEvidence<T>(body: string, marker: string, schema: z.Zod
   return schema.parse(JSON.parse(Buffer.from(match[1], "base64url").toString("utf8")) as unknown);
 }
 
-export function integrationEvidenceVariableName(secretDigest: string): string {
-  if (!/^[0-9a-f]{64}$/i.test(secretDigest)) throw new Error("Invalid Integration dispatch digest.");
-  return `FUGUE_INT_${secretDigest.slice(0, 32).toUpperCase()}`;
+export function integrationEvidenceVariableName(prNumber: number): string {
+  if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error("Invalid Integration PR number.");
+  return `${INTEGRATION_AUTHORITY_PREFIX}${String(prNumber).padStart(10, "0")}`;
 }
 
 export function serializeIntegrationRunStartEvidence(value: IntegrationRunStartEvidence): string {
@@ -167,16 +180,46 @@ async function createIntegrationDispatchAnchor(
     throw new Error("Protected Integration dispatch anchor failed publisher self-check.");
   }
   await assertRepositoryDefaultBranchRevision(github, request.identity.baseSha);
-  const name = integrationEvidenceVariableName(anchor.secret_digest);
-  const created = await createFugueAuthorityVariable(github, name, signed);
-  if (!created) {
-    const existing = await getFugueAuthorityVariable(github, name);
-    const parsed = existing ? parseIntegrationDispatchAnchor(existing) : null;
-    if (!existing || !parsed || JSON.stringify(parsed) !== JSON.stringify(anchor) ||
-        !(await verifyProtocolPublicationBodyAtRevision(github, existing, request.identity.baseSha, timestamp))) {
-      throw new Error(`Integration dispatch authority variable ${name} already exists with different authority.`);
+  const name = integrationEvidenceVariableName(request.identity.prNumber);
+  await compactFugueRecoveryAuthorityVariables(github, undefined, 1);
+  let existing = await getFugueAuthorityVariable(github, name);
+  if (!existing) {
+    const active = await listFugueAuthorityVariables(github, INTEGRATION_AUTHORITY_PREFIX);
+    if (active.length >= INTEGRATION_AUTHORITY_SLOT_LIMIT) {
+      throw new IntegrationAuthorityCapacityPendingError(
+        `Protected Integration authority has ${active.length} active PR slots; scheduled reconciliation will retry after an existing slot binds or aborts.`,
+      );
+    }
+    const created = await createFugueAuthorityVariable(github, name, signed);
+    if (created) existing = signed;
+    else existing = await getFugueAuthorityVariable(github, name);
+    if (!existing) {
+      throw new IntegrationAuthorityCapacityPendingError(
+        "Repository Authority-variable capacity is temporarily full; Fugue reclaimed recovery checkpoints where safe and will retry without Human repository surgery.",
+      );
     }
   }
+
+  const parsedAnchor = (() => { try { return parseIntegrationDispatchAnchor(existing!); } catch { return null; } })();
+  if (parsedAnchor && JSON.stringify(parsedAnchor) === JSON.stringify(anchor) &&
+      await verifyProtocolPublicationBodyAtRevision(github, existing, request.identity.baseSha, timestamp)) return;
+  const parsedStart = (() => { try { return parseIntegrationRunStart(existing!); } catch { return null; } })();
+  const sameStartIdentity = parsedStart && parsedStart.pr_number === request.identity.prNumber &&
+    parsedStart.head_sha === request.identity.headSha && parsedStart.base_sha === request.identity.baseSha;
+  if (sameStartIdentity && parsedStart.request_id !== request.request_id) {
+    throw new Error(`Integration authority slot ${name} was already consumed by run ${parsedStart.run_id} for request ${parsedStart.request_id}.`);
+  }
+
+  // authorizeIntegrationDispatch creates the anchor before d3 publishes the request and only the
+  // caller dispatches after that publication succeeds. Therefore a different same-identity *anchor*
+  // with no run-start is a crash residue that can never have been legitimately consumed; reclaiming
+  // it prevents a crash between anchor creation and d3 request publication from wedging the PR.
+  // A same-identity run-start above is never reclaimed because it proves the protected start boundary
+  // was crossed and must remain fail-closed until d3 recovery resolves that request.
+  // Different-head/base or malformed slots are stale presentation/working state and are also reclaimable.
+  await updateFugueAuthorityVariable(github, name, signed);
+  const committed = await getFugueAuthorityVariable(github, name);
+  if (committed !== signed) throw new Error(`Integration dispatch authority slot ${name} was not durably replaced.`);
 }
 
 async function verifyIntegrationDispatchAnchor(
@@ -201,7 +244,7 @@ export async function getIntegrationRunStartEvidence(
   record: IntegrationRecord,
 ): Promise<IntegrationRunStartEvidence | undefined> {
   if (!record.dispatch) return undefined;
-  const name = integrationEvidenceVariableName(record.dispatch.secret_digest);
+  const name = integrationEvidenceVariableName(record.identity.prNumber);
   const body = await getFugueAuthorityVariable(github, name);
   if (!body) throw new Error(`Protected Integration authority variable ${name} is missing.`);
   let start: IntegrationRunStartEvidence | null;
@@ -223,6 +266,18 @@ export async function getIntegrationRunStartEvidence(
     throw new Error(`Protected Integration run-start evidence ${name} has invalid provenance.`);
   }
   return start;
+}
+
+export async function releaseIntegrationAuthorityVariable(github: FugueGitHub, record: IntegrationRecord): Promise<void> {
+  if (!record.dispatch) return;
+  const name = integrationEvidenceVariableName(record.identity.prNumber);
+  const body = await getFugueAuthorityVariable(github, name);
+  if (!body) return;
+  let current: IntegrationDispatchAnchor | IntegrationRunStartEvidence | null = null;
+  try { current = parseIntegrationRunStart(body) ?? parseIntegrationDispatchAnchor(body); } catch { current = null; }
+  if (!current || current.request_id !== record.request.request_id ||
+      current.secret_digest !== record.dispatch.secret_digest) return;
+  await deleteFugueAuthorityVariable(github, name);
 }
 
 function integrationRunBindingFromEvidence(github: FugueGitHub, evidence: IntegrationRunStartEvidence): IntegrationRunBinding {
@@ -256,7 +311,7 @@ export async function currentIntegrationState(
     return { state: record.terminal.state, request, targetUrl: record.run?.html_url };
   }
 
-  const evidence = await getIntegrationRunStartEvidence(github, record);
+  const evidence = record.run ? undefined : await getIntegrationRunStartEvidence(github, record);
   const binding = record.run ?? (evidence ? integrationRunBindingFromEvidence(github, evidence) : undefined);
   if (binding) {
     const live = await getIntegrationWorkflowRunForBinding(github, request, binding);
@@ -324,11 +379,13 @@ export async function sealIntegrationWorkflowRunEvent(
     if (error instanceof DurableProtocolRecoveryPendingError) return false;
     throw error;
   }
-  if (record.terminal) return false;
-  const evidence = await getIntegrationRunStartEvidence(github, record);
-  if (!evidence || evidence.run_id !== event.runId) return false;
-  const binding = integrationRunBindingFromEvidence(github, evidence);
-  if (record.run && record.run.id !== binding.id) return false;
+  if (record.terminal) {
+    await releaseIntegrationAuthorityVariable(github, record);
+    return false;
+  }
+  const evidence = record.run ? undefined : await getIntegrationRunStartEvidence(github, record);
+  const binding = record.run ?? (evidence ? integrationRunBindingFromEvidence(github, evidence) : undefined);
+  if (!binding || binding.id !== event.runId) return false;
   const createdAt = new Date().toISOString();
   if (event.conclusion === "cancelled") {
     await publishIntegrationRecord(github, {
@@ -405,7 +462,10 @@ export async function publishIntegrationRecord(
   record: IntegrationRecord,
 ): Promise<IntegrationRecord> {
   const current = await getCurrentIntegrationRecord(github, record.identity);
-  if (current && sameIntegrationRecord(current, record)) return current;
+  if (current && sameIntegrationRecord(current, record)) {
+    if (current.run || current.terminal) await releaseIntegrationAuthorityVariable(github, current);
+    return current;
+  }
   if (current && current.terminal && current.terminal.state !== "aborted") {
     throw new Error(`Integration request ${current.request.request_id} already has terminal ${current.terminal.state} authority.`);
   }
@@ -434,6 +494,7 @@ export async function publishIntegrationRecord(
     authorityOrder: normalized.created_at,
   });
   await replaceIntegrationLocator(github, normalized);
+  if (normalized.run || normalized.terminal) await releaseIntegrationAuthorityVariable(github, normalized);
   return normalized;
 }
 
@@ -449,11 +510,17 @@ export async function ensureIntegrationDispatch(
     if (error instanceof DurableProtocolRecoveryPendingError) return { dispatch: false };
     throw error;
   }
-  if (current?.terminal && current.terminal.state !== "aborted") return { request: current.request, dispatch: false };
-  if (current?.terminal?.state === "aborted") current = undefined;
+  if (current?.terminal && current.terminal.state !== "aborted") {
+    await releaseIntegrationAuthorityVariable(github, current);
+    return { request: current.request, dispatch: false };
+  }
+  if (current?.terminal?.state === "aborted") {
+    await releaseIntegrationAuthorityVariable(github, current);
+    current = undefined;
+  }
 
   if (current) {
-    const evidence = await getIntegrationRunStartEvidence(github, current);
+    const evidence = current.run ? undefined : await getIntegrationRunStartEvidence(github, current);
     if (evidence && !current.run) {
       current = await publishIntegrationRecord(github, {
         ...current,
@@ -522,7 +589,13 @@ export async function ensureIntegrationDispatch(
 
   const request = createIntegrationRequest(snapshot.identity, new Date(now).toISOString());
   const authorizedAt = new Date(now).toISOString();
-  const authorized = await authorizeIntegrationDispatch(github, request, authorizedAt);
+  let authorized: Awaited<ReturnType<typeof authorizeIntegrationDispatch>>;
+  try {
+    authorized = await authorizeIntegrationDispatch(github, request, authorizedAt);
+  } catch (error) {
+    if (error instanceof IntegrationAuthorityCapacityPendingError) return { dispatch: false };
+    throw error;
+  }
   await publishIntegrationRecord(github, createIntegrationRecord(request, {
     dispatch: authorized.authorization,
     createdAt: authorizedAt,
@@ -547,6 +620,7 @@ export async function bindIntegrationRun(
   }
   if (current.run) {
     if (current.run.id !== runId) throw new Error(`Integration request ${requestId} is already bound to protected run ${current.run.id}.`);
+    await releaseIntegrationAuthorityVariable(github, current);
     return current;
   }
   const evidence = await getIntegrationRunStartEvidence(github, current);

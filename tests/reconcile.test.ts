@@ -15,6 +15,7 @@ import {
   ensureIntegrationDispatch,
   getCurrentIntegrationRecord,
   getIntegrationRunStartEvidence,
+  INTEGRATION_AUTHORITY_SLOT_LIMIT,
   integrationEvidenceVariableName,
   integrationRunStartSchema,
   publishIntegrationRecord,
@@ -27,12 +28,14 @@ import {
   assertRepositoryDefaultBranchRevision,
   FUGUE_PROTOCOL_ACTOR,
   signProtocolBody,
+  createDurableManifestProof,
   verifyDurableManifestProof,
   verifyProtocolPublicationBodyAtRevision,
 } from "../src/core/provenance.js";
 import { ingestCoordinatorSnapshot, preserveCoordinatorIssueEvent } from "../src/core/reconcile.js";
 import {
   canonicalRequirements,
+  compactFugueRecoveryAuthorityVariables,
   coordinatorSnapshotSchema,
   createCanonicalWorkState,
   durableManifestContext,
@@ -211,7 +214,7 @@ describe("d3 protected durable authority", () => {
         sha: BASE,
         context: durableManifestContext("work/18", key),
         description: `n=48;c=${"b".repeat(32)};b=${"a".repeat(64)};a=1;z=48`,
-        target_url: `https://token.actions.githubusercontent.com/fugue/d3?o=${order}&p=forged`,
+        target_url: `https://token.actions.githubusercontent.com/fugue/d3?o=${order}&i=${Array.from({ length: 48 }, () => "1").join(".")}&p=forged`,
         created_at: "2026-08-17T03:00:01.000Z",
       });
     }
@@ -230,7 +233,7 @@ describe("d3 protected durable authority", () => {
     expect(first.exhausted).toBe(false);
     expect(github.__listStatus).toHaveBeenCalledTimes(2);
     expect(vi.mocked(verifyDurableManifestProof)).toHaveBeenCalledTimes(8);
-    expect(vi.mocked(verifyProtocolPublicationBodyAtRevision)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(verifyProtocolPublicationBodyAtRevision)).toHaveBeenCalledTimes(3);
     expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3_"))).toBe(true);
     expect([...github.__refs.keys()].some((ref) => ref.startsWith("fugue/recovery/"))).toBe(false);
     expect(github.__comments.some((comment) => comment.body.includes("fugue-durable-recovery"))).toBe(false);
@@ -246,6 +249,20 @@ describe("d3 protected durable authority", () => {
     expect(github.__comments.some((comment) => comment.body.includes("work-d3"))).toBe(true);
   });
 
+
+  it("binds every exact protected chunk status ID despite hostile same-context interleaving", async () => {
+    const github = makeGithub({ interleaveSameContext: true });
+    vi.mocked(createDurableManifestProof).mockClear();
+    await publishCanonicalWorkState(github, canonicalWork("exact-id-safe"));
+    const binding = vi.mocked(createDurableManifestProof).mock.calls.at(-1)?.[1];
+    expect(binding?.statusIds).toHaveLength(binding?.chunkCount ?? 0);
+    const hostileId = github.__statuses.find((status) => status.description === "hostile-same-context")?.id;
+    expect(hostileId).toBeDefined();
+    expect(binding?.statusIds).not.toContain(hostileId);
+    github.__comments.splice(0);
+    const recovered = await loadCurrentCanonicalWorkState(github, 18, BASE);
+    expect(canonicalRequirements(recovered!)).toBe("exact-id-safe");
+  });
 
   it("reconstructs a committed record despite hostile statuses inserted after proof and before manifest commit", async () => {
     const github = makeGithub({ interleaveBeforeManifest: 250 });
@@ -279,6 +296,61 @@ describe("d3 protected durable authority", () => {
     expect(canonicalRequirements(recovered!.record!.value)).toBe("older-valid-authority");
     expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3_"))).toBe(true);
     expect([...github.__refs.keys()].some((ref) => ref.startsWith("fugue/recovery/"))).toBe(false);
+  });
+
+  it("self-compacts a full recovery-variable namespace before advancing the checkpoint", async () => {
+    const github = makeGithub();
+    await publishCanonicalWorkState(github, canonicalWork("capacity-safe"));
+    github.__comments.splice(0);
+    for (let index = 0; index < 3400; index += 1) {
+      github.__statuses.push({ id: ++github.__nextStatusId, sha: BASE, context: `capacity-noise/${index}`, description: "noise" });
+    }
+    const first = await recoverDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: "work/18", issueNumber: 18,
+      parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
+    });
+    expect(first.exhausted).toBe(false);
+    const checkpoint = [...github.__authorityVariables.entries()].find(([name]) => name.startsWith("FUGUE_D3_"));
+    expect(checkpoint).toBeDefined();
+    const [name, value] = checkpoint!;
+    const prefix = name.slice(0, -16);
+    for (let index = 0; github.__authorityVariables.size < 500; index += 1) {
+      github.__authorityVariables.set(`${prefix}${index.toString(16).padStart(16, "0")}`, value);
+    }
+    expect(github.__authorityVariables.size).toBe(500);
+    let recovered = first;
+    for (let attempt = 0; attempt < 8 && !recovered.record; attempt += 1) {
+      recovered = await recoverDurableProtocolRecord(github, {
+        storageSha: BASE, publisherSha: BASE, scope: "work/18", issueNumber: 18,
+        parse: parseCanonicalWorkState, timestamp: (entry) => Date.parse(entry.created_at), order: (entry) => entry.created_at,
+      });
+    }
+    expect(github.__authorityVariables.size).toBeLessThan(500);
+    expect(recovered.record).toBeDefined();
+    expect(canonicalRequirements(recovered.record!.value)).toBe("capacity-safe");
+  });
+
+  it("uses one deterministic survivor when equal-progress recovery cleanup runs concurrently", async () => {
+    const github = makeGithub();
+    await publishCanonicalWorkState(github, canonicalWork("equal-progress"));
+    github.__comments.splice(0);
+    for (let index = 0; index < 3400; index += 1) {
+      github.__statuses.push({ id: ++github.__nextStatusId, sha: BASE, context: `equal-noise/${index}`, description: "noise" });
+    }
+    await recoverDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: "work/18", issueNumber: 18,
+      parse: parseCanonicalWorkState, timestamp: (value) => Date.parse(value.created_at), order: (value) => value.created_at,
+    });
+    const checkpoint = [...github.__authorityVariables.entries()].find(([name]) => name.startsWith("FUGUE_D3_"))!;
+    const prefix = checkpoint[0].slice(0, -16);
+    github.__authorityVariables.set(`${prefix}${"e".repeat(16)}`, checkpoint[1]);
+    github.__authorityVariables.set(`${prefix}${"f".repeat(16)}`, checkpoint[1]);
+    await Promise.all([
+      compactFugueRecoveryAuthorityVariables(github),
+      compactFugueRecoveryAuthorityVariables(github),
+    ]);
+    const surviving = [...github.__authorityVariables.keys()].filter((name) => name.startsWith(prefix));
+    expect(surviving).toHaveLength(1);
   });
 
   it("ignores pre-created, deleted, rewound, fast-forwarded, and replayed custom recovery refs after presentation loss", async () => {
@@ -533,6 +605,48 @@ describe("durable Integration one-request/one-run/result authority", () => {
     expect(current?.terminal?.state).toBe("aborted");
   });
 
+  it("reclaims an orphan dispatch anchor after a crash before d3 request publication", async () => {
+    const github = makeGithub();
+    const orphan = createIntegrationRequest(snapshot().identity, "2026-08-17T03:48:00.000Z");
+    await authorizeIntegrationDispatch(github, orphan, "2026-08-17T03:48:00.000Z", "a".repeat(64));
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_PR_"))).toHaveLength(1);
+
+    const next = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T03:48:05.000Z"));
+    expect(next.dispatch).toBe(true);
+    expect(next.request?.request_id).not.toBe(orphan.request_id);
+    const current = await getCurrentIntegrationRecord(github, snapshot().identity);
+    expect(current?.request.request_id).toBe(next.request?.request_id);
+    expect(current?.dispatch).toBeDefined();
+  });
+
+  it("backs off safely when the bounded active Integration-slot budget is occupied", async () => {
+    const github = makeGithub();
+    for (let index = 0; index < INTEGRATION_AUTHORITY_SLOT_LIMIT; index += 1) {
+      github.__authorityVariables.set(`FUGUE_INT_PR_${String(1000 + index).padStart(10, "0")}`, "occupied");
+    }
+    const next = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T03:49:00.000Z"));
+    expect(next.dispatch).toBe(false);
+    expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_PR_"))).toHaveLength(INTEGRATION_AUTHORITY_SLOT_LIMIT);
+  });
+
+  it("reclaims the bounded per-PR Integration authority slot across repeated cancellations", async () => {
+    const github = makeGithub();
+    let now = Date.parse("2026-08-17T03:50:00.000Z");
+    for (let index = 0; index < 12; index += 1) {
+      const next = await ensureIntegrationDispatch(github, snapshot(), now);
+      expect(next.dispatch).toBe(true);
+      const record = await getCurrentIntegrationRecord(github, snapshot().identity);
+      expect(record?.dispatch).toBeDefined();
+      const runId = 9000 + index;
+      await installRunStartEvidence(github, record!, runId, new Date(now + 1000).toISOString());
+      await expect(sealIntegrationWorkflowRunEvent(
+        github, completionEvent(record!.request, runId, "cancelled", new Date(now + 2000).toISOString()),
+      )).resolves.toBe(true);
+      expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_PR_"))).toHaveLength(0);
+      now += 10_000;
+    }
+  });
+
   it("treats replayed Integration receipt comments as hints and keeps newer terminal d3 authority", async () => {
     const github = makeGithub();
     const record = await publishAuthorizedRecord(github, 800, "2026-08-17T03:45:00.000Z");
@@ -586,7 +700,7 @@ interface TestGithub extends FugueGitHub {
   __listWorkflowRuns: ReturnType<typeof vi.fn>;
 }
 
-function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?: boolean; interleaveBeforeManifest?: number } = {}): TestGithub {
+function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?: boolean; interleaveBeforeManifest?: number; interleaveSameContext?: boolean } = {}): TestGithub {
   const comments: TestComment[] = [];
   const statuses: TestStatus[] = [];
   const runs: TestRun[] = [];
@@ -601,6 +715,7 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
   let nextStatusId = 0;
   let failedManifest = false;
   let interleavedManifest = false;
+  let interleavedSameContext = false;
   const listForRepo = vi.fn();
   const listCommits = vi.fn();
   const listWorkflowRuns = vi.fn(async () => ({ data: { workflow_runs: runs } }));
@@ -703,7 +818,12 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
               }
             }
             const status = { id: ++nextStatusId, sha: args.sha, context: args.context, description: args.description ?? "", target_url: args.target_url, created_at: new Date().toISOString() };
-            statuses.push(status); return { data: status };
+            statuses.push(status);
+            if (options.interleaveSameContext && args.context.includes("/d/") && !interleavedSameContext) {
+              interleavedSameContext = true;
+              statuses.push({ id: ++nextStatusId, sha: args.sha, context: args.context, description: "hostile-same-context", created_at: new Date().toISOString() });
+            }
+            return { data: status };
           }),
           listCommitStatusesForRef,
           getCollaboratorPermissionLevel: vi.fn(async () => ({ data: { permission: "admin" } })),
@@ -773,7 +893,7 @@ async function installRunStartEvidence(
     secret_digest: record.dispatch.secret_digest, run_id: runId, run_attempt: 1, created_at: createdAt,
   });
   const signed = await signProtocolBody(github, serializeIntegrationRunStartEvidence(evidence));
-  github.__authorityVariables.set(integrationEvidenceVariableName(record.dispatch.secret_digest), signed);
+  github.__authorityVariables.set(integrationEvidenceVariableName(record.identity.prNumber), signed);
   expect((await getIntegrationRunStartEvidence(github, record))?.run_id).toBe(runId);
 }
 

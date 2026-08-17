@@ -42,6 +42,9 @@ const DURABLE_WRITE_ATTEMPTS = 4;
 const STATUS_PAGE_SIZE = 100;
 const MANIFEST_PROOFS_PER_RECOVERY_SLICE = 8;
 const STATUS_PAGES_PER_RECOVERY_SLICE = 32;
+const REPOSITORY_AUTHORITY_VARIABLE_CAPACITY = 500;
+export const FUGUE_RECOVERY_VARIABLE_LIMIT = 24;
+const RECOVERY_AUTHORITY_PREFIX = "FUGUE_D3_";
 const MANIFEST_PATTERN = /^n=(\d+);c=([0-9a-f]{32});b=([0-9a-f]{64});a=(\d+);z=(\d+)$/i;
 const DURABLE_MANIFEST_URL = "https://token.actions.githubusercontent.com/fugue/d3";
 
@@ -92,6 +95,7 @@ const recoveryManifestSchema = z.object({
   first_status_id: z.number().int().positive(),
   last_status_id: z.number().int().positive(),
   chunk_count: z.number().int().positive().max(DURABLE_MAX_CHUNKS),
+  status_ids: z.array(z.number().int().positive()).min(1).max(DURABLE_MAX_CHUNKS),
 });
 
 const recoveryCursorSchema = z.object({
@@ -340,8 +344,9 @@ function encodeDurableBundle(scope: string, key: string, nonce: string, signedBo
  * Publish a durable protocol body so statuses:write is transport only, never authority. Both the
  * random bundle key and a 128-bit commit nonce are covered by the protected OIDC signature but are
  * redacted from every pre-commit status chunk. The final manifest reveals them and carries a
- * second protected OIDC proof binding the exact server-assigned chunk-ID range, body digest,
- * authority order, key, and nonce. Interleaved hostile statuses cannot make a committed record
+ * second protected OIDC proof binding the ordered exact server-assigned ID of every chunk, body
+ * digest, authority order, key, and nonce. Same-context hostile interleaving is ignored unless its
+ * server ID is one of those exact protected IDs, so it cannot make a committed record
  * unreconstructible, and candidate statuses:write cannot finish an aborted prospective record.
  */
 export async function publishDurableProtocolRecord(
@@ -409,9 +414,10 @@ export async function publishDurableProtocolRecord(
         firstStatusId,
         lastStatusId,
         chunkCount: bundle.data.length,
+        statusIds: writtenIds,
       };
       const manifestProof = await createDurableManifestProof(github, manifestBinding);
-      const manifestTarget = durableManifestTargetUrl(input.authorityOrder, manifestProof);
+      const manifestTarget = durableManifestTargetUrl(input.authorityOrder, manifestProof, writtenIds);
 
       await assertRepositoryDefaultBranchRevision(github, input.publisherSha);
       await github.octokit.rest.repos.createCommitStatus({
@@ -549,9 +555,9 @@ export async function recoverDurableProtocolRecord<T>(
   const manifest = cursor.best_manifest;
   if (!manifest) throw new CanonicalWorkStateIntegrityError(`Durable recovery lost its authenticated manifest for ${options.scope}.`);
   const chunks = [...(cursor.chunks ?? Array.from({ length: manifest.chunk_count }, () => null))];
-  const expected = new Map<string, number>();
+  const expected = new Map<number, { index: number; context: string }>();
   for (let index = 0; index < manifest.chunk_count; index += 1) {
-    expected.set(durableDataContext(options.scope, manifest.key, index), index);
+    expected.set(manifest.status_ids[index]!, { index, context: durableDataContext(options.scope, manifest.key, index) });
   }
   const materialized = await scanFrozenStatuses(
     github,
@@ -561,8 +567,10 @@ export async function recoverDurableProtocolRecord<T>(
     cursor.before_id,
     cursor.page,
     async (status) => {
-      const index = expected.get(status.context);
-      if (index !== undefined && chunks[index] == null && status.description) chunks[index] = status.description;
+      const protectedChunk = expected.get(status.id);
+      if (protectedChunk && status.context === protectedChunk.context && chunks[protectedChunk.index] == null && status.description) {
+        chunks[protectedChunk.index] = status.description;
+      }
       return true;
     },
   );
@@ -651,6 +659,7 @@ interface RecoveryManifest {
   first_status_id: number;
   last_status_id: number;
   chunk_count: number;
+  status_ids: number[];
 }
 
 async function authenticatedManifest<T>(
@@ -671,7 +680,8 @@ async function authenticatedManifest<T>(
       !Number.isInteger(firstStatusId) || firstStatusId <= 0 ||
       !Number.isInteger(lastStatusId) || lastStatusId < firstStatusId || lastStatusId >= status.id) return undefined;
   const target = parseDurableManifestTarget(status.targetUrl ?? "");
-  if (!target || !status.createdAt) return undefined;
+  if (!target || !status.createdAt || target.statusIds.length !== chunkCount ||
+      target.statusIds[0] !== firstStatusId || target.statusIds.at(-1) !== lastStatusId) return undefined;
   const timestamp = Date.parse(status.createdAt);
   if (!Number.isFinite(timestamp)) return undefined;
   const binding = {
@@ -684,6 +694,7 @@ async function authenticatedManifest<T>(
     firstStatusId,
     lastStatusId,
     chunkCount,
+    statusIds: target.statusIds,
   };
   if (!(await verifyDurableManifestProof(github, target.proof, binding, options.publisherSha, timestamp))) return undefined;
   return recoveryManifestSchema.parse({
@@ -695,6 +706,7 @@ async function authenticatedManifest<T>(
     first_status_id: firstStatusId,
     last_status_id: lastStatusId,
     chunk_count: chunkCount,
+    status_ids: target.statusIds,
   });
 }
 
@@ -728,23 +740,54 @@ async function scanFrozenStatuses(
   return { beforeId, page, exhausted: false };
 }
 
-function durableManifestTargetUrl(order: string, proof: string): string {
+function encodeStatusIds(ids: readonly number[]): string {
+  let previous = 0;
+  return ids.map((id, index) => {
+    const value = index === 0 ? id : id - previous;
+    previous = id;
+    return value.toString(36);
+  }).join(".");
+}
+
+function decodeStatusIds(value: string): number[] | undefined {
+  if (!value || value.length > 512) return undefined;
+  const parts = value.split(".");
+  if (!parts.length || parts.length > DURABLE_MAX_CHUNKS) return undefined;
+  const ids: number[] = [];
+  let previous = 0;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!part || !/^[0-9a-z]+$/i.test(part)) return undefined;
+    const encoded = Number.parseInt(part, 36);
+    if (!Number.isSafeInteger(encoded) || encoded <= 0) return undefined;
+    const id = index === 0 ? encoded : previous + encoded;
+    if (!Number.isSafeInteger(id) || id <= previous) return undefined;
+    ids.push(id);
+    previous = id;
+  }
+  return ids;
+}
+
+function durableManifestTargetUrl(order: string, proof: string, statusIds: readonly number[]): string {
   const target = new URL(DURABLE_MANIFEST_URL);
   target.searchParams.set("o", Buffer.from(order, "utf8").toString("base64url"));
+  target.searchParams.set("i", encodeStatusIds(statusIds));
   target.searchParams.set("p", proof);
   return target.toString();
 }
 
-function parseDurableManifestTarget(value: string): { order: string; proof: string } | undefined {
+function parseDurableManifestTarget(value: string): { order: string; proof: string; statusIds: number[] } | undefined {
   try {
     const target = new URL(value);
     if (`${target.origin}${target.pathname}` !== DURABLE_MANIFEST_URL) return undefined;
     const encodedOrder = target.searchParams.get("o");
+    const encodedIds = target.searchParams.get("i");
     const proof = target.searchParams.get("p");
-    if (!encodedOrder || !proof) return undefined;
+    if (!encodedOrder || !encodedIds || !proof) return undefined;
     const order = Buffer.from(encodedOrder, "base64url").toString("utf8");
-    if (!order || order.length > 512) return undefined;
-    return { order, proof };
+    const statusIds = decodeStatusIds(encodedIds);
+    if (!order || order.length > 512 || !statusIds) return undefined;
+    return { order, proof, statusIds };
   } catch {
     return undefined;
   }
@@ -795,7 +838,7 @@ function requireAuthorityToken(): string {
   const token = process.env.FUGUE_AUTHORITY_TOKEN?.trim();
   if (!token) {
     throw new CanonicalWorkStateIntegrityError(
-      "Protected Fugue authority token is unavailable; refusing to use candidate-writable GitHub state as recovery authority.",
+      "Protected Fugue authority token is unavailable. Hosted mutation must use the Authority App; local status/debug reads require an explicitly supplied repository-Variables read credential in FUGUE_AUTHORITY_TOKEN.",
     );
   }
   return token;
@@ -866,6 +909,7 @@ export async function createFugueAuthorityVariable(github: FugueGitHub, name: st
   const injected = injectedAuthorityVariables(github);
   if (injected) {
     if (injected.has(name)) return false;
+    if (injected.size >= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY) return false;
     injected.set(name, value);
     return true;
   }
@@ -894,7 +938,7 @@ export async function updateFugueAuthorityVariable(github: FugueGitHub, name: st
   }
 }
 
-async function deleteFugueAuthorityVariable(github: FugueGitHub, name: string): Promise<void> {
+export async function deleteFugueAuthorityVariable(github: FugueGitHub, name: string): Promise<void> {
   const injected = injectedAuthorityVariables(github);
   if (injected) {
     injected.delete(name);
@@ -933,7 +977,7 @@ async function findRecoveryCursor<T>(
       continue;
     }
     if (!best || compareRecoveryProgress(cursor, best.cursor) > 0 ||
-        (compareRecoveryProgress(cursor, best.cursor) === 0 && cursor.checkpoint_at > best.cursor.checkpoint_at)) {
+        (compareRecoveryProgress(cursor, best.cursor) === 0 && variable.name < best.variableName)) {
       best = { variableName: variable.name, cursor };
     }
   }
@@ -965,13 +1009,108 @@ function compareRecoveryProgress(left: RecoveryCursor, right: RecoveryCursor): n
   return leftChunks - rightChunks;
 }
 
+function recoveryIdentity(cursor: RecoveryCursor): string {
+  return `${cursor.storage_sha.toLowerCase()}\0${cursor.publisher_sha.toLowerCase()}\0${cursor.scope}`;
+}
+
+function recoveryOptionsIdentity<T>(options: DurableRecordOptions<T>): string {
+  return `${options.storageSha.toLowerCase()}\0${options.publisherSha.toLowerCase()}\0${options.scope}`;
+}
+
+async function verifiedRecoveryAuthorityVariables(github: FugueGitHub): Promise<Array<{ variableName: string; cursor: RecoveryCursor }>> {
+  const verified: Array<{ variableName: string; cursor: RecoveryCursor }> = [];
+  for (const variable of await listFugueAuthorityVariables(github, RECOVERY_AUTHORITY_PREFIX)) {
+    let cursor: RecoveryCursor | null;
+    try { cursor = parsePayloadBlock(variable.value, RECOVERY_START, recoveryCursorSchema); }
+    catch { cursor = null; }
+    if (!cursor) {
+      await deleteFugueAuthorityVariable(github, variable.name);
+      continue;
+    }
+    const timestamp = Date.parse(cursor.checkpoint_at);
+    let valid = Number.isFinite(timestamp);
+    if (valid) {
+      try { valid = await verifyProtocolPublicationBodyAtRevision(github, variable.value, cursor.publisher_sha, timestamp); }
+      catch { valid = false; }
+    }
+    if (!valid) {
+      await deleteFugueAuthorityVariable(github, variable.name);
+      continue;
+    }
+    verified.push({ variableName: variable.name, cursor });
+  }
+  return verified;
+}
+
+/**
+ * Recovery checkpoints are performance state, never d3 authority. Keep one deterministic greatest
+ * checkpoint per identity and a small global working set. Equal-progress writers choose the same
+ * lexicographic survivor, so concurrent cleanup cannot cross-delete every valid checkpoint.
+ */
+export async function compactFugueRecoveryAuthorityVariables(
+  github: FugueGitHub,
+  preserveIdentity?: string,
+  reserveSlots = 0,
+): Promise<void> {
+  const verified = await verifiedRecoveryAuthorityVariables(github);
+  const grouped = new Map<string, Array<{ variableName: string; cursor: RecoveryCursor }>>();
+  for (const entry of verified) {
+    const key = recoveryIdentity(entry.cursor);
+    const group = grouped.get(key) ?? [];
+    group.push(entry);
+    grouped.set(key, group);
+  }
+
+  const survivors: Array<{ variableName: string; cursor: RecoveryCursor }> = [];
+  for (const group of grouped.values()) {
+    group.sort((left, right) => {
+      const progress = compareRecoveryProgress(right.cursor, left.cursor);
+      if (progress !== 0) return progress;
+      return left.variableName.localeCompare(right.variableName);
+    });
+    const winner = group[0]!;
+    survivors.push(winner);
+    for (const stale of group.slice(1)) await deleteFugueAuthorityVariable(github, stale.variableName);
+  }
+
+  survivors.sort((left, right) => {
+    const leftPreserved = recoveryIdentity(left.cursor) === preserveIdentity ? 1 : 0;
+    const rightPreserved = recoveryIdentity(right.cursor) === preserveIdentity ? 1 : 0;
+    if (leftPreserved !== rightPreserved) return rightPreserved - leftPreserved;
+    const timestamp = Date.parse(right.cursor.checkpoint_at) - Date.parse(left.cursor.checkpoint_at);
+    if (timestamp !== 0) return timestamp;
+    return left.variableName.localeCompare(right.variableName);
+  });
+
+  for (const stale of survivors.slice(FUGUE_RECOVERY_VARIABLE_LIMIT)) {
+    if (recoveryIdentity(stale.cursor) === preserveIdentity) continue;
+    await deleteFugueAuthorityVariable(github, stale.variableName);
+  }
+
+  let all = await listFugueAuthorityVariables(github, "");
+  if (all.length + reserveSlots <= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY) return;
+  const deletable = survivors
+    .filter((entry) => recoveryIdentity(entry.cursor) !== preserveIdentity)
+    .sort((left, right) => Date.parse(left.cursor.checkpoint_at) - Date.parse(right.cursor.checkpoint_at));
+  for (const stale of deletable) {
+    await deleteFugueAuthorityVariable(github, stale.variableName);
+    all = await listFugueAuthorityVariables(github, "");
+    if (all.length + reserveSlots <= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY) return;
+  }
+}
+
 async function writeRecoveryCursor<T>(
   github: FugueGitHub,
   options: DurableRecordOptions<T>,
   supplied: RecoveryCursor,
 ): Promise<void> {
+  const identity = recoveryOptionsIdentity(options);
+  await compactFugueRecoveryAuthorityVariables(github, identity, 1);
   const current = await findRecoveryCursor(github, options);
-  if (current && compareRecoveryProgress(current.cursor, supplied) >= 0) return;
+  if (current && compareRecoveryProgress(current.cursor, supplied) >= 0) {
+    await compactFugueRecoveryAuthorityVariables(github, identity);
+    return;
+  }
 
   const cursor = recoveryCursorSchema.parse({ ...supplied, checkpoint_at: new Date().toISOString() });
   const payload = Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
@@ -983,12 +1122,19 @@ async function writeRecoveryCursor<T>(
   }
 
   const name = recoveryVariableName(options, signed);
-  const created = await createFugueAuthorityVariable(github, name, signed);
-  if (!created) {
-    const existing = await getFugueAuthorityVariable(github, name);
-    if (existing !== signed) {
-      throw new CanonicalWorkStateIntegrityError(`Protected Fugue authority variable collision at ${name}.`);
-    }
+  let created = await createFugueAuthorityVariable(github, name, signed);
+  let existing = created ? signed : await getFugueAuthorityVariable(github, name);
+  if (!created && existing === undefined) {
+    await compactFugueRecoveryAuthorityVariables(github, identity, 1);
+    created = await createFugueAuthorityVariable(github, name, signed);
+    existing = created ? signed : await getFugueAuthorityVariable(github, name);
+  }
+  if (!created && existing !== signed) {
+    throw new CanonicalWorkStateIntegrityError(
+      existing === undefined
+        ? "Protected Fugue Authority-variable namespace is full with no reclaimable recovery checkpoint; refusing to corrupt unrelated repository variables."
+        : `Protected Fugue authority variable collision at ${name}.`,
+    );
   }
 
   const durable = await findRecoveryCursor(github, options);
@@ -996,18 +1142,7 @@ async function writeRecoveryCursor<T>(
     throw new CanonicalWorkStateIntegrityError("Protected Fugue recovery progress did not become durable.");
   }
 
-  // Cleanup is presentation/space maintenance only: the new checkpoint already exists, and a
-  // concurrent stale protected writer can at worst leave an older write-once variable behind.
-  for (const variable of await listFugueAuthorityVariables(github, recoveryVariablePrefix(options))) {
-    if (variable.name === durable.variableName) continue;
-    let candidate: RecoveryCursor | null;
-    try { candidate = parsePayloadBlock(variable.value, RECOVERY_START, recoveryCursorSchema); }
-    catch { continue; }
-    if (!candidate) continue;
-    if (compareRecoveryProgress(candidate, durable.cursor) <= 0) {
-      await deleteFugueAuthorityVariable(github, variable.name);
-    }
-  }
+  await compactFugueRecoveryAuthorityVariables(github, identity);
 }
 
 async function recentIssueComments(github: FugueGitHub, issueNumber: number) {

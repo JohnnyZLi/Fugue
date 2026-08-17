@@ -24,8 +24,8 @@ The Leader must distinguish **presentation** from **authority**.
 - The ordinary `fugue-work-state` issue comment, issue body/labels, `fugue-work` metadata, PR body, and `fugue-pr` metadata are repairable mirrors.
 - A Human Coordinator edit is captured from the exact immutable GitHub Actions event payload. Issue-event runs have non-replacing concurrency identities so GitHub's single-pending replacement cannot discard that event before execution.
 - Before canonicalizing work state, protected Fugue commits the full authorized event snapshot to d3 durable authority. Scheduled reconciliation can recover and replay the latest protected issue revision after a crash or comment deletion.
-- The d3 authority commit uses an OIDC-signed random bundle key plus independent commit nonce that are both hidden from every pre-commit chunk and revealed only by the protected final manifest. Candidate `statuses:write` code cannot finish an aborted prospective publication.
-- Fake manifests are processed through bounded status-ID recovery slices. Progress is persisted as write-once OIDC-signed repository Actions Variables created by the dedicated Fugue Authority GitHub App, not in issue comments or `refs/fugue/**`. Candidate `GITHUB_TOKEN` permissions do not include repository Variables, and readers choose greatest validated progress, so deleting/moving custom refs and presentation comments while appending statuses cannot reset recovery to page 1, make an older record authoritative, or require Human repository surgery.
+- The d3 authority commit uses an OIDC-signed random bundle key plus independent commit nonce that are both hidden from every pre-commit chunk and revealed only by the protected final manifest. Its second protected proof binds the ordered exact server ID of every data status, so a candidate cannot substitute an interleaved same-context status. Candidate `statuses:write` code cannot finish an aborted prospective publication.
+- Fake manifests are processed through bounded status-ID recovery slices. Progress is persisted as write-once OIDC-signed repository Actions Variables created by the dedicated Fugue Authority GitHub App, not in issue comments or `refs/fugue/**`. Candidate `GITHUB_TOKEN` permissions do not include repository Variables. The recovery working set is bounded and self-compacting; equal-progress cleanup selects one deterministic survivor before deleting duplicates, so concurrent writers cannot cross-delete every checkpoint and capacity pressure does not require Human repository surgery.
 - Authorized Coordinator snapshots are totally ordered by immutable issue revision, protected workflow delivery sequence, and a content-bound event ID, so distinct same-second/same-action Human edits cannot collide or be reordered by a slower run.
 
 A replacement Leader should read reconstructed Fugue state first, never infer authority from whatever issue/PR comments happen to remain visible.
@@ -111,8 +111,8 @@ The Human only says whether they acknowledge it. The Leader re-fetches the curre
 Integration authority is a d3 durable record plus protected one-use dispatch/run-start authority-variable evidence, not a request/result comment, custom Git ref, or the mutable workflow-run list.
 
 - An unpredictable signed request ID and fresh 256-bit one-use dispatch capability are created first; only the capability digest is stored durably.
-- The dedicated Fugue Authority GitHub App creates an OIDC-signed dispatch-anchor repository variable for that digest; its Variables permission is not available to candidate `GITHUB_TOKEN`.
-- Before repository checkout/setup/build, attempt 1 proves the capability and transitions that same protected variable once to an OIDC-signed run-start value carrying the exact `GITHUB_RUN_ID` and attempt 1.
+- The dedicated Fugue Authority GitHub App uses one bounded per-PR repository-variable slot for the OIDC-signed dispatch anchor; its Variables permission is not available to candidate `GITHUB_TOKEN`. The `fugue-authority` environment must already have its default-branch-only deployment policy before the App private key is installed; the workflow audit is only drift detection.
+- Before repository checkout/setup/build, attempt 1 proves the capability and transitions that same protected slot once to an OIDC-signed run-start value carrying the exact `GITHUB_RUN_ID` and attempt 1. Once d3 commits that run binding (or an abort), Fugue reclaims the transient slot.
 - Filtered workflow-run search is not used to select the bound run, so arbitrary later same-request run flooding cannot change first-run identity.
 - PASS/failure/error is committed to the durable record before its presentation comment/status.
 - A terminal PASS embeds the full Integration attestation plus request ID, run ID, and attempt 1.
@@ -128,7 +128,7 @@ Only ask after Fugue reconstructs a current exact-identity durable Integration P
 
 ## Local CLI
 
-Local Fugue remains useful for bootstrap, status inspection, and protocol debugging. Canonical publication requires protected GitHub workflow identity, so a local user-token invocation must not be treated as authoritative mutation/recovery evidence.
+Local Fugue remains useful for bootstrap, status inspection, and protocol debugging. Local d3 reconstruction must supply `FUGUE_AUTHORITY_TOKEN` using a short-lived/fine-grained repository credential with **Variables: read**; the Authority App private key must not be exported locally. That token only supplies the read side of the checkpoint/run-start plane. Canonical publication still requires protected GitHub workflow/OIDC identity plus the hosted App write credential, so local inspection cannot become authoritative mutation evidence.
 
 ## Replacement Leader
 

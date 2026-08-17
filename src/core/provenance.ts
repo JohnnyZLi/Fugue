@@ -207,6 +207,7 @@ export interface DurableManifestProofBinding {
   firstStatusId: number;
   lastStatusId: number;
   chunkCount: number;
+  statusIds: readonly number[];
 }
 
 export async function createDurableManifestProof(
@@ -245,6 +246,7 @@ export async function verifyDurableManifestProof(
 function durableManifestAudience(repository: string, binding: DurableManifestProofBinding): string {
   const scopeDigest = createHash("sha256").update(binding.scope, "utf8").digest("hex").slice(0, 24);
   const orderDigest = createHash("sha256").update(binding.authorityOrder, "utf8").digest("hex").slice(0, 24);
+  const statusIdsDigest = createHash("sha256").update(binding.statusIds.join(","), "utf8").digest("hex");
   return [
     "fugue:v1",
     repository,
@@ -258,6 +260,7 @@ function durableManifestAudience(repository: string, binding: DurableManifestPro
     String(binding.firstStatusId),
     String(binding.lastStatusId),
     String(binding.chunkCount),
+    statusIdsDigest,
   ].join(":");
 }
 
@@ -273,6 +276,17 @@ function validateDurableManifestBinding(binding: DurableManifestProofBinding): v
       !Number.isInteger(binding.lastStatusId) || binding.lastStatusId < binding.firstStatusId ||
       !Number.isInteger(binding.chunkCount) || binding.chunkCount <= 0 || binding.chunkCount > 48) {
     throw new Error("Invalid durable status range.");
+  }
+  if (!Array.isArray(binding.statusIds) || binding.statusIds.length !== binding.chunkCount) {
+    throw new Error("Durable manifest must bind every exact chunk status ID.");
+  }
+  let previous = 0;
+  for (const id of binding.statusIds) {
+    if (!Number.isSafeInteger(id) || id <= previous) throw new Error("Durable chunk status IDs must be strictly increasing positive integers.");
+    previous = id;
+  }
+  if (binding.statusIds[0] !== binding.firstStatusId || binding.statusIds.at(-1) !== binding.lastStatusId) {
+    throw new Error("Durable chunk status IDs do not match their authenticated range.");
   }
 }
 

@@ -32,11 +32,13 @@ concurrency:
 jobs:
   reconcile:
     runs-on: ubuntu-latest
-    # This environment must allow only the protected base branch. Its private App key is the
-    # authority boundary: candidate GITHUB_TOKEN permissions do not include repository Variables.
+    # SECURITY INVARIANT (external): before the App private key is installed, repository admins
+    # must configure fugue-authority to allow only the protected default branch. The audit below is
+    # defense-in-depth drift detection after GitHub's environment gate; it cannot make a broad
+    # environment safe against a candidate workflow that references that environment directly.
     environment: fugue-authority
     steps:
-      - name: Verify Fugue Authority environment boundary
+      - name: Audit external Fugue Authority environment invariant
         env:
           FUGUE_PROTECTED_BRANCH: ${{ github.event.repository.default_branch }}
           GITHUB_TOKEN: ${{ github.token }}
