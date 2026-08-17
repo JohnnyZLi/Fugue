@@ -72,15 +72,26 @@ export function upsertWorkMetadata(issueBody: string, metadata: WorkMetadata): s
   return `${base}${base ? "\n\n" : ""}${block}\n`;
 }
 
+export interface CanonicalWorkSpecIdentity {
+  requirements: string;
+  spec: WorkSpec;
+  digest: string;
+}
+
+export function canonicalWorkSpecIdentity(requirements: string, metadata: WorkMetadata): CanonicalWorkSpecIdentity {
+  const canonical = {
+    requirements: normalizeRequirements(requirements),
+    spec: workSpecSchema.parse(metadata.spec),
+  };
+  return { ...canonical, digest: digestCanonical(canonical) };
+}
+
 export function workSpecDigest(issueBody: string, metadata: WorkMetadata): string {
-  return workSpecDigestFromRequirements(stripWorkMetadata(issueBody), metadata);
+  return canonicalWorkSpecIdentity(stripWorkMetadata(issueBody), metadata).digest;
 }
 
 export function workSpecDigestFromRequirements(requirements: string, metadata: WorkMetadata): string {
-  return digestCanonical({
-    requirements: normalizeRequirements(requirements),
-    spec: metadata.spec,
-  });
+  return canonicalWorkSpecIdentity(requirements, metadata).digest;
 }
 
 export function createWorkId(issueNumber: number): string {

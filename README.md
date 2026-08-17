@@ -228,3 +228,8 @@ Normal work after bootstrap is coordinated through the Leader/GitHub control pla
 Fugue governs its own repository. [Path](https://github.com/JohnnyZLi/Path) remains the visual-product dogfood target for parallel work and artifact-backed Visual QA.
 
 See [`docs/protocol-v0.1.md`](docs/protocol-v0.1.md), [`docs/chatgpt-project.md`](docs/chatgpt-project.md), and [`docs/leader-chat.md`](docs/leader-chat.md).
+
+
+### d3 recovery and Integration ordering
+
+D3 manifests authenticate their exact committed chunk-ID range and authority order. Recovery freezes a status-ID ceiling and advances a signed low-water cursor without resetting when hostile statuses are appended; locator/receipt comments are repaired presentation hints only. Coordinator snapshots order by immutable issue `updated_at` plus event identity. Integration scans all workflow-run pages for the globally earliest attempt-1 run, and protected `workflow_run` completion events seal terminal failure even if the Actions run is subsequently deleted. Work-spec identity is produced by the single `canonicalWorkSpecIdentity` normalization/hash path and review-start attestations carry that exact digest.

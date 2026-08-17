@@ -197,6 +197,85 @@ export async function assertRepositoryDefaultBranchRevision(
  * authority MUST keep any commit capability redacted from all pre-commit transport and only reveal
  * it in their final protected commit write.
  */
+export interface DurableManifestProofBinding {
+  storageSha: string;
+  scope: string;
+  key: string;
+  nonce: string;
+  bodyDigest: string;
+  authorityOrder: string;
+  firstStatusId: number;
+  lastStatusId: number;
+  chunkCount: number;
+}
+
+export async function createDurableManifestProof(
+  github: FugueGitHub,
+  binding: DurableManifestProofBinding,
+): Promise<string> {
+  validateDurableManifestBinding(binding);
+  return requestGitHubOidcToken(durableManifestAudience(github.repository.fullName, binding));
+}
+
+export async function verifyDurableManifestProof(
+  github: FugueGitHub,
+  token: string,
+  binding: DurableManifestProofBinding,
+  protectedWorkflowSha: string,
+  publicationTimestampMs: number,
+): Promise<boolean> {
+  try {
+    validateDurableManifestBinding(binding);
+    const identity = await readRepositoryDefaultBranchIdentity(github);
+    const jwks = await loadGitHubOidcJwks();
+    return verifyPublisherTokenInternal(
+      token,
+      durableManifestAudience(github.repository.fullName, binding),
+      github.repository.fullName,
+      identity.branch,
+      protectedWorkflowSha,
+      publicationTimestampMs,
+      jwks,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function durableManifestAudience(repository: string, binding: DurableManifestProofBinding): string {
+  const scopeDigest = createHash("sha256").update(binding.scope, "utf8").digest("hex").slice(0, 24);
+  const orderDigest = createHash("sha256").update(binding.authorityOrder, "utf8").digest("hex").slice(0, 24);
+  return [
+    "fugue:v1",
+    repository,
+    "durable-manifest",
+    binding.storageSha.toLowerCase(),
+    scopeDigest,
+    binding.key.toLowerCase(),
+    binding.nonce.toLowerCase(),
+    binding.bodyDigest.toLowerCase(),
+    orderDigest,
+    String(binding.firstStatusId),
+    String(binding.lastStatusId),
+    String(binding.chunkCount),
+  ].join(":");
+}
+
+function validateDurableManifestBinding(binding: DurableManifestProofBinding): void {
+  if (!/^[0-9a-f]{40}$/i.test(binding.storageSha)) throw new Error("Invalid durable storage SHA.");
+  if (!/^[A-Za-z0-9._/-]{1,56}$/.test(binding.scope)) throw new Error("Invalid durable scope.");
+  if (!/^[0-9a-f]{32}$/i.test(binding.key) || !/^[0-9a-f]{32}$/i.test(binding.nonce)) {
+    throw new Error("Invalid durable manifest secret.");
+  }
+  if (!/^[0-9a-f]{64}$/i.test(binding.bodyDigest)) throw new Error("Invalid durable body digest.");
+  if (!binding.authorityOrder || binding.authorityOrder.length > 512) throw new Error("Invalid durable authority order.");
+  if (!Number.isInteger(binding.firstStatusId) || binding.firstStatusId <= 0 ||
+      !Number.isInteger(binding.lastStatusId) || binding.lastStatusId < binding.firstStatusId ||
+      !Number.isInteger(binding.chunkCount) || binding.chunkCount <= 0 || binding.chunkCount > 48) {
+    throw new Error("Invalid durable status range.");
+  }
+}
+
 export async function signProtocolBody(github: FugueGitHub, body: string): Promise<string> {
   return attachPublisherProof(github.repository.fullName, body);
 }

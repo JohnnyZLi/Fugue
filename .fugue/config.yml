@@ -17,6 +17,8 @@ control_plane:
     - "src/cli.ts"
     - "src/commands/reconcile.ts"
     - "src/commands/integration-runtime.ts"
+    - "src/commands/init.ts"
+    - "src/core/repository-init.ts"
     - "src/core/reconcile.ts"
     - "src/core/state.ts"
     - "src/core/state-comment.ts"

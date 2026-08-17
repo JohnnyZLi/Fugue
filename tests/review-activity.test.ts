@@ -11,7 +11,7 @@ const identity = {
   protocolVersion: 1 as const,
   issueNumber: 2,
   workId: "work-2",
-  workSpecDigest: "sha256:spec",
+  workSpecDigest: "sha256:ffbb7fc23856746dd7bbf0b0e7b960293a17fb54403b09f8c6f1eaa6d767d177",
 };
 
 function session(id: string, createdAt = "2026-08-15T00:00:00.000Z") {

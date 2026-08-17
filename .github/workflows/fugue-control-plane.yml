@@ -8,7 +8,7 @@ on:
   pull_request_target:
     types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft, closed]
   workflow_run:
-    workflows: [CI]
+    workflows: [CI, Fugue Integration]
     types: [completed]
   schedule:
     - cron: "*/15 * * * *"
@@ -23,10 +23,10 @@ permissions:
   pull-requests: write
   statuses: write
 
-# Issue-event runs use a run-specific group so GitHub's single-pending replacement cannot discard
-# the only immutable Human event snapshot. Other event classes remain repository-serialized.
+# Human issue snapshots and Integration completion events each get a run-specific group so GitHub's
+# single-pending replacement cannot discard their immutable event payloads. Other events stay serialized.
 concurrency:
-  group: ${{ github.event_name == 'issues' && format('fugue-control-plane-issue-{0}', github.run_id) || format('fugue-control-plane-{0}', github.repository) }}
+  group: ${{ (github.event_name == 'issues' || (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'Fugue Integration')) && format('fugue-control-plane-event-{0}', github.run_id) || format('fugue-control-plane-{0}', github.repository) }}
   cancel-in-progress: false
 
 jobs:

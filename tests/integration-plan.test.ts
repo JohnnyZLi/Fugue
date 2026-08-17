@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
+import { reviewStartSchema } from "../src/core/attestations.js";
 import { describe, expect, it } from "vitest";
 import { parseConfig } from "../src/core/config.js";
+import { canonicalWorkSpecIdentity, workMetadataSchema, workSpecDigestFromRequirements } from "../src/core/metadata.js";
 import { resolveQaRequirements } from "../src/core/qa.js";
 import {
   assertValidationMatchesPlan,
@@ -8,6 +10,8 @@ import {
   integrationPlanSchema,
   integrationValidationSchema,
 } from "../src/core/integration-plan.js";
+
+const CURRENT_WORK_SPEC_DIGEST = "sha256:ffbb7fc23856746dd7bbf0b0e7b960293a17fb54403b09f8c6f1eaa6d767d177";
 
 const identity = {
   prNumber: 21,
@@ -18,7 +22,7 @@ const identity = {
   protocolVersion: 1 as const,
   issueNumber: 18,
   workId: "work-18",
-  workSpecDigest: "sha256:spec",
+  workSpecDigest: CURRENT_WORK_SPEC_DIGEST,
 };
 
 const integration = {
@@ -48,6 +52,23 @@ describe("GitHub-hosted Integration plan", () => {
     expect(value.identity.headSha).toBe(identity.headSha);
     expect(value.integration).toEqual(integration);
     expect(value.validation.checks).toEqual(["npm test"]);
+  });
+
+  it("uses one canonical work-spec normalization/hash and carries the exact digest in review-start evidence", () => {
+    const metadata = workMetadataSchema.parse({
+      version: 1, work_id: "work-18",
+      spec: { dependencies: [], ownership: { owned: ["src/**"], coordinate: [], forbidden: [] }, qa: { force: ["code"] }, authorized_changes: { agents_invariants: [] } },
+      execution: { worker_id: "wkr-b0057a9e", branch: "agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration" },
+    });
+    const first = canonicalWorkSpecIdentity("## Outcome\r\nSame state   \r\n", metadata);
+    const second = canonicalWorkSpecIdentity("## Outcome\nSame state", metadata);
+    expect(first.digest).toBe(second.digest);
+    expect(workSpecDigestFromRequirements("## Outcome\nSame state", metadata)).toBe(first.digest);
+    const review = reviewStartSchema.parse({
+      version: 1, kind: "review_start", session_id: "rev-code-digest", role: "code", identity,
+      fugue_version: "0.1.0-alpha.0", created_at: "2026-08-17T05:00:00.000Z",
+    });
+    expect(review.identity.workSpecDigest).toBe(CURRENT_WORK_SPEC_DIGEST);
   });
 
   it("uses an unpredictable request nonce so a future exact request cannot be preplayed", () => {
@@ -143,6 +164,8 @@ describe("GitHub-hosted Integration plan", () => {
       "src/core/provenance.ts",
       "src/core/integration-status.ts",
       "src/commands/integration-runtime.ts",
+      "src/commands/init.ts",
+      "src/core/repository-init.ts",
     ]) {
       const resolution = resolveQaRequirements(config, [path]);
       expect(resolution.controlPlaneChanged, path).toBe(true);

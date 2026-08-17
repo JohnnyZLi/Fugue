@@ -21,6 +21,8 @@ import {
   signProtocolBody,
   updateProtocolComment,
   verifyProtocolPublicationBodyAtRevision,
+  createDurableManifestProof,
+  verifyDurableManifestProof,
 } from "./provenance.js";
 
 const WORK_STATE_START = "<!-- fugue-work-state";
@@ -39,8 +41,10 @@ const DURABLE_CHUNK_SIZE = 100;
 const DURABLE_MAX_CHUNKS = 48;
 const DURABLE_WRITE_ATTEMPTS = 4;
 const STATUS_PAGE_SIZE = 100;
-const MANIFESTS_PER_RECOVERY_SLICE = 2;
-const MANIFEST_PATTERN = /^n=(\d+);d=([0-9a-f]{64});c=([0-9a-f]{32})$/i;
+const MANIFEST_PROOFS_PER_RECOVERY_SLICE = 8;
+const STATUS_PAGES_PER_RECOVERY_SLICE = 32;
+const MANIFEST_PATTERN = /^n=(\d+);c=([0-9a-f]{32});b=([0-9a-f]{64});a=(\d+);z=(\d+)$/i;
+const DURABLE_MANIFEST_URL = "https://token.actions.githubusercontent.com/fugue/d3";
 
 const stateLabelSchema = z.enum(["state:ready", "state:working", "state:blocked"]);
 const canonicalPrSchema = z.object({
@@ -79,16 +83,32 @@ export const coordinatorSnapshotSchema = z.object({
   captured_at: z.string().min(1),
 });
 
+const recoveryManifestSchema = z.object({
+  id: z.number().int().positive(),
+  key: z.string().regex(/^[0-9a-f]{32}$/i),
+  nonce: z.string().regex(/^[0-9a-f]{32}$/i),
+  body_digest: z.string().regex(/^[0-9a-f]{64}$/i),
+  authority_order_b64: z.string().min(1),
+  first_status_id: z.number().int().positive(),
+  last_status_id: z.number().int().positive(),
+  chunk_count: z.number().int().positive().max(DURABLE_MAX_CHUNKS),
+});
+
 const recoveryCursorSchema = z.object({
   version: z.literal(1),
   kind: z.literal("durable_recovery"),
   scope: z.string().min(1),
   storage_sha: z.string().regex(/^[0-9a-f]{40}$/i),
   publisher_sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  complete_top_id: z.number().int().nonnegative(),
+  scan_top_id: z.number().int().nonnegative(),
+  scan_floor_id: z.number().int().nonnegative(),
+  before_id: z.number().int().positive(),
   page: z.number().int().positive(),
-  offset: z.number().int().nonnegative(),
-  anchor_id: z.number().int().positive().nullable(),
+  phase: z.enum(["discover", "materialize"]),
   best_body_b64: z.string().optional(),
+  best_manifest: recoveryManifestSchema.optional(),
+  chunks: z.array(z.string().nullable()).max(DURABLE_MAX_CHUNKS).optional(),
 });
 
 export type CanonicalWorkState = z.infer<typeof canonicalWorkStateSchema>;
@@ -144,6 +164,8 @@ interface CommitStatusRecord {
   id: number;
   context: string;
   description?: string | null;
+  targetUrl?: string | null;
+  createdAt?: string | null;
 }
 
 interface DurableBundleRecord {
@@ -168,6 +190,7 @@ export interface DurableRecordOptions<T> {
   issueNumber: number;
   parse: (body: string) => T | null;
   timestamp: (value: T) => number;
+  order: (value: T) => string;
   compare?: (left: T, right: T) => number;
   validate?: (value: T) => boolean;
 }
@@ -315,9 +338,10 @@ function encodeDurableBundle(scope: string, key: string, nonce: string, signedBo
 /**
  * Publish a durable protocol body so statuses:write is transport only, never authority. Both the
  * random bundle key and a 128-bit commit nonce are covered by the protected OIDC signature but are
- * redacted from every pre-commit status chunk. The final manifest reveals them atomically. A
- * candidate can neither finish an aborted prospective publication nor repackage a committed body
- * under a fresh key because the protected signature binds the exact key used by the manifest.
+ * redacted from every pre-commit status chunk. The final manifest reveals them and carries a
+ * second protected OIDC proof binding the exact server-assigned chunk-ID range, body digest,
+ * authority order, key, and nonce. Interleaved hostile statuses cannot make a committed record
+ * unreconstructible, and candidate statuses:write cannot finish an aborted prospective record.
  */
 export async function publishDurableProtocolRecord(
   github: FugueGitHub,
@@ -327,6 +351,7 @@ export async function publishDurableProtocolRecord(
     scope: string;
     unsignedBody: string;
     publicationTimestamp: number;
+    authorityOrder: string;
   },
 ): Promise<string> {
   const { owner, repo } = github.repository;
@@ -358,6 +383,7 @@ export async function publishDurableProtocolRecord(
         });
         writtenIds.push(response.data.id);
       }
+      if (!writtenIds.length) throw new Error("Durable record wrote no data chunks.");
 
       await assertRepositoryDefaultBranchRevision(github, input.publisherSha);
       if (!(await verifyProtocolPublicationBodyAtRevision(
@@ -369,15 +395,22 @@ export async function publishDurableProtocolRecord(
         throw new Error("Protected publisher identity changed before durable authority commit.");
       }
 
-      // A committed bundle is guaranteed to fit inside two adjacent 100-status recovery pages.
-      // If hostile interleaving pushed any protected chunk out of the newest page before commit,
-      // abandon the redacted partial bundle and retry under fresh unrevealed secrets.
-      const newest = await statusPage(github, input.storageSha, 1);
-      const newestIds = new Set(newest.map((status) => status.id));
-      if (!writtenIds.every((id) => newestIds.has(id))) {
-        lastError = new Error("Durable-record chunks were interleaved out of the bounded commit window.");
-        continue;
-      }
+      const firstStatusId = Math.min(...writtenIds);
+      const lastStatusId = Math.max(...writtenIds);
+      const bodyDigest = createHash("sha256").update(signedBody, "utf8").digest("hex");
+      const manifestBinding = {
+        storageSha: input.storageSha,
+        scope: input.scope,
+        key,
+        nonce,
+        bodyDigest,
+        authorityOrder: input.authorityOrder,
+        firstStatusId,
+        lastStatusId,
+        chunkCount: bundle.data.length,
+      };
+      const manifestProof = await createDurableManifestProof(github, manifestBinding);
+      const manifestTarget = durableManifestTargetUrl(input.authorityOrder, manifestProof);
 
       await assertRepositoryDefaultBranchRevision(github, input.publisherSha);
       await github.octokit.rest.repos.createCommitStatus({
@@ -386,7 +419,8 @@ export async function publishDurableProtocolRecord(
         sha: input.storageSha,
         state: "success",
         context: bundle.manifest.context,
-        description: bundle.manifest.description,
+        description: `n=${bundle.data.length};c=${nonce};b=${bodyDigest};a=${firstStatusId};z=${lastStatusId}`,
+        target_url: manifestTarget,
       });
       return signedBody;
     } catch (error) {
@@ -399,79 +433,181 @@ export async function publishDurableProtocolRecord(
 }
 
 /**
- * Recover one bounded slice of a durable scope. Fake manifests never trigger per-chunk API calls:
- * one primary and one adjacent status page are loaded, then at most two manifests and 48 in-memory
- * chunks are considered. A protected signed cursor advances across scheduled runs; if the status
- * anchor changes, recovery restarts from the newest page so a stable finite hostile history is
- * eventually exhausted without rollback.
+ * Recover bounded d3 work from a frozen status-ID ceiling. The signed cursor keeps the ceiling,
+ * low-water ID and page progress stable while newer hostile statuses are appended. Manifest proof
+ * verification and chunk materialization each have fixed per-call budgets; locators never select
+ * authority. A completed slice advances the durable ceiling monotonically instead of restarting.
  */
 export async function recoverDurableProtocolRecord<T>(
   github: FugueGitHub,
   options: DurableRecordOptions<T>,
 ): Promise<DurableRecoveryResult<T>> {
   const firstPage = await statusPage(github, options.storageSha, 1);
-  const anchorId = firstPage[0]?.id ?? null;
+  const topId = firstPage[0]?.id ?? 0;
   let cursorEntry = await findRecoveryCursor(github, options);
   let cursor = cursorEntry?.cursor;
-  if (!cursor || cursor.anchor_id !== anchorId) {
+  let bestBody = cursor?.best_body_b64
+    ? Buffer.from(cursor.best_body_b64, "base64url").toString("utf8")
+    : undefined;
+  let bestValue = bestBody ? await validateDurableBody(github, options, bestBody) : undefined;
+  if (!bestValue) bestBody = undefined;
+
+  if (!cursor) {
+    if (topId === 0) return { exhausted: true };
     cursor = recoveryCursorSchema.parse({
       version: 1,
       kind: "durable_recovery",
       scope: options.scope,
       storage_sha: options.storageSha,
       publisher_sha: options.publisherSha,
+      complete_top_id: 0,
+      scan_top_id: topId,
+      scan_floor_id: 0,
+      before_id: topId + 1,
       page: 1,
-      offset: 0,
-      anchor_id: anchorId,
+      phase: "discover",
     });
-    cursorEntry = undefined;
-  }
-
-  const primary = cursor.page === 1 ? firstPage : await statusPage(github, options.storageSha, cursor.page);
-  const secondary = await statusPage(github, options.storageSha, cursor.page + 1);
-  const prefix = `${durablePrefix(options.scope)}/m/`;
-  const manifests = primary
-    .filter((status) => status.context.startsWith(prefix))
-    .sort((a, b) => b.id - a.id);
-
-  let bestBody = cursor.best_body_b64
-    ? Buffer.from(cursor.best_body_b64, "base64url").toString("utf8")
-    : undefined;
-  let bestValue: T | undefined;
-  if (bestBody) bestValue = await validateDurableBody(github, options, bestBody);
-  if (!bestValue) bestBody = undefined;
-
-  const slice = manifests.slice(cursor.offset, cursor.offset + MANIFESTS_PER_RECOVERY_SLICE);
-  const window = [...primary, ...secondary];
-  for (const manifestStatus of slice) {
-    const candidateBody = await reconstructDurableBodyFromWindow(options.scope, manifestStatus, window);
-    if (!candidateBody) continue;
-    const candidate = await validateDurableBody(github, options, candidateBody);
-    if (!candidate) continue;
-    if (!bestValue || compareDurable(options, candidate, bestValue) > 0) {
-      bestValue = candidate;
-      bestBody = candidateBody;
+  } else if (cursor.phase === "discover" && cursor.scan_top_id === cursor.complete_top_id) {
+    if (topId <= cursor.complete_top_id) {
+      return bestValue && bestBody
+        ? { record: { value: bestValue, body: bestBody }, exhausted: true }
+        : { exhausted: true };
     }
+    cursor = recoveryCursorSchema.parse({
+      ...cursor,
+      scan_top_id: topId,
+      scan_floor_id: cursor.complete_top_id,
+      before_id: topId + 1,
+      page: 1,
+      best_manifest: undefined,
+      chunks: undefined,
+    });
   }
 
-  const nextOffset = cursor.offset + slice.length;
-  const moreManifestsOnPage = nextOffset < manifests.length;
-  const exhausted = !moreManifestsOnPage && primary.length < STATUS_PAGE_SIZE;
-  if (exhausted) {
-    if (cursorEntry) await deleteCommentIfPresent(github, cursorEntry.id);
+  if (cursor.phase === "discover") {
+    let bestManifest = cursor.best_manifest;
+    let proofBudget = MANIFEST_PROOFS_PER_RECOVERY_SLICE;
+    const scan = await scanFrozenStatuses(
+      github,
+      options.storageSha,
+      cursor.scan_top_id,
+      cursor.scan_floor_id,
+      cursor.before_id,
+      cursor.page,
+      async (status) => {
+        if (!status.context.startsWith(`${durablePrefix(options.scope)}/m/`)) return true;
+        if (proofBudget <= 0) return false;
+        proofBudget -= 1;
+        const manifest = await authenticatedManifest(github, options, status);
+        if (!manifest) return true;
+        if (!bestManifest || compareManifest(manifest, bestManifest) > 0) bestManifest = manifest;
+        return true;
+      },
+    );
+    cursor = recoveryCursorSchema.parse({
+      ...cursor,
+      before_id: scan.beforeId,
+      page: scan.page,
+      ...(bestManifest ? { best_manifest: bestManifest } : { best_manifest: undefined }),
+    });
+    if (!scan.exhausted) {
+      await writeRecoveryCursor(github, options, cursor, cursorEntry?.id);
+      return { exhausted: false };
+    }
+
+    const bestOrder = bestValue ? options.order(bestValue) : undefined;
+    if (bestManifest && (!bestOrder || compareAuthorityOrder(manifestOrder(bestManifest), bestOrder) > 0)) {
+      cursor = recoveryCursorSchema.parse({
+        ...cursor,
+        phase: "materialize",
+        before_id: bestManifest.last_status_id + 1,
+        page: 1,
+        chunks: Array.from({ length: bestManifest.chunk_count }, () => null),
+      });
+      await writeRecoveryCursor(github, options, cursor, cursorEntry?.id);
+      // Discovery and materialization are each independently bounded; finish a found manifest
+      // in the same public recovery call so normal reads do not depend on presentation locators.
+      return recoverDurableProtocolRecord(github, options);
+    }
+
+    cursor = recoveryCursorSchema.parse({
+      ...cursor,
+      complete_top_id: cursor.scan_top_id,
+      scan_floor_id: cursor.scan_top_id,
+      before_id: cursor.scan_top_id + 1,
+      page: 1,
+      best_manifest: undefined,
+      chunks: undefined,
+    });
+    await writeRecoveryCursor(github, options, cursor, cursorEntry?.id);
     return bestValue && bestBody
       ? { record: { value: bestValue, body: bestBody }, exhausted: true }
       : { exhausted: true };
   }
 
-  const next = recoveryCursorSchema.parse({
+  const manifest = cursor.best_manifest;
+  if (!manifest) throw new CanonicalWorkStateIntegrityError(`Durable recovery lost its authenticated manifest for ${options.scope}.`);
+  const chunks = [...(cursor.chunks ?? Array.from({ length: manifest.chunk_count }, () => null))];
+  const expected = new Map<string, number>();
+  for (let index = 0; index < manifest.chunk_count; index += 1) {
+    expected.set(durableDataContext(options.scope, manifest.key, index), index);
+  }
+  const materialized = await scanFrozenStatuses(
+    github,
+    options.storageSha,
+    manifest.last_status_id,
+    manifest.first_status_id - 1,
+    cursor.before_id,
+    cursor.page,
+    async (status) => {
+      const index = expected.get(status.context);
+      if (index !== undefined && chunks[index] == null && status.description) chunks[index] = status.description;
+      return true;
+    },
+  );
+  cursor = recoveryCursorSchema.parse({ ...cursor, before_id: materialized.beforeId, page: materialized.page, chunks });
+  if (!materialized.exhausted) {
+    await writeRecoveryCursor(github, options, cursor, cursorEntry?.id);
+    return { exhausted: false };
+  }
+  if (chunks.some((chunk) => !chunk)) {
+    throw new CanonicalWorkStateIntegrityError(`Authenticated durable manifest ${manifest.id} is missing committed chunks.`);
+  }
+  const encoded = (chunks as string[]).join("");
+  let redacted: string;
+  try {
+    redacted = gunzipSync(Buffer.from(encoded, "base64url")).toString("utf8");
+  } catch {
+    throw new CanonicalWorkStateIntegrityError(`Authenticated durable manifest ${manifest.id} has invalid chunk encoding.`);
+  }
+  const restored = restoreAuthorityBody(redacted, manifest.key, manifest.nonce);
+  if (!restored || createHash("sha256").update(restored, "utf8").digest("hex") !== manifest.body_digest) {
+    throw new CanonicalWorkStateIntegrityError(`Authenticated durable manifest ${manifest.id} failed body reconstruction.`);
+  }
+  const value = await validateDurableBody(github, options, restored);
+  if (!value || options.order(value) !== manifestOrder(manifest)) {
+    throw new CanonicalWorkStateIntegrityError(`Authenticated durable manifest ${manifest.id} failed protected body validation.`);
+  }
+  if (!bestValue || compareDurable(options, value, bestValue) > 0) {
+    bestValue = value;
+    bestBody = restored;
+  }
+
+  cursor = recoveryCursorSchema.parse({
     ...cursor,
-    page: moreManifestsOnPage ? cursor.page : cursor.page + 1,
-    offset: moreManifestsOnPage ? nextOffset : 0,
+    phase: "discover",
+    complete_top_id: cursor.scan_top_id,
+    scan_floor_id: cursor.scan_top_id,
+    before_id: cursor.scan_top_id + 1,
+    page: 1,
     ...(bestBody ? { best_body_b64: Buffer.from(bestBody, "utf8").toString("base64url") } : { best_body_b64: undefined }),
+    best_manifest: undefined,
+    chunks: undefined,
   });
-  await writeRecoveryCursor(github, options, next, cursorEntry?.id);
-  return { exhausted: false };
+  await writeRecoveryCursor(github, options, cursor, cursorEntry?.id);
+  return bestValue && bestBody
+    ? { record: { value: bestValue, body: bestBody }, exhausted: true }
+    : { exhausted: true };
 }
 
 async function validateDurableBody<T>(
@@ -505,44 +641,126 @@ function compareDurable<T>(options: DurableRecordOptions<T>, left: T, right: T):
   return options.compare?.(left, right) ?? options.timestamp(left) - options.timestamp(right);
 }
 
-async function reconstructDurableBodyFromWindow(
-  scope: string,
-  manifestStatus: CommitStatusRecord,
-  window: CommitStatusRecord[],
-): Promise<string | undefined> {
-  const keyPattern = new RegExp(`^${escapeRegex(durablePrefix(scope))}/m/([0-9a-f]{${SECRET_HEX_LENGTH}})$`, "i");
-  const key = manifestStatus.context.match(keyPattern)?.[1]?.toLowerCase();
-  if (!key) return undefined;
-  const manifest = manifestStatus.description?.match(MANIFEST_PATTERN);
-  if (!manifest?.[1] || !manifest[2] || !manifest[3]) return undefined;
-  const count = Number(manifest[1]);
-  if (!Number.isInteger(count) || count <= 0 || count > DURABLE_MAX_CHUNKS) return undefined;
-  const nonce = manifest[3].toLowerCase();
+interface RecoveryManifest {
+  id: number;
+  key: string;
+  nonce: string;
+  body_digest: string;
+  authority_order_b64: string;
+  first_status_id: number;
+  last_status_id: number;
+  chunk_count: number;
+}
 
-  const byContext = new Map<string, CommitStatusRecord[]>();
-  for (const status of window) {
-    const list = byContext.get(status.context) ?? [];
-    list.push(status);
-    byContext.set(status.context, list);
-  }
-  for (const list of byContext.values()) list.sort((a, b) => a.id - b.id);
+async function authenticatedManifest<T>(
+  github: FugueGitHub,
+  options: DurableRecordOptions<T>,
+  status: CommitStatusRecord,
+): Promise<RecoveryManifest | undefined> {
+  const keyPattern = new RegExp(`^${escapeRegex(durablePrefix(options.scope))}/m/([0-9a-f]{${SECRET_HEX_LENGTH}})$`, "i");
+  const key = status.context.match(keyPattern)?.[1]?.toLowerCase();
+  const match = status.description?.match(MANIFEST_PATTERN);
+  if (!key || !match?.[1] || !match[2] || !match[3] || !match[4] || !match[5]) return undefined;
+  const chunkCount = Number(match[1]);
+  const nonce = match[2].toLowerCase();
+  const bodyDigest = match[3].toLowerCase();
+  const firstStatusId = Number(match[4]);
+  const lastStatusId = Number(match[5]);
+  if (!Number.isInteger(chunkCount) || chunkCount <= 0 || chunkCount > DURABLE_MAX_CHUNKS ||
+      !Number.isInteger(firstStatusId) || firstStatusId <= 0 ||
+      !Number.isInteger(lastStatusId) || lastStatusId < firstStatusId || lastStatusId >= status.id) return undefined;
+  const target = parseDurableManifestTarget(status.targetUrl ?? "");
+  if (!target || !status.createdAt) return undefined;
+  const timestamp = Date.parse(status.createdAt);
+  if (!Number.isFinite(timestamp)) return undefined;
+  const binding = {
+    storageSha: options.storageSha,
+    scope: options.scope,
+    key,
+    nonce,
+    bodyDigest,
+    authorityOrder: target.order,
+    firstStatusId,
+    lastStatusId,
+    chunkCount,
+  };
+  if (!(await verifyDurableManifestProof(github, target.proof, binding, options.publisherSha, timestamp))) return undefined;
+  return recoveryManifestSchema.parse({
+    id: status.id,
+    key,
+    nonce,
+    body_digest: bodyDigest,
+    authority_order_b64: Buffer.from(target.order, "utf8").toString("base64url"),
+    first_status_id: firstStatusId,
+    last_status_id: lastStatusId,
+    chunk_count: chunkCount,
+  });
+}
 
-  const chunks: string[] = [];
-  for (let index = 0; index < count; index += 1) {
-    const context = durableDataContext(scope, key, index);
-    const chunk = byContext.get(context)?.[0]?.description ?? "";
-    if (!chunk || !/^[A-Za-z0-9_-]+$/.test(chunk)) return undefined;
-    chunks.push(chunk);
+async function scanFrozenStatuses(
+  github: FugueGitHub,
+  sha: string,
+  topId: number,
+  floorId: number,
+  startingBeforeId: number,
+  startingPage: number,
+  visit: (status: CommitStatusRecord) => Promise<boolean>,
+): Promise<{ beforeId: number; page: number; exhausted: boolean }> {
+  let beforeId = startingBeforeId;
+  let page = startingPage;
+  for (let pages = 0; pages < STATUS_PAGES_PER_RECOVERY_SLICE; pages += 1) {
+    const statuses = await statusPage(github, sha, page);
+    if (!statuses.length) return { beforeId, page, exhausted: true };
+    const eligible = statuses
+      .filter((status) => status.id <= topId && status.id > floorId && status.id < beforeId)
+      .sort((left, right) => right.id - left.id);
+    for (const status of eligible) {
+      const shouldContinue = await visit(status);
+      if (!shouldContinue) return { beforeId: status.id + 1, page, exhausted: false };
+      beforeId = status.id;
+    }
+    if (statuses.some((status) => status.id <= floorId) || statuses.length < STATUS_PAGE_SIZE) {
+      return { beforeId, page, exhausted: true };
+    }
+    page += 1;
   }
-  const encoded = chunks.join("");
-  if (createHash("sha256").update(encoded, "utf8").digest("hex") !== manifest[2].toLowerCase()) return undefined;
-  let redacted: string;
+  return { beforeId, page, exhausted: false };
+}
+
+function durableManifestTargetUrl(order: string, proof: string): string {
+  const target = new URL(DURABLE_MANIFEST_URL);
+  target.searchParams.set("o", Buffer.from(order, "utf8").toString("base64url"));
+  target.searchParams.set("p", proof);
+  return target.toString();
+}
+
+function parseDurableManifestTarget(value: string): { order: string; proof: string } | undefined {
   try {
-    redacted = gunzipSync(Buffer.from(encoded, "base64url")).toString("utf8");
+    const target = new URL(value);
+    if (`${target.origin}${target.pathname}` !== DURABLE_MANIFEST_URL) return undefined;
+    const encodedOrder = target.searchParams.get("o");
+    const proof = target.searchParams.get("p");
+    if (!encodedOrder || !proof) return undefined;
+    const order = Buffer.from(encodedOrder, "base64url").toString("utf8");
+    if (!order || order.length > 512) return undefined;
+    return { order, proof };
   } catch {
     return undefined;
   }
-  return restoreAuthorityBody(redacted, key, nonce) ?? undefined;
+}
+
+function manifestOrder(manifest: RecoveryManifest): string {
+  return Buffer.from(manifest.authority_order_b64, "base64url").toString("utf8");
+}
+
+function compareManifest(left: RecoveryManifest, right: RecoveryManifest): number {
+  const order = compareAuthorityOrder(manifestOrder(left), manifestOrder(right));
+  if (order !== 0) return order;
+  return right.id - left.id;
+}
+
+function compareAuthorityOrder(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 async function statusPage(github: FugueGitHub, sha: string, page: number): Promise<CommitStatusRecord[]> {
@@ -558,6 +776,8 @@ async function statusPage(github: FugueGitHub, sha: string, page: number): Promi
     id: status.id,
     context: status.context,
     description: status.description,
+    targetUrl: status.target_url,
+    createdAt: status.created_at,
   }));
 }
 
@@ -579,9 +799,20 @@ async function findRecoveryCursor<T>(
     }
     if (!cursor) continue;
     if (cursor.scope !== options.scope || cursor.storage_sha !== options.storageSha || cursor.publisher_sha !== options.publisherSha) continue;
-    if (!current || comment.id > current.id) current = { id: comment.id, cursor };
+    if (!current || compareRecoveryProgress(cursor, current.cursor) > 0 ||
+        (compareRecoveryProgress(cursor, current.cursor) === 0 && comment.id > current.id)) {
+      current = { id: comment.id, cursor };
+    }
   }
   return current;
+}
+
+function compareRecoveryProgress(left: RecoveryCursor, right: RecoveryCursor): number {
+  if (left.complete_top_id !== right.complete_top_id) return left.complete_top_id - right.complete_top_id;
+  if (left.scan_top_id !== right.scan_top_id) return left.scan_top_id - right.scan_top_id;
+  if (left.phase !== right.phase) return left.phase === "materialize" ? 1 : -1;
+  if (left.before_id !== right.before_id) return right.before_id - left.before_id;
+  return left.page - right.page;
 }
 
 async function writeRecoveryCursor<T>(
@@ -668,7 +899,7 @@ async function createWorkLocator(github: FugueGitHub, state: CanonicalWorkState)
   await createProtocolComment(github, state.issue, `${renderCanonicalWorkStateComment(state)}\n\n${WORK_RECEIPT}`);
 }
 
-/** Canonical work-state publication deletes the old locator before committing a newer authority. */
+/** Canonical work-state publication commits d3 authority before repairing presentation receipts. */
 export async function publishCanonicalWorkState(
   github: FugueGitHub,
   state: CanonicalWorkState,
@@ -684,17 +915,15 @@ export async function publishCanonicalWorkState(
   const createdMs = Math.max(Date.now(), minimumCreated, Number.isFinite(requestedCreated) ? requestedCreated : 0);
   parsed = canonicalWorkStateSchema.parse({ ...parsed, created_at: new Date(createdMs).toISOString() });
 
-  // No older valid locator may survive a newer authority commit. If publication then crashes, the
-  // existing status authority is recovered instead of falling back to an older signed comment.
-  await deleteTrustedReceiptComments(github, parsed.issue, WORK_RECEIPT);
   await publishDurableProtocolRecord(github, {
     storageSha: parsed.base_sha,
     publisherSha: parsed.base_sha,
     scope: workScope(parsed.issue),
     unsignedBody: renderCanonicalWorkStateComment(parsed),
     publicationTimestamp: Date.parse(parsed.created_at),
+    authorityOrder: parsed.created_at,
   });
-  await createWorkLocator(github, parsed);
+  await replaceWorkLocator(github, parsed);
   return true;
 }
 
@@ -703,18 +932,22 @@ export async function loadCurrentCanonicalWorkState(
   issueNumber: number,
   baseSha: string,
 ): Promise<CanonicalWorkState | undefined> {
-  const locator = await loadWorkLocator(github, issueNumber, baseSha);
-  if (locator) return locator;
   const recovered = await recoverWorkStateAtBase(github, issueNumber, baseSha);
   if (recovered.record) {
-    await deleteTrustedReceiptComments(github, issueNumber, WORK_RECEIPT);
-    await createWorkLocator(github, recovered.record.value);
+    await replaceWorkLocator(github, recovered.record.value);
     return recovered.record.value;
   }
   if (recovered.exhausted) return undefined;
   throw new DurableProtocolRecoveryPendingError(
     `Issue #${issueNumber} canonical work-state recovery is progressing through bounded status history.`,
   );
+}
+
+async function replaceWorkLocator(github: FugueGitHub, state: CanonicalWorkState): Promise<void> {
+  const locator = await loadWorkLocator(github, state.issue, state.base_sha);
+  if (locator && exactCanonicalWorkState(locator, state)) return;
+  await deleteTrustedReceiptComments(github, state.issue, WORK_RECEIPT);
+  await createWorkLocator(github, state);
 }
 
 async function recoverWorkStateAtBase(
@@ -729,6 +962,7 @@ async function recoverWorkStateAtBase(
     issueNumber,
     parse: parseCanonicalWorkState,
     timestamp: (value) => Date.parse(value.created_at),
+    order: (value) => value.created_at,
     validate: (value) => value.issue === issueNumber && value.base_sha.toLowerCase() === baseSha.toLowerCase(),
   });
 }
@@ -840,19 +1074,19 @@ export async function publishCoordinatorSnapshot(
   snapshot: CoordinatorSnapshot,
 ): Promise<void> {
   const parsed = coordinatorSnapshotSchema.parse(snapshot);
-  await deleteTrustedReceiptComments(github, parsed.issue, COORDINATOR_RECEIPT);
+  const current = await loadLatestCoordinatorSnapshot(github, parsed.issue, baseSha);
+  if (current && compareCoordinatorSnapshots(parsed, current) <= 0) return;
   await publishDurableProtocolRecord(github, {
     storageSha: baseSha,
     publisherSha: baseSha,
     scope: coordinatorScope(parsed.issue),
-    unsignedBody: `${serializeCoordinatorSnapshot(parsed)}\n\nCOORDINATOR SNAPSHOT — DURABLE`,
+    unsignedBody: `${serializeCoordinatorSnapshot(parsed)}
+
+COORDINATOR SNAPSHOT — DURABLE`,
     publicationTimestamp: Date.parse(parsed.captured_at),
+    authorityOrder: coordinatorAuthorityOrder(parsed),
   });
-  await createProtocolComment(
-    github,
-    parsed.issue,
-    `${serializeCoordinatorSnapshot(parsed)}\n\nCOORDINATOR SNAPSHOT — DURABLE\n\n${COORDINATOR_RECEIPT}`,
-  );
+  await replaceCoordinatorLocator(github, parsed);
 }
 
 export async function loadLatestCoordinatorSnapshot(
@@ -860,8 +1094,6 @@ export async function loadLatestCoordinatorSnapshot(
   issueNumber: number,
   baseSha: string,
 ): Promise<CoordinatorSnapshot | undefined> {
-  const locator = await loadCoordinatorLocator(github, issueNumber);
-  if (locator) return locator;
   const recovered = await recoverDurableProtocolRecord(github, {
     storageSha: baseSha,
     publisherSha: baseSha,
@@ -869,21 +1101,32 @@ export async function loadLatestCoordinatorSnapshot(
     issueNumber,
     parse: parseCoordinatorSnapshot,
     timestamp: (value) => Date.parse(value.captured_at),
+    order: coordinatorAuthorityOrder,
     compare: compareCoordinatorSnapshots,
     validate: (value) => value.issue === issueNumber,
   });
   if (recovered.record) {
-    await deleteTrustedReceiptComments(github, issueNumber, COORDINATOR_RECEIPT);
-    await createProtocolComment(
-      github,
-      issueNumber,
-      `${serializeCoordinatorSnapshot(recovered.record.value)}\n\nCOORDINATOR SNAPSHOT — DURABLE\n\n${COORDINATOR_RECEIPT}`,
-    );
+    await replaceCoordinatorLocator(github, recovered.record.value);
     return recovered.record.value;
   }
   if (recovered.exhausted) return undefined;
   throw new DurableProtocolRecoveryPendingError(
     `Issue #${issueNumber} Coordinator snapshot recovery is progressing through bounded status history.`,
+  );
+}
+
+async function replaceCoordinatorLocator(github: FugueGitHub, snapshot: CoordinatorSnapshot): Promise<void> {
+  const locator = await loadCoordinatorLocator(github, snapshot.issue);
+  if (locator && compareCoordinatorSnapshots(locator, snapshot) === 0) return;
+  await deleteTrustedReceiptComments(github, snapshot.issue, COORDINATOR_RECEIPT);
+  await createProtocolComment(
+    github,
+    snapshot.issue,
+    `${serializeCoordinatorSnapshot(snapshot)}
+
+COORDINATOR SNAPSHOT — DURABLE
+
+${COORDINATOR_RECEIPT}`,
   );
 }
 
@@ -932,11 +1175,11 @@ async function loadCoordinatorLocator(
 }
 
 function compareCoordinatorSnapshots(left: CoordinatorSnapshot, right: CoordinatorSnapshot): number {
-  const revision = Date.parse(left.issue_updated_at) - Date.parse(right.issue_updated_at);
-  if (revision !== 0) return revision;
-  const captured = Date.parse(left.captured_at) - Date.parse(right.captured_at);
-  if (captured !== 0) return captured;
-  return left.event_id.localeCompare(right.event_id);
+  return compareAuthorityOrder(coordinatorAuthorityOrder(left), coordinatorAuthorityOrder(right));
+}
+
+function coordinatorAuthorityOrder(snapshot: CoordinatorSnapshot): string {
+  return `${snapshot.issue_updated_at}\u0000${snapshot.event_id}`;
 }
 
 function coordinatorScope(issueNumber: number): string {

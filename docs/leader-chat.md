@@ -138,3 +138,8 @@ Fugue Leader for OWNER/REPO. Reconstruct all current coordination state from Git
 ```
 
 No additional handoff packet is required.
+
+
+## Canonical work-spec identity
+
+Leader, Worker, and QA sessions use the exact work-spec digest carried by current Fugue evaluation/review-start evidence. The digest is computed by the repository's single canonical work-spec normalization/hash function; reviewers do not invent a parallel digest. D3 receipt comments remain presentation hints and must never be used to choose authority over the durable record ordering.

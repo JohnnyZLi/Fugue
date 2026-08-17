@@ -82,7 +82,7 @@ export async function currentIntegrationState(
 
   if (record.run) {
     const bound = await getBoundIntegrationWorkflowRun(github, record);
-    if (!bound) return { state: "none", request };
+    if (!bound) return { state: "pending", request };
     if (bound.status !== "completed") return { state: "pending", request, targetUrl: bound.htmlUrl };
     if (isRecoverableAbortedRun(bound.status, bound.conclusion)) return { state: "none", request };
     if (bound.conclusion === "failure") return { state: "failure", request, targetUrl: bound.htmlUrl };
@@ -100,7 +100,106 @@ export async function currentIntegrationState(
   const created = Date.parse(request.created_at);
   if (!Number.isFinite(created)) return { state: "error", request };
   if (now - created < INTEGRATION_REQUEST_RECOVERY_GRACE_MS) return { state: "pending", request };
-  return { state: "none", request };
+  // Absence is ambiguous under actions:write: a protected run may have completed and been deleted
+  // while its immutable workflow_run completion event is still queued for protected reconciliation.
+  return { state: "pending", request };
+}
+
+export interface DurableIntegrationWorkflowRunEvent {
+  eventName: "workflow_run";
+  workflowName: string;
+  runId: number;
+  runAttempt: number;
+  conclusion: string | null;
+  status: string;
+  headSha: string;
+  displayTitle: string;
+  createdAt: string;
+  htmlUrl: string;
+  actor: string;
+}
+
+export async function sealIntegrationWorkflowRunEvent(
+  github: FugueGitHub,
+  event: DurableIntegrationWorkflowRunEvent | undefined,
+): Promise<boolean> {
+  if (!event || event.workflowName !== "Fugue Integration" || event.runAttempt !== 1 ||
+      event.actor !== "github-actions[bot]" || event.status !== "completed") return false;
+  const match = event.displayTitle.match(/^Fugue Integration PR #(\d+) (int-[0-9a-f]{16}-[0-9a-f]{16})$/);
+  if (!match?.[1] || !match[2]) return false;
+  const prNumber = Number(match[1]);
+  if (!Number.isInteger(prNumber) || prNumber <= 0) return false;
+  const { owner, repo } = github.repository;
+  const pr = await github.octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
+  const identity = {
+    prNumber,
+    headSha: pr.data.head.sha,
+    baseBranch: pr.data.base.ref,
+    baseSha: event.headSha,
+  };
+  let record: IntegrationRecord | undefined;
+  try {
+    const recovered = await recoverDurableProtocolRecord(github, {
+      storageSha: identity.headSha,
+      publisherSha: identity.baseSha,
+      scope: integrationScope(prNumber),
+      issueNumber: prNumber,
+      parse: parseIntegrationRecord,
+      timestamp: (value) => Date.parse(value.created_at),
+      order: (value) => value.created_at,
+      validate: (value) => value.identity.prNumber === prNumber &&
+        value.identity.headSha === identity.headSha && value.identity.baseSha === identity.baseSha &&
+        value.request.request_id === match[2],
+    });
+    if (!recovered.record) return false;
+    record = recovered.record.value;
+  } catch (error) {
+    if (error instanceof DurableProtocolRecoveryPendingError) return false;
+    throw error;
+  }
+  if (record.terminal && (!record.run || record.run.id <= event.runId)) return false;
+  if (Date.parse(event.createdAt) < Date.parse(record.request.created_at)) return false;
+  if (record.run && record.run.id < event.runId) return false;
+
+  const visibleFirst = await findIntegrationWorkflowRun(github, record.request);
+  if (visibleFirst && visibleFirst.id < event.runId) return false;
+  const binding: IntegrationRunBinding = { id: event.runId, attempt: 1, created_at: event.createdAt, html_url: event.htmlUrl };
+  const conclusion = event.conclusion;
+  if (conclusion === "cancelled") {
+    await publishIntegrationRecord(github, {
+      ...record,
+      run: binding,
+      terminal: { state: "aborted", detail: "Protected attempt 1 completed cancelled.", created_at: new Date().toISOString() },
+      created_at: new Date().toISOString(),
+    });
+    return true;
+  }
+  if (conclusion === "failure") {
+    await publishIntegrationRecord(github, {
+      ...record,
+      run: binding,
+      terminal: { state: "failure", detail: "Protected attempt 1 completed failure (sealed from immutable workflow_run event).", created_at: new Date().toISOString() },
+      created_at: new Date().toISOString(),
+    });
+    return true;
+  }
+  if (conclusion === "success") {
+    // A successful workflow must already have committed terminal PASS. Missing PASS is fail-closed.
+    await publishIntegrationRecord(github, {
+      ...record,
+      run: binding,
+      terminal: { state: "error", detail: "Protected attempt 1 completed success without durable terminal PASS evidence.", created_at: new Date().toISOString() },
+      created_at: new Date().toISOString(),
+    });
+    return true;
+  }
+  await publishIntegrationRecord(github, {
+    ...record,
+    run: binding,
+    terminal: { state: "error", detail: `Protected attempt 1 completed ${conclusion ?? "without conclusion"}; only observed cancellation is retryable.`, created_at: new Date().toISOString() },
+    created_at: new Date().toISOString(),
+  });
+  return true;
 }
 
 export async function findCurrentIntegrationRequest(
@@ -121,8 +220,6 @@ export async function getCurrentIntegrationRecord(
   github: FugueGitHub,
   identity: IntegrationRequest["identity"],
 ): Promise<IntegrationRecord | undefined> {
-  const locator = await loadIntegrationLocator(github, identity);
-  if (locator) return locator;
   const recovered = await recoverDurableProtocolRecord(github, {
     storageSha: identity.headSha,
     publisherSha: identity.baseSha,
@@ -130,11 +227,11 @@ export async function getCurrentIntegrationRecord(
     issueNumber: identity.prNumber,
     parse: parseIntegrationRecord,
     timestamp: (value) => Date.parse(value.created_at),
+    order: (value) => value.created_at,
     validate: (value) => sameEvaluationIdentity(value.identity, identity),
   });
   if (recovered.record) {
-    await deleteIntegrationLocators(github, identity.prNumber);
-    await createIntegrationLocator(github, recovered.record.value);
+    await replaceIntegrationLocator(github, recovered.record.value);
     return recovered.record.value;
   }
   if (recovered.exhausted) return undefined;
@@ -149,14 +246,19 @@ export async function publishIntegrationRecord(
 ): Promise<IntegrationRecord> {
   const current = await getCurrentIntegrationRecord(github, record.identity);
   if (current && sameIntegrationRecord(current, record)) return current;
-  if (current && current.terminal && current.terminal.state !== "aborted") {
+  const correctingEarlierRun = Boolean(
+    current?.run && record.run &&
+    current.request.request_id === record.request.request_id &&
+    record.run.id < current.run.id
+  );
+  if (current && current.terminal && current.terminal.state !== "aborted" && !correctingEarlierRun) {
     throw new Error(`Integration request ${current.request.request_id} already has terminal ${current.terminal.state} authority.`);
   }
   if (current && record.request.request_id !== current.request.request_id && current.terminal?.state !== "aborted") {
     throw new Error(`Cannot replace active Integration request ${current.request.request_id}.`);
   }
-  if (current?.run && record.run && current.run.id !== record.run.id) {
-    throw new Error(`Integration request ${record.request.request_id} is already bound to run ${current.run.id}.`);
+  if (current?.run && record.run && current.run.id !== record.run.id && !correctingEarlierRun) {
+    throw new Error(`Integration request ${record.request.request_id} is already bound to earlier protected run ${current.run.id}.`);
   }
 
   const minimum = current ? Date.parse(current.created_at) + 1 : 0;
@@ -164,15 +266,15 @@ export async function publishIntegrationRecord(
   const createdAt = new Date(Math.max(Date.now(), minimum, Number.isFinite(requested) ? requested : 0)).toISOString();
   const normalized = { ...record, created_at: createdAt } as IntegrationRecord;
 
-  await deleteIntegrationLocators(github, normalized.identity.prNumber);
   await publishDurableProtocolRecord(github, {
     storageSha: normalized.identity.headSha,
     publisherSha: normalized.identity.baseSha,
     scope: integrationScope(normalized.identity.prNumber),
     unsignedBody: `${serializeIntegrationRecord(normalized)}\n\nINTEGRATION RECORD — CANONICAL`,
     publicationTimestamp: Date.parse(normalized.created_at),
+    authorityOrder: normalized.created_at,
   });
-  await createIntegrationLocator(github, normalized);
+  await replaceIntegrationLocator(github, normalized);
   return normalized;
 }
 
@@ -195,12 +297,16 @@ export async function ensureIntegrationDispatch(
 
   if (current?.run) {
     const bound = await getBoundIntegrationWorkflowRun(github, current);
-    if (!bound || isRecoverableAbortedRun(bound.status, bound.conclusion)) {
+    if (!bound) {
+      // The immutable workflow_run completion event is the authority for failure vs cancellation.
+      // Until it is sealed, disappearance is fail-closed pending and never permits redispatch.
+      return { request: current.request, dispatch: false };
+    } else if (isRecoverableAbortedRun(bound.status, bound.conclusion)) {
       await publishIntegrationRecord(github, {
         ...current,
         terminal: {
           state: "aborted",
-          detail: bound ? `Protected attempt 1 concluded ${bound.conclusion}.` : "Bound protected run was deleted before a terminal Fugue result was committed.",
+          detail: `Protected attempt 1 concluded ${bound.conclusion}.`,
           created_at: new Date(now).toISOString(),
         },
         created_at: new Date(now).toISOString(),
@@ -254,17 +360,17 @@ export async function ensureIntegrationDispatch(
       });
       return { request: current.request, dispatch: false };
     }
-    if (!first && Number.isFinite(requestCreated) && now - requestCreated < INTEGRATION_REQUEST_RECOVERY_GRACE_MS) {
+    if (!first) {
+      // Absence is ambiguous under actions:write because a genuine failed attempt may have been deleted.
+      // The protected workflow_run completion event seals observable cancellation/failure; no missing run is retried.
       return { request: current.request, dispatch: false };
     }
     await publishIntegrationRecord(github, {
       ...current,
-      ...(first ? { run: integrationRunBinding(first) } : {}),
+      run: integrationRunBinding(first),
       terminal: {
         state: "aborted",
-        detail: first
-          ? `First protected run ${first.id} concluded ${first.conclusion}; only aborted transport outcomes permit a fresh request.`
-          : "No protected first run materialized before the request recovery deadline.",
+        detail: `First protected run ${first.id} concluded ${first.conclusion}; only an observed aborted transport outcome permits a fresh request.`,
         created_at: new Date(now).toISOString(),
       },
       created_at: new Date(now).toISOString(),
@@ -316,7 +422,7 @@ export async function findIntegrationWorkflowRun(
   const { owner, repo } = github.repository;
   const requestCreated = Date.parse(request.created_at);
   if (!Number.isFinite(requestCreated)) return undefined;
-  const runs = await github.octokit.rest.actions.listWorkflowRuns({
+  const runs = await github.octokit.paginate(github.octokit.rest.actions.listWorkflowRuns, {
     owner,
     repo,
     workflow_id: "fugue-integration.yml",
@@ -324,7 +430,7 @@ export async function findIntegrationWorkflowRun(
     head_sha: request.identity.baseSha,
     per_page: 100,
   });
-  const candidates = (runs.data.workflow_runs as unknown as WorkflowRunRecord[])
+  const candidates = (runs as unknown as WorkflowRunRecord[])
     .filter((run) => matchesIntegrationRunIdentity(run, request, requestCreated))
     .sort((left, right) => left.id - right.id);
   for (const run of candidates) {
@@ -415,6 +521,13 @@ async function loadIntegrationLocator(github: FugueGitHub, identity: Integration
   const newest = records.sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at)).at(-1)!;
   if (records.some((record) => !sameIntegrationRecord(record, newest))) return undefined;
   return newest;
+}
+
+async function replaceIntegrationLocator(github: FugueGitHub, record: IntegrationRecord): Promise<void> {
+  const locator = await loadIntegrationLocator(github, record.identity);
+  if (locator && sameIntegrationRecord(locator, record)) return;
+  await deleteIntegrationLocators(github, record.identity.prNumber);
+  await createIntegrationLocator(github, record);
 }
 
 async function createIntegrationLocator(github: FugueGitHub, record: IntegrationRecord): Promise<void> {

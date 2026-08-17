@@ -25,7 +25,7 @@ import { upsertStateComment } from "./state-comment.js";
 import { actionLabel, observeWork, planWork, type WorkflowAction } from "./workflow.js";
 import { claimWorker } from "./worker.js";
 import type { FugueGitHub } from "./github.js";
-import { ensureIntegrationDispatch } from "./integration-status.js";
+import { ensureIntegrationDispatch, sealIntegrationWorkflowRunEvent } from "./integration-status.js";
 import { FUGUE_PROTOCOL_ACTOR } from "./provenance.js";
 import { captureEvaluation } from "./evaluation.js";
 import { loadCurrentCanonicalWorkState, publishCanonicalWorkState } from "./state.js";
@@ -68,6 +68,7 @@ export async function reconcileRepository(
   await rollCanonicalWorkStatesToCurrentBase(github, policy);
   await repairCanonicalWorkStateComments(github, policy);
 
+  await sealIntegrationWorkflowRunEvent(github, integrationWorkflowRunEventFromEnvironment());
   const event = coordinatorIssueEventFromEnvironment();
   await preserveCoordinatorIssueEvent(github, policy, event);
   await replayCoordinatorSnapshots(github, policy);
@@ -234,6 +235,10 @@ export async function ingestCoordinatorSnapshot(
   policy: ActivePolicy,
   snapshot: CoordinatorSnapshot,
 ): Promise<boolean> {
+  const latest = await recoverCoordinatorSnapshots(github, policy);
+  const current = latest.find((candidate) => candidate.issue === snapshot.issue);
+  if (current && (Date.parse(current.issue_updated_at) > Date.parse(snapshot.issue_updated_at) ||
+      (current.issue_updated_at === snapshot.issue_updated_at && current.event_id > snapshot.event_id))) return false;
   return ingestCoordinatorIssueEvent(github, policy, {
     eventName: snapshot.event_name,
     action: snapshot.action,
@@ -474,6 +479,56 @@ async function canCanonicalizeCoordinatorEvent(github: FugueGitHub, actor: strin
     return response.data.permission === "write" || response.data.permission === "maintain" || response.data.permission === "admin";
   } catch {
     return false;
+  }
+}
+
+export interface IntegrationWorkflowRunEvent {
+  eventName: "workflow_run";
+  workflowName: string;
+  runId: number;
+  runAttempt: number;
+  conclusion: string | null;
+  status: string;
+  headSha: string;
+  displayTitle: string;
+  createdAt: string;
+  htmlUrl: string;
+  actor: string;
+}
+
+export function integrationWorkflowRunEventFromEnvironment(): IntegrationWorkflowRunEvent | undefined {
+  if ((process.env.GITHUB_EVENT_NAME ?? "") !== "workflow_run") return undefined;
+  const eventPath = process.env.GITHUB_EVENT_PATH ?? "";
+  if (!eventPath) return undefined;
+  try {
+    const payload = JSON.parse(readFileSync(eventPath, "utf8")) as {
+      workflow_run?: {
+        name?: unknown; id?: unknown; run_attempt?: unknown; conclusion?: unknown; status?: unknown;
+        head_sha?: unknown; display_title?: unknown; created_at?: unknown; html_url?: unknown;
+        actor?: { login?: unknown } | null; event?: unknown;
+      };
+    };
+    const run = payload.workflow_run;
+    if (!run || run.name !== "Fugue Integration" || run.event !== "workflow_dispatch" ||
+        typeof run.id !== "number" || typeof run.run_attempt !== "number" ||
+        typeof run.status !== "string" || typeof run.head_sha !== "string" ||
+        typeof run.display_title !== "string" || typeof run.created_at !== "string" ||
+        typeof run.html_url !== "string" || typeof run.actor?.login !== "string") return undefined;
+    return {
+      eventName: "workflow_run",
+      workflowName: run.name,
+      runId: run.id,
+      runAttempt: run.run_attempt,
+      conclusion: typeof run.conclusion === "string" ? run.conclusion : null,
+      status: run.status,
+      headSha: run.head_sha,
+      displayTitle: run.display_title,
+      createdAt: run.created_at,
+      htmlUrl: run.html_url,
+      actor: run.actor.login,
+    };
+  } catch {
+    return undefined;
   }
 }
 
