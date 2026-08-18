@@ -1,0 +1,160 @@
+name: Work 18 Specialist Consolidation
+
+on:
+  push:
+    branches: [bootstrap/work18-consolidation-20260818]
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  consolidate:
+    if: contains(github.event.head_commit.message, '[work18-consolidate]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout consolidation control
+        uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-consolidation-20260818
+          path: control
+      - name: Checkout exact canonical Worker head
+        uses: actions/checkout@v4
+        with:
+          ref: 8a18e6cfad62335b082e5a83740b63a8631468d7
+          path: work
+      - name: Checkout exact recovery specialist
+        uses: actions/checkout@v4
+        with:
+          ref: d6f737925d65823ef5ca392a6b4d59e9b0340ac6
+          path: recovery
+      - name: Checkout exact authority specialist
+        uses: actions/checkout@v4
+        with:
+          ref: 4acb5d65fa29ccb0c5f98cd77681618928565629
+          path: authority
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: work/package-lock.json
+      - name: Confirm live assignment and specialist identities
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git -C work rev-parse HEAD)" = "8a18e6cfad62335b082e5a83740b63a8631468d7"
+          test "$(git -C recovery rev-parse HEAD)" = "d6f737925d65823ef5ca392a6b4d59e9b0340ac6"
+          test "$(git -C authority rev-parse HEAD)" = "4acb5d65fa29ccb0c5f98cd77681618928565629"
+          test "$(git -C recovery merge-base HEAD 8a18e6cfad62335b082e5a83740b63a8631468d7)" = "8a18e6cfad62335b082e5a83740b63a8631468d7"
+          test "$(git -C authority merge-base HEAD 8a18e6cfad62335b082e5a83740b63a8631468d7)" = "8a18e6cfad62335b082e5a83740b63a8631468d7"
+          test "$(git ls-remote origin refs/heads/agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration | cut -f1)" = "8a18e6cfad62335b082e5a83740b63a8631468d7"
+          test "$(gh api repos/JohnnyZLi/Fugue/issues/18 --jq .updated_at)" = "2026-08-18T04:28:24Z"
+          gh api repos/JohnnyZLi/Fugue/issues/18 --jq .body > /tmp/issue-body.txt
+      - name: Recompute canonical work-spec digest
+        working-directory: work
+        run: npm ci
+      - name: Verify Worker metadata, ownership, and digest
+        working-directory: work
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs'; import crypto from 'node:crypto'; import { parse as parseYaml } from 'yaml';
+          const body=fs.readFileSync('/tmp/issue-body.txt','utf8'); const sm='<!-- fugue-work'; const em='-->'; const s=body.indexOf(sm); const e=body.indexOf(em,s+sm.length); if(s<0||e<0) throw new Error('missing metadata');
+          const m=parseYaml(body.slice(s+sm.length,e).trim());
+          if(m.execution?.worker_id!=='wkr-b0057a9e'||m.execution?.branch!=='agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration') throw new Error('Worker assignment drift');
+          if(!m.spec?.ownership?.owned?.includes('tests/state-authority-blockers.test.ts') || !m.spec?.ownership?.owned?.includes('.github/workflows/fugue-integration.yml') || !m.spec?.ownership?.coordinate?.includes('src/core/integration-status.ts') || !m.spec?.ownership?.forbidden?.includes('package-lock.json')) throw new Error('ownership drift');
+          const req=`${body.slice(0,s)}${body.slice(e+em.length)}`.replace(/\r\n?/g,'\n').split('\n').map(x=>x.replace(/[ \t]+$/g,'')).join('\n').trim();
+          const sort=v=>Array.isArray(v)?v.map(sort):v&&typeof v==='object'?Object.fromEntries(Object.entries(v).sort(([a],[b])=>a.localeCompare(b)).map(([k,x])=>[k,sort(x)])):v;
+          const digest='sha256:'+crypto.createHash('sha256').update(JSON.stringify(sort({requirements:req,spec:m.spec})),'utf8').digest('hex');
+          if(digest!=='sha256:d68ce1214ed0aee5e8d1cad0539d535ef2c9d7ce90ea1a74be06359e0c6953e1') throw new Error(`work-spec drift: ${digest}`);
+          NODE
+      - name: Apply selected specialist consolidation
+        run: python3 control/.github/work18-consolidate.py work recovery
+      - name: Verify consolidation scope and trust-root removals
+        run: |
+          set -euo pipefail
+          cd work
+          git diff --check
+          test -z "$(git diff --name-only -- package-lock.json)"
+          changed="$(git diff --name-only | sort)"
+          printf '%s\n' "$changed"
+          expected="$(printf '%s\n' \
+            .github/workflows/fugue-control-plane.yml \
+            .github/workflows/fugue-integration.yml \
+            AGENTS.md README.md docs/leader-chat.md \
+            src/core/integration-status.ts src/core/provenance.ts src/core/reconcile.ts \
+            tests/integration-plan.test.ts tests/state-authority-blockers.test.ts | sort)"
+          test "$changed" = "$expected"
+          ! grep -q 'GET /repos/{owner}/{repo}/deployments' src/core/integration-status.ts
+          ! grep -q 'correlatedIntegrationDeploymentSnapshot' src/core/integration-status.ts
+          ! grep -q 'fugue_request=${{ inputs.request_id }}' .github/workflows/fugue-integration.yml
+          grep -q 'return_run_details: true' src/core/reconcile.ts
+          grep -q 'kind: "unresolved"' src/core/reconcile.ts
+      - name: Typecheck consolidated tree
+        working-directory: work
+        run: npm run check
+      - name: Test consolidated tree
+        working-directory: work
+        run: npm test
+      - name: Build consolidated tree
+        working-directory: work
+        run: npm run build
+      - name: Publish validated non-workflow canonical changes
+        run: |
+          set -euo pipefail
+          cd work
+          test "$(git ls-remote origin refs/heads/agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration | cut -f1)" = "8a18e6cfad62335b082e5a83740b63a8631468d7"
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add AGENTS.md README.md docs/leader-chat.md src/core/integration-status.ts src/core/provenance.ts src/core/reconcile.ts tests/integration-plan.test.ts tests/state-authority-blockers.test.ts
+          git diff --cached --check
+          test -z "$(git diff --cached --name-only -- package-lock.json)"
+          git commit -m 'Consolidate Integration authority and recovery'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+          echo "NON_WORKFLOW_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Stage exact validated workflow blobs on helper branch
+        run: |
+          set -euo pipefail
+          cp work/.github/workflows/fugue-control-plane.yml control/.github/work18-fugue-control-plane.staged
+          cp work/.github/workflows/fugue-integration.yml control/.github/work18-fugue-integration.staged
+          cd control
+          git pull --ff-only origin bootstrap/work18-consolidation-20260818
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-fugue-control-plane.staged .github/work18-fugue-integration.staged
+          git commit -m 'Stage validated work-18 workflow blobs'
+          git push origin HEAD:bootstrap/work18-consolidation-20260818
+      - name: Record consolidation result
+        run: |
+          set -euo pipefail
+          cd control
+          git pull --ff-only origin bootstrap/work18-consolidation-20260818
+          cat > .github/work18-consolidation-result.txt <<EOF
+          run_id=${{ github.run_id }}
+          status=success
+          non_workflow_head=${NON_WORKFLOW_HEAD}
+          work_spec_digest=sha256:d68ce1214ed0aee5e8d1cad0539d535ef2c9d7ce90ea1a74be06359e0c6953e1
+          EOF
+          sed -i 's/^          //' .github/work18-consolidation-result.txt
+          git add .github/work18-consolidation-result.txt
+          git commit -m 'Record work-18 consolidation result'
+          git push origin HEAD:bootstrap/work18-consolidation-20260818
+
+  record-failure:
+    needs: consolidate
+    if: always() && needs.consolidate.result == 'failure' && contains(github.event.head_commit.message, '[work18-consolidate]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-consolidation-20260818
+      - run: |
+          echo "run_id=${{ github.run_id }}" > .github/work18-consolidation-result.txt
+          echo "status=failure" >> .github/work18-consolidation-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-consolidation-result.txt
+          git commit -m 'Record failed work-18 consolidation' || exit 0
+          git push origin HEAD:bootstrap/work18-consolidation-20260818
