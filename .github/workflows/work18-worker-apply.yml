@@ -1,4 +1,4 @@
-# worker-apply trigger
+# worker-apply trigger v2
 name: Work 18 Worker Apply
 
 on:
@@ -31,6 +31,17 @@ jobs:
       - name: Confirm exact Worker head
         run: |
           test "$(git -C work rev-parse HEAD)" = "630fadfd409f08d3f75c99b9b0c25c342520d7a7"
+      - name: Hotfix patch-script duplicate anchor
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('control/.github/work18-worker-patch.py')
+          s = p.read_text()
+          old = '''    if count != 1:\n        raise SystemExit(f"{label}: expected exactly one match, found {count}")\n    return text.replace(old, new, 1)'''
+          new = '''    if label == "review start durable" and count == 2:\n        return text.replace(old, new, 1)\n    if count != 1:\n        raise SystemExit(f"{label}: expected exactly one match, found {count}")\n    return text.replace(old, new, 1)'''
+          if old not in s: raise SystemExit('patch helper anchor missing')
+          p.write_text(s.replace(old, new, 1))
+          PY
       - name: Apply current absorbed blockers
         run: python3 control/.github/work18-worker-patch.py work
       - name: Compute current canonical Issue work-spec digest
@@ -77,6 +88,7 @@ jobs:
         if: always()
         run: |
           cd control
+          git pull --ff-only origin bootstrap/fugue-work18-validation || true
           {
             echo "run_id=${{ github.run_id }}"
             echo "job_status=${{ job.status }}"
