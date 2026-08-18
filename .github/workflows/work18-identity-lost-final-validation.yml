@@ -1,0 +1,56 @@
+name: Work 18 Identity Lost Exact Head Validation
+
+on:
+  push:
+    branches: [bootstrap/work18-identity-lost-20260818]
+
+jobs:
+  test:
+    if: contains(github.event.head_commit.message, '[identity-lost-final-validate]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ""
+      GH_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 163ec2f7c5576e1fc39c918eb2d1aee2de679a62
+          persist-credentials: false
+      - name: Confirm detached exact head and no publication credential
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "163ec2f7c5576e1fc39c918eb2d1aee2de679a62"
+          test -z "$(git symbolic-ref -q HEAD || true)"
+          test -z "$(git config --local --get-regexp 'http.*extraheader' || true)"
+          test -z "$GITHUB_TOKEN"
+          test -z "$GH_TOKEN"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  record:
+    needs: test
+    if: always() && contains(github.event.head_commit.message, '[identity-lost-final-validate]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-identity-lost-20260818
+      - name: Record result
+        run: |
+          set -euo pipefail
+          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '163ec2f7c5576e1fc39c918eb2d1aee2de679a62' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-identity-lost-final-validation-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-identity-lost-final-validation-result.txt
+          git commit -m 'Record identity-lost exact-head validation' || exit 0
+          git push origin HEAD:bootstrap/work18-identity-lost-20260818
