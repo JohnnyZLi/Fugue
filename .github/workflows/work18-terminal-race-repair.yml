@@ -4,6 +4,7 @@ on:
   push:
     branches: [bootstrap/work18-identity-lost-20260818]
 
+# One-shot auxiliary repair runner for the current Worker handoff.
 jobs:
   repair:
     if: contains(github.event.head_commit.message, '[terminal-race-repair]')
