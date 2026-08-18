@@ -137,6 +137,7 @@ jobs:
           const suffix = createHash('sha256').update(requestId, 'utf8').digest('hex').slice(0, 32).toUpperCase();
           const fenceName = `FUGUE_INT_F_${suffix}`;
           const bindingName = `FUGUE_INT_B_${suffix}`;
+          const commitName = `FUGUE_INT_C_${suffix}`;
           const apiBase = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}`;
           const headers = {
             Authorization: `Bearer ${process.env.FUGUE_AUTHORITY_TOKEN}`,
@@ -156,11 +157,19 @@ jobs:
             if (typeof value !== 'string') throw new Error(`Protected Fugue Authority variable ${name} has no string value.`);
             return value;
           }
+          async function createVariable(name, value) {
+            const response = await request('/actions/variables', {
+              method: 'POST',
+              body: JSON.stringify({ name, value }),
+            });
+            if (response.status !== 201 && response.status !== 409 && response.status !== 422) {
+              throw new Error(`Unable to create protected Integration variable ${name} (${response.status}).`);
+            }
+          }
 
           const fenceRaw = await readVariable(fenceName, true);
-          // The synchronous workflow-dispatch response may already have bound d3 and reclaimed the
-          // transient fence before this requested event is delivered. In that case there is nothing
-          // left for this recovery path to authorize.
+          // A durable exact binding or terminal authority may already have committed and reclaimed F.
+          // In that case this delayed workflow_run delivery is presentation only and cannot reopen it.
           if (fenceRaw === null) process.exit(0);
           let fence;
           try { fence = JSON.parse(fenceRaw); }
@@ -170,6 +179,38 @@ jobs:
               fence.run_token !== runToken || fence.authority_actor_id !== expectedActorId ||
               typeof fence.head_sha !== 'string' || typeof fence.anchor_name !== 'string' || typeof fence.created_at !== 'string') {
             throw new Error('Protected Integration workflow_run conflicts with its immutable dispatch fence.');
+          }
+
+          // C is the request-local first-writer-wins serialization point shared by exact-L writers
+          // and identity_lost terminalization. Claim it before publishing B so a legitimate exact L
+          // that wins this create cannot be suppressed by a stale terminalizer.
+          const exactCommit = {
+            version: 1,
+            kind: 'integration_exact_run_commit',
+            request_id: requestId,
+            pr_number: prNumber,
+            head_sha: fence.head_sha,
+            base_sha: fence.base_sha,
+            anchor_name: fence.anchor_name,
+            run_id: runId,
+            run_attempt: 1,
+            run_created_at: runCreatedAt,
+            html_url: htmlUrl,
+          };
+          const serializedCommit = JSON.stringify(exactCommit);
+          await createVariable(commitName, serializedCommit);
+          const committedRaw = await readVariable(commitName);
+          let committed;
+          try { committed = JSON.parse(committedRaw); }
+          catch { throw new Error('Protected Integration request-local commit is malformed.'); }
+          if (committed?.kind === 'integration_identity_lost_commit') process.exit(0);
+          if (committed?.version !== 1 || committed?.kind !== 'integration_exact_run_commit' ||
+              committed.request_id !== requestId || committed.pr_number !== prNumber ||
+              committed.head_sha?.toLowerCase() !== fence.head_sha.toLowerCase() ||
+              committed.base_sha?.toLowerCase() !== fence.base_sha.toLowerCase() ||
+              committed.anchor_name !== fence.anchor_name || committed.run_id !== runId || committed.run_attempt !== 1 ||
+              committed.run_created_at !== runCreatedAt || committed.html_url !== htmlUrl) {
+            throw new Error('Protected Integration request-local commit was already claimed by another run.');
           }
 
           const witness = {
@@ -188,15 +229,9 @@ jobs:
             html_url: htmlUrl,
           };
           const serialized = JSON.stringify(witness);
-          const createResponse = await request('/actions/variables', {
-            method: 'POST',
-            body: JSON.stringify({ name: bindingName, value: serialized }),
-          });
-          if (createResponse.status !== 201 && createResponse.status !== 409 && createResponse.status !== 422) {
-            throw new Error(`Unable to persist protected Integration binding witness (${createResponse.status}).`);
-          }
-          const committed = await readVariable(bindingName);
-          if (committed !== serialized) {
+          await createVariable(bindingName, serialized);
+          const witnessCommitted = await readVariable(bindingName);
+          if (witnessCommitted !== serialized) {
             throw new Error('Protected Integration binding witness was already claimed by a different run.');
           }
           NODE
