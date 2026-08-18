@@ -149,6 +149,12 @@ jobs:
               throw new Error(`Unable to create protected Integration variable ${name} (${response.status}).`);
             }
           }
+          async function deleteVariable(name) {
+            const response = await request(`/actions/variables/${encodeURIComponent(name)}`, { method: 'DELETE' });
+            if (response.status !== 204 && response.status !== 404) {
+              throw new Error(`Unable to delete protected Integration variable ${name} (${response.status}).`);
+            }
+          }
           function parseBlock(body, marker) {
             const start = body.indexOf(marker);
             if (start < 0) return null;
@@ -228,6 +234,21 @@ jobs:
               !Number.isFinite(Date.parse(String(commit.run_created_at ?? '')))) {
             throw new Error('Protected Integration request-local commit was already claimed by another run.');
           }
+
+          // Cleanup deletes F/A before C. Re-read both after C so a run-start job that was already
+          // executing cannot recreate C/S after terminal cleanup. Missing prerequisites make the
+          // delayed writer inert and it self-reclaims its recreated C slot.
+          const fenceAfterCommit = await read(`/actions/variables/${fenceName}`, true);
+          const anchorAfterCommit = await read(`/actions/variables/${anchorName}`, true);
+          if (!fenceAfterCommit || !anchorAfterCommit) {
+            await deleteVariable(commitName);
+            process.exit(0);
+          }
+          if (String(fenceAfterCommit.value ?? '') !== String(fenceVariable.value ?? '') ||
+              String(anchorAfterCommit.value ?? '') !== String(variable.value ?? '')) {
+            throw new Error('Protected Integration prerequisites changed across exact-run serialization.');
+          }
+
           const createdAt = commit.run_created_at;
           const startEvidence = {
             version: 1,
