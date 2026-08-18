@@ -14,6 +14,12 @@ source, count = re.subn(
 )
 if count != 1:
     raise SystemExit(f'expected one robust rollback refinement block, found {count}')
+# reconcile.ts uses a compact one-line integration-status import on this head.
+old = '''    s=once(s,\n''' + "'''  ensureIntegrationDispatch,\\n  sealIntegrationWorkflowRunEvent,''',\n'''  ensureIntegrationDispatch,\\n  bindDispatchedIntegrationRun,\\n  sealIntegrationWorkflowRunEvent,''','reconcile integration import')"
+new = '''    s=once(s,\n''' + "'''import { ensureIntegrationDispatch, reclaimOrphanIntegrationAuthorityVariables, sealIntegrationWorkflowRunEvent } from \\\"./integration-status.js\\\";''',\n'''import { bindDispatchedIntegrationRun, ensureIntegrationDispatch, reclaimOrphanIntegrationAuthorityVariables, sealIntegrationWorkflowRunEvent } from \\\"./integration-status.js\\\";''','reconcile integration import')"
+if old not in source:
+    raise SystemExit('expected reconcile import refinement source anchor')
+source = source.replace(old, new, 1)
 with tempfile.NamedTemporaryFile('w', suffix='.py', delete=False) as handle:
     handle.write(source)
     path = handle.name
