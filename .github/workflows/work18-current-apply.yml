@@ -1,0 +1,103 @@
+name: Work 18 Current Gated Repair 4
+
+on:
+  push:
+    branches: [bootstrap/work18-worker-repair-20260818-4]
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  apply:
+    if: contains(github.event.head_commit.message, '[work18-current-apply]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-worker-repair-20260818-4
+          path: control
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+          path: work
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: work/package-lock.json
+      - name: Confirm exact assignment and unchanged work identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git -C work rev-parse HEAD)" = "57b1d187ec4e6230fc68db47071ee2dea80c114f"
+          gh api repos/JohnnyZLi/Fugue/issues/18 --jq .body > /tmp/issue-body.txt
+          test "$(gh api repos/JohnnyZLi/Fugue/issues/18 --jq .updated_at)" = "2026-08-18T04:28:24Z"
+          cd work && npm ci
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs'; import crypto from 'node:crypto'; import { parse as parseYaml } from 'yaml';
+          const body=fs.readFileSync('/tmp/issue-body.txt','utf8'); const sm='<!-- fugue-work'; const em='-->'; const s=body.indexOf(sm); const e=body.indexOf(em,s+sm.length); if(s<0||e<0) throw new Error('missing metadata');
+          const m=parseYaml(body.slice(s+sm.length,e).trim());
+          if(m.execution?.worker_id!=='wkr-b0057a9e'||m.execution?.branch!=='agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration'||!m.spec?.ownership?.owned?.includes('tests/state-authority-blockers.test.ts')||m.spec?.ownership?.forbidden?.includes('package-lock.json')!==true) throw new Error('assignment drift');
+          const req=`${body.slice(0,s)}${body.slice(e+em.length)}`.replace(/\r\n?/g,'\n').split('\n').map(x=>x.replace(/[ \t]+$/g,'')).join('\n').trim();
+          const sort=v=>Array.isArray(v)?v.map(sort):v&&typeof v==='object'?Object.fromEntries(Object.entries(v).sort(([a],[b])=>a.localeCompare(b)).map(([k,x])=>[k,sort(x)])):v;
+          const digest='sha256:'+crypto.createHash('sha256').update(JSON.stringify(sort({requirements:req,spec:m.spec})),'utf8').digest('hex');
+          if(digest!=='sha256:d68ce1214ed0aee5e8d1cad0539d535ef2c9d7ce90ea1a74be06359e0c6953e1') throw new Error(`work-spec drift: ${digest}`);
+          NODE
+      - name: Apply current QA repairs
+        run: python3 control/.github/work18-current-repair.py work
+      - name: Verify scope
+        run: |
+          cd work
+          git diff --check
+          test -z "$(git diff --name-only -- package-lock.json)"
+          git diff --name-only | sort
+      - name: Typecheck
+        run: cd work && npm run check
+      - name: Test
+        run: cd work && npm test
+      - name: Build
+        run: cd work && npm run build
+      - name: Commit validated repair
+        run: |
+          cd work
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add AGENTS.md README.md docs/leader-chat.md src/core/submissions.ts src/core/integration-status.ts .github/workflows/fugue-integration.yml .github/workflows/fugue-control-plane.yml tests/integration-plan.test.ts tests/state-authority-blockers.test.ts
+          git diff --cached --check
+          test -z "$(git diff --cached --name-only -- package-lock.json)"
+          git commit -m 'Close current provenance and Integration recovery blockers'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+      - name: Record result
+        if: success()
+        run: |
+          cd control
+          git pull --ff-only origin bootstrap/work18-worker-repair-20260818-4 || true
+          echo "run_id=${{ github.run_id }}" > .github/work18-current-result.txt
+          echo "status=success" >> .github/work18-current-result.txt
+          echo "worker_head=$(git -C ../work rev-parse HEAD)" >> .github/work18-current-result.txt
+          echo "work_spec_digest=sha256:d68ce1214ed0aee5e8d1cad0539d535ef2c9d7ce90ea1a74be06359e0c6953e1" >> .github/work18-current-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-current-result.txt
+          git commit -m 'Record current work-18 repair result' || exit 0
+          git push origin HEAD:bootstrap/work18-worker-repair-20260818-4
+
+  record-failure:
+    needs: apply
+    if: always() && needs.apply.result == 'failure' && contains(github.event.head_commit.message, '[work18-current-apply]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-worker-repair-20260818-4
+      - run: |
+          echo "run_id=${{ github.run_id }}" > .github/work18-current-result.txt
+          echo "status=failure" >> .github/work18-current-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-current-result.txt
+          git commit -m 'Record failed current work-18 repair' || exit 0
+          git push origin HEAD:bootstrap/work18-worker-repair-20260818-4
