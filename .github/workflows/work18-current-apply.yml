@@ -48,24 +48,24 @@ jobs:
         run: |
           python3 control/.github/work18-current-repair.py work
           python3 control/.github/work18-current-fix.py work
-      - name: Verify scope
+      - name: Verify full repaired tree before publication split
         run: |
           cd work
           git diff --check
           test -z "$(git diff --name-only -- package-lock.json)"
-          git diff --name-only | sort
-      - name: Typecheck
+      - name: Typecheck full repaired tree
         run: cd work && npm run check
-      - name: Test
+      - name: Test full repaired tree
         run: cd work && npm test
-      - name: Build
+      - name: Build full repaired tree
         run: cd work && npm run build
-      - name: Commit validated repair
+      - name: Publish non-workflow portion
         run: |
           cd work
+          git restore -- .github/workflows/fugue-control-plane.yml .github/workflows/fugue-integration.yml
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-          git add AGENTS.md README.md docs/leader-chat.md src/core/submissions.ts src/core/integration-status.ts .github/workflows/fugue-integration.yml .github/workflows/fugue-control-plane.yml tests/integration-plan.test.ts tests/state-authority-blockers.test.ts
+          git add AGENTS.md README.md src/core/submissions.ts src/core/integration-status.ts tests/integration-plan.test.ts tests/state-authority-blockers.test.ts
           git diff --cached --check
           test -z "$(git diff --cached --name-only -- package-lock.json)"
           git commit -m 'Close current provenance and Integration recovery blockers'
