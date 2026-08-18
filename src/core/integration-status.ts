@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { z } from "zod";
 import { type IntegrationAttestation } from "./attestations.js";
 import { sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
@@ -75,6 +75,21 @@ const INTEGRATION_ELECTION_PREFIX = "FUGUE_INT_E_";
 const INTEGRATION_ANCHOR_PREFIX = "FUGUE_INT_A_";
 const INTEGRATION_RUN_START_PREFIX = "FUGUE_INT_S_";
 export const INTEGRATION_AUTHORITY_SLOT_LIMIT = 64;
+
+
+export function integrationDispatchRunToken(requestId: string, dispatchSecret: string): string {
+  if (!/^int-[0-9a-f]{16}-[0-9a-f]{16}$/.test(requestId) || !/^[0-9a-f]{64}$/i.test(dispatchSecret)) {
+    throw new Error("Invalid Integration run-correlation input.");
+  }
+  return createHmac("sha256", Buffer.from(dispatchSecret, "hex"))
+    .update(`fugue-integration-run\0${requestId}`, "utf8")
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function integrationRunTitleWithToken(request: IntegrationRequest, token: string): string {
+  return `${integrationRunTitle(request.request_id, request.identity.prNumber)} ${token}`;
+}
 
 export class IntegrationAuthorityCapacityPendingError extends Error {
   constructor(message: string) {
@@ -456,6 +471,7 @@ export async function currentIntegrationState(
     return { state: "pending", request, targetUrl: live.htmlUrl };
   }
 
+  if (record.dispatch_started_at) return { state: "pending", request };
   const created = Date.parse(request.created_at);
   if (!Number.isFinite(created)) return { state: "error", request };
   return now - created >= INTEGRATION_REQUEST_RECOVERY_GRACE_MS
@@ -483,7 +499,7 @@ export async function sealIntegrationWorkflowRunEvent(
 ): Promise<boolean> {
   if (!event || event.workflowName !== "Fugue Integration" || event.runAttempt !== 1 ||
       event.actor !== "github-actions[bot]" || event.status !== "completed") return false;
-  const match = event.displayTitle.match(/^Fugue Integration PR #(\d+) (int-[0-9a-f]{16}-[0-9a-f]{16})$/);
+  const match = event.displayTitle.match(/^Fugue Integration PR #(\d+) (int-[0-9a-f]{16}-[0-9a-f]{16})(?: ([0-9a-f]{24}))?$/);
   if (!match?.[1] || !match[2]) return false;
   const prNumber = Number(match[1]);
   if (!Number.isInteger(prNumber) || prNumber <= 0) return false;
@@ -513,7 +529,16 @@ export async function sealIntegrationWorkflowRunEvent(
     return false;
   }
   const evidence = record.run ? undefined : await getIntegrationRunStartEvidence(github, record);
-  const binding = record.run ?? (evidence ? integrationRunBindingFromEvidence(github, evidence) : undefined);
+  let binding = record.run ?? (evidence ? integrationRunBindingFromEvidence(github, evidence) : undefined);
+  if (!binding && match[3] && record.dispatch && record.dispatch_started_at) {
+    const anchorBody = await getFugueAuthorityVariable(github, record.dispatch.anchor_name);
+    const anchor = anchorBody ? await verifyIntegrationDispatchAnchor(github, record, anchorBody) : undefined;
+    if (!anchor || integrationDispatchRunToken(record.request.request_id, anchor.dispatch_secret) !== match[3]) return false;
+    const eventCreated = Date.parse(event.createdAt);
+    const minimumCreated = Math.max(Date.parse(record.request.created_at), Date.parse(record.dispatch_started_at));
+    if (!Number.isFinite(eventCreated) || !Number.isFinite(minimumCreated) || eventCreated < minimumCreated) return false;
+    binding = { id: event.runId, attempt: 1, created_at: event.createdAt, html_url: event.htmlUrl };
+  }
   if (!binding || binding.id !== event.runId) return false;
   const createdAt = new Date().toISOString();
   if (event.conclusion === "cancelled") {
@@ -566,24 +591,34 @@ export async function getCurrentIntegrationRecord(
   github: FugueGitHub,
   identity: IntegrationRequest["identity"],
 ): Promise<IntegrationRecord | undefined> {
-  const recovered = await recoverDurableProtocolRecord(github, {
-    storageSha: identity.headSha,
-    publisherSha: identity.baseSha,
-    scope: integrationScope(identity.prNumber),
-    issueNumber: identity.prNumber,
-    parse: parseIntegrationRecord,
-    timestamp: (value) => Date.parse(value.created_at),
-    order: (value) => value.created_at,
-    validate: (value) => sameEvaluationIdentity(value.identity, identity),
-  });
-  if (recovered.record) {
-    await replaceIntegrationLocator(github, recovered.record.value);
-    return recovered.record.value;
+  let lastPending: DurableProtocolRecoveryPendingError | undefined;
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    try {
+      const recovered = await recoverDurableProtocolRecord(github, {
+        storageSha: identity.headSha,
+        publisherSha: identity.baseSha,
+        scope: integrationScope(identity.prNumber),
+        issueNumber: identity.prNumber,
+        parse: parseIntegrationRecord,
+        timestamp: (value) => Date.parse(value.created_at),
+        order: (value) => value.created_at,
+        validate: (value) => sameEvaluationIdentity(value.identity, identity),
+      });
+      if (recovered.record) {
+        await replaceIntegrationLocator(github, recovered.record.value);
+        return recovered.record.value;
+      }
+      if (recovered.exhausted) return undefined;
+      throw new DurableProtocolRecoveryPendingError(
+        `PR #${identity.prNumber} Integration authority recovery is progressing through bounded status history.`,
+      );
+    } catch (error) {
+      if (!(error instanceof DurableProtocolRecoveryPendingError)) throw error;
+      lastPending = error;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
   }
-  if (recovered.exhausted) return undefined;
-  throw new DurableProtocolRecoveryPendingError(
-    `PR #${identity.prNumber} Integration authority recovery is progressing through bounded status history.`,
-  );
+  throw lastPending ?? new DurableProtocolRecoveryPendingError("Protected Integration authority remained busy.");
 }
 
 export async function publishIntegrationRecord(
@@ -605,6 +640,9 @@ export async function publishIntegrationRecord(
       JSON.stringify(current.dispatch) !== JSON.stringify(record.dispatch)) {
     throw new Error(`Integration request ${record.request.request_id} cannot replace its protected dispatch authorization.`);
   }
+  if (current?.dispatch_started_at && record.dispatch_started_at !== current.dispatch_started_at) {
+    throw new Error(`Integration request ${record.request.request_id} cannot clear or replace its durable dispatch-start boundary.`);
+  }
   if (current?.run && record.run && current.run.id !== record.run.id) {
     throw new Error(`Integration request ${record.request.request_id} is already bound to protected run ${current.run.id}.`);
   }
@@ -625,6 +663,24 @@ export async function publishIntegrationRecord(
   await replaceIntegrationLocator(github, normalized);
   if (normalized.terminal) await releaseIntegrationAuthorityVariable(github, normalized);
   return normalized;
+}
+
+export async function markIntegrationDispatchStarted(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+  requestId: string,
+  startedAt = new Date().toISOString(),
+): Promise<IntegrationRecord> {
+  const current = await getCurrentIntegrationRecord(github, snapshot.identity);
+  if (!current || current.request.request_id !== requestId || current.terminal || !current.dispatch) {
+    throw new Error(`Integration request ${requestId} is not an active authorized dispatch.`);
+  }
+  if (current.dispatch_started_at) return current;
+  return publishIntegrationRecord(github, {
+    ...current,
+    dispatch_started_at: startedAt,
+    created_at: startedAt,
+  });
 }
 
 export async function ensureIntegrationDispatch(
@@ -702,15 +758,22 @@ export async function ensureIntegrationDispatch(
         return { request: current.request, dispatch: false };
       }
     } else if (!evidence) {
-      const created = Date.parse(current.request.created_at);
+      const created = Date.parse(current.dispatch_started_at ?? current.request.created_at);
       if (!Number.isFinite(created) || now - created < INTEGRATION_REQUEST_RECOVERY_GRACE_MS) {
+        return { request: current.request, dispatch: false };
+      }
+      if (current.dispatch_started_at) {
+        // Crossing the durable dispatch-creation boundary is irreversible. Without exact run-start,
+        // returned-run binding, or the authenticated completion event we cannot prove whether GitHub
+        // created the attempt, so remain pending forever rather than silently converting possible
+        // attempt-1 failure into abort/retry. The workflow_run event can still seal the exact run ID.
         return { request: current.request, dispatch: false };
       }
       await publishIntegrationRecord(github, {
         ...current,
         terminal: {
           state: "aborted",
-          detail: "Authorized Integration dispatch never crossed its protected run-start boundary; transport may recover with a fresh request.",
+          detail: "Authorized Integration dispatch never crossed its protected dispatch-creation boundary; transport may recover with a fresh request.",
           created_at: new Date(now).toISOString(),
         },
         created_at: new Date(now).toISOString(),
@@ -864,10 +927,12 @@ function workflowRun(run: WorkflowRunRecord): IntegrationWorkflowRun {
 
 function matchesIntegrationRunIdentity(run: WorkflowRunRecord, request: IntegrationRequest, requestCreated: number): boolean {
   const runCreated = Date.parse(run.created_at ?? "");
+  const baseTitle = integrationRunTitle(request.request_id, request.identity.prNumber);
+  const titleMatches = run.display_title === baseTitle ||
+    new RegExp(`^${baseTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} [0-9a-f]{24}$`).test(run.display_title);
   return isTrustedProtocolWorkflowRun(run) &&
     run.event === "workflow_dispatch" &&
-    run.head_sha === request.identity.baseSha &&
-    run.display_title === integrationRunTitle(request.request_id, request.identity.prNumber) &&
+    run.head_sha === request.identity.baseSha && titleMatches &&
     Number.isFinite(runCreated) && runCreated >= requestCreated;
 }
 

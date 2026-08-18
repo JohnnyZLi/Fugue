@@ -48,6 +48,7 @@ export const integrationRecordSchema = z.object({
   identity: evaluationIdentitySchema,
   request: integrationRequestSchema,
   dispatch: integrationDispatchAuthorizationSchema.nullable().default(null),
+  dispatch_started_at: z.string().min(1).nullable().default(null),
   run: integrationRunBindingSchema.nullable(),
   terminal: integrationTerminalSchema.nullable(),
   created_at: z.string().min(1),
@@ -121,6 +122,7 @@ export function createIntegrationRecord(
   request: IntegrationRequest,
   input: {
     dispatch?: IntegrationDispatchAuthorization | null;
+    dispatchStartedAt?: string | null;
     run?: IntegrationRunBinding | null;
     terminal?: IntegrationRecord["terminal"];
     createdAt?: string;
@@ -132,6 +134,7 @@ export function createIntegrationRecord(
     identity: request.identity,
     request,
     dispatch: input.dispatch ?? null,
+    dispatch_started_at: input.dispatchStartedAt ?? null,
     run: input.run ?? null,
     terminal: input.terminal ?? null,
     created_at: input.createdAt ?? new Date().toISOString(),

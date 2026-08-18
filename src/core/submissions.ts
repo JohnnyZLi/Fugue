@@ -7,6 +7,7 @@ import {
   humanControlPlaneAttestationSchema,
   parseAttestation,
   serializeAttestation,
+  type HumanControlPlaneAttestation,
   type QaRole,
 } from "./attestations.js";
 import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
@@ -277,34 +278,36 @@ export async function recordHumanControlPlaneAcknowledgement(
   );
 }
 
-export async function hasCurrentHumanAcknowledgement(
+export async function currentHumanAcknowledgement(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
-): Promise<boolean> {
+): Promise<HumanControlPlaneAttestation | undefined> {
   const durable = await recoverHumanAcknowledgementAuthority(github, snapshot);
-  if (durable) return true;
+  if (durable) return durable;
 
   const { owner, repo } = github.repository;
   const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
-    owner,
-    repo,
-    issue_number: snapshot.pr.number,
-    per_page: 100,
+    owner, repo, issue_number: snapshot.pr.number, per_page: 100,
   });
-
   for (const comment of comments) {
     if (!(await isTrustedProtocolComment(github, comment))) continue;
     try {
       const value = parseAttestation(comment.body ?? "");
-      if (value?.kind !== "human_control_plane") continue;
-      if (!sameEvaluationIdentity(value.identity, snapshot.identity)) continue;
+      if (value?.kind !== "human_control_plane" || !sameEvaluationIdentity(value.identity, snapshot.identity)) continue;
       await publishHumanAcknowledgementAuthority(github, snapshot, value);
-      return true;
+      return value;
     } catch {
       // Historical malformed evidence is not current acknowledgement.
     }
   }
-  return false;
+  return undefined;
+}
+
+export async function hasCurrentHumanAcknowledgement(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+): Promise<boolean> {
+  return Boolean(await currentHumanAcknowledgement(github, snapshot));
 }
 
 function humanIdentityToken(snapshot: EvaluationSnapshot): string {

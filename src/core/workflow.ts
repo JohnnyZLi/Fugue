@@ -1,12 +1,12 @@
-import { parseAttestation, type QaRole } from "./attestations.js";
+import { type QaRole } from "./attestations.js";
 import { currentRequiredCiState, type RequiredCiState } from "./ci.js";
-import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
+import { captureEvaluation } from "./evaluation.js";
 import { IntegrationGateFailure, verifyBaseCurrent } from "./gates.js";
 import type { FugueGitHub } from "./github.js";
 import { currentIntegrationState, type IntegrationState } from "./integration-status.js";
 import { resolveOwnership } from "./ownership.js";
-import { isTrustedProtocolComment } from "./provenance.js";
 import { currentReviewActivities } from "./reviews.js";
+import { hasCurrentHumanAcknowledgement } from "./submissions.js";
 import type { WorkState } from "./state.js";
 
 export type QaWorkflowState = "none" | "pending" | "approved" | "changes_requested" | "error";
@@ -181,7 +181,7 @@ export async function observeWork(github: FugueGitHub, work: WorkState): Promise
     qa,
     controlPlaneChanged: snapshot.qa.controlPlaneChanged,
     humanControlPlaneAcknowledged: snapshot.qa.controlPlaneChanged
-      ? await hasCurrentHumanControlPlaneAcknowledgement(github, snapshot)
+      ? await hasCurrentHumanAcknowledgement(github, snapshot)
       : false,
     integration: (await currentIntegrationState(github, snapshot)).state,
   };
@@ -211,29 +211,4 @@ function roleLabel(role: QaRole): string {
   if (role === "code") return "Code QA";
   if (role === "security") return "Security QA";
   return "Visual QA";
-}
-
-async function hasCurrentHumanControlPlaneAcknowledgement(
-  github: FugueGitHub,
-  snapshot: EvaluationSnapshot,
-): Promise<boolean> {
-  const { owner, repo } = github.repository;
-  const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
-    owner,
-    repo,
-    issue_number: snapshot.pr.number,
-    per_page: 100,
-  });
-
-  for (const comment of comments) {
-    if (!(await isTrustedProtocolComment(github, comment))) continue;
-    try {
-      const value = parseAttestation(comment.body ?? "");
-      if (value?.kind !== "human_control_plane") continue;
-      if (sameEvaluationIdentity(value.identity, snapshot.identity)) return true;
-    } catch {
-      // Invalid historical evidence is not a current acknowledgement.
-    }
-  }
-  return false;
 }

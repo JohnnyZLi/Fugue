@@ -7,8 +7,9 @@ import { workMetadataSchema } from "../src/core/metadata.js";
 import { ingestCoordinatorIssueEvent } from "../src/core/reconcile.js";
 import { currentReviewActivities } from "../src/core/reviews.js";
 import { hasCurrentHumanAcknowledgement } from "../src/core/submissions.js";
+import { verifyHumanControlPlanePrerequisite } from "../src/core/integration.js";
 import { createIntegrationRecord, createIntegrationRequest } from "../src/core/integration-plan.js";
-import { authorizeIntegrationDispatch, bindDispatchedIntegrationRun, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, publishIntegrationRecord, sealIntegrationWorkflowRunEvent } from "../src/core/integration-status.js";
+import { authorizeIntegrationDispatch, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, integrationDispatchRunToken, markIntegrationDispatchStarted, publishIntegrationRecord, sealIntegrationWorkflowRunEvent } from "../src/core/integration-status.js";
 import { humanControlPlaneAttestationSchema, qaAttestationSchema, reviewStartSchema, serializeAttestation } from "../src/core/attestations.js";
 import {
   assertRepositoryDefaultBranchRevision,
@@ -22,6 +23,7 @@ import {
   canonicalRequirements,
   compactFugueRecoveryAuthorityVariables,
   createCanonicalWorkState,
+  DurableProtocolRecoveryPendingError,
   loadCurrentCanonicalWorkState,
   parseCanonicalWorkState,
   publishCanonicalWorkState,
@@ -513,8 +515,70 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     github.__beforeRevisionCheck = undefined;
     expect(recoveryScopes(github).has("guarded-create-race")).toBe(false);
     expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3GT_"))).toBe(false);
-    expect(github.__authorityVariables.get("FUGUE_D3GI_00")).toBe("reserved-for-fugue-recovery-mutation-guard");
+    expect(github.__authorityVariables.get("FUGUE_D3GI_00")).toMatch(
+      /^reserved-for-fugue-recovery-mutation-guard(?::[0-9a-f]{32})?$/,
+    );
     expect(github.__authorityVariables.get("FUGUE_D3R_00")).toBe("reserved-for-fugue-recovery-compaction");
+  });
+
+  it("invalidates a reader that passed idle immediately before a provisional writer acquires the guard", async () => {
+    const github = makeGithub();
+    const firstOrder = "2026-08-17T08:15:00.000Z";
+    await publishDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: "guard-precheck-reader",
+      unsignedBody: "committed-before-race", publicationTimestamp: Date.parse(firstOrder), authorityOrder: firstOrder,
+    });
+
+    let releaseReader!: () => void;
+    let readerReached!: () => void;
+    const readerGate = new Promise<void>((resolve) => { releaseReader = resolve; });
+    const readerPaused = new Promise<void>((resolve) => { readerReached = resolve; });
+    let pausedOnce = false;
+    vi.mocked(verifyProtocolPublicationBodyAtRevision).mockImplementation(async (candidateGithub, body, expected) => {
+      const cursor = recoveryCursorBody(body);
+      if (!pausedOnce && cursor?.scope === "guard-precheck-reader" && cursor.commit_witness === true) {
+        pausedOnce = true;
+        readerReached();
+        await readerGate;
+      }
+      return defaultPublicationVerifier(candidateGithub, body, expected);
+    });
+
+    const reader = recoverDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: "guard-precheck-reader", issueNumber: 18,
+      parse: (body) => body, timestamp: () => Date.parse(firstOrder), order: () => firstOrder,
+    });
+    await readerPaused;
+
+    let releaseWriter!: () => void;
+    let writerReached!: () => void;
+    const writerGate = new Promise<void>((resolve) => { releaseWriter = resolve; });
+    const writerPaused = new Promise<void>((resolve) => { writerReached = resolve; });
+    let writerHeld = false;
+    github.__beforeRevisionCheck = async () => {
+      if (writerHeld || ![...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3GT_"))) return;
+      const provisional = [...github.__authorityVariables.keys()].some((name) =>
+        /^FUGUE_D3_[0-9A-F]{16}_[0-9A-F]{16}$/i.test(name) &&
+        recoveryCursorBody(github.__authorityVariables.get(name) ?? "")?.scope === "guard-precheck-reader");
+      if (!provisional) return;
+      writerHeld = true;
+      writerReached();
+      await writerGate;
+    };
+    const secondOrder = "2026-08-17T08:16:00.000Z";
+    const writer = publishDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: "guard-precheck-reader",
+      unsignedBody: "provisional-must-never-be-observed", publicationTimestamp: Date.parse(secondOrder), authorityOrder: secondOrder,
+    });
+    await writerPaused;
+    github.__baseSha = NEXT_BASE;
+    releaseReader();
+    await expect(reader).rejects.toBeInstanceOf(DurableProtocolRecoveryPendingError);
+    releaseWriter();
+    await expect(writer).rejects.toThrow(/stale protected revision/);
+    github.__beforeRevisionCheck = undefined;
+    vi.mocked(verifyProtocolPublicationBodyAtRevision).mockImplementation(defaultPublicationVerifier);
+    expect(recoveryCheckpointBodies(github).some((body) => body.includes("provisional-must-never-be-observed"))).toBe(false);
   });
 
   it("recovers accepted QA and Human evidence from d3 after every presentation comment is deleted", async () => {
@@ -538,9 +602,12 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     const after = await currentReviewActivities(github, snapshot);
     expect(after.get("code")?.completed?.attestation_id).toBe(qa.attestation_id);
     await expect(hasCurrentHumanAcknowledgement(github, snapshot)).resolves.toBe(true);
+    await expect(verifyHumanControlPlanePrerequisite(github, snapshot)).resolves.toMatchObject({
+      attestation_id: human.attestation_id, verdict: "acknowledged",
+    });
   });
 
-  it("seals a genuine protected attempt-1 failure even when it completes before custom run-start evidence", async () => {
+  it("recovers dispatch-created attempt 1 after d3 bind loss and seals pre-run-start failure", async () => {
     const github = makeGithub();
     const identity = {
       prNumber: 19, headSha: "a".repeat(40), baseBranch: "main", baseSha: BASE,
@@ -549,25 +616,36 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     };
     const snapshot = { identity, pr: { number: 19 } } as unknown as EvaluationSnapshot;
     const request = createIntegrationRequest(identity, "2026-08-17T08:30:00.000Z", "1".repeat(16));
-    const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T08:30:00.000Z", undefined);
+    const secret = "2".repeat(64);
+    const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T08:30:00.000Z", secret);
     await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
       dispatch: authorized.authorization, createdAt: "2026-08-17T08:30:00.000Z",
     }));
-    await bindDispatchedIntegrationRun(
-      github, snapshot, authorized.request.request_id, 4242,
-      "https://github.com/JohnnyZLi/Fugue/actions/runs/4242", "2026-08-17T08:30:30.000Z",
-    );
-    expect(await getIntegrationRunStartEvidence(github, (await getCurrentIntegrationRecord(github, identity))!)).toBeUndefined();
+    await markIntegrationDispatchStarted(github, snapshot, authorized.request.request_id, "2026-08-17T08:30:10.000Z");
+    const beforeFailure = (await getCurrentIntegrationRecord(github, identity))!;
+    expect(beforeFailure.run).toBeNull();
+    expect(await getIntegrationRunStartEvidence(github, beforeFailure)).toBeUndefined();
+
+    const runToken = integrationDispatchRunToken(authorized.request.request_id, secret);
+    const displayTitle = `Fugue Integration PR #19 ${authorized.request.request_id} ${runToken}`;
     await expect(sealIntegrationWorkflowRunEvent(github, {
       eventName: "workflow_run", workflowName: "Fugue Integration", runId: 4242, runAttempt: 1,
-      conclusion: "failure", status: "completed", headSha: BASE,
-      displayTitle: `Fugue Integration PR #19 ${authorized.request.request_id}`,
+      conclusion: "failure", status: "completed", headSha: BASE, displayTitle,
       createdAt: "2026-08-17T08:31:00.000Z", htmlUrl: "https://github.com/JohnnyZLi/Fugue/actions/runs/4242",
       actor: "github-actions[bot]",
     })).resolves.toBe(true);
     const terminal = await getCurrentIntegrationRecord(github, identity);
     expect(terminal?.run?.id).toBe(4242);
     expect(terminal?.terminal?.state).toBe("failure");
+
+    // Once the original exact run is terminal, a later same-token run can never replace it.
+    await expect(sealIntegrationWorkflowRunEvent(github, {
+      eventName: "workflow_run", workflowName: "Fugue Integration", runId: 4243, runAttempt: 1,
+      conclusion: "success", status: "completed", headSha: BASE, displayTitle,
+      createdAt: "2026-08-17T08:32:00.000Z", htmlUrl: "https://github.com/JohnnyZLi/Fugue/actions/runs/4243",
+      actor: "github-actions[bot]",
+    })).resolves.toBe(false);
+    expect((await getCurrentIntegrationRecord(github, identity))?.run?.id).toBe(4242);
   });
 
 });

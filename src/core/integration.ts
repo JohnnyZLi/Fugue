@@ -1,7 +1,6 @@
 import {
   createAttestationId,
   integrationAttestationSchema,
-  parseAttestation,
   serializeAttestation,
   type HumanControlPlaneAttestation,
   type IntegrationAttestation,
@@ -28,8 +27,9 @@ import {
 import { getCurrentIntegrationRecord, publishIntegrationRecord } from "./integration-status.js";
 import { assertOwnership } from "./ownership.js";
 import { FUGUE_CLI_VERSION } from "./protocol.js";
-import { createProtocolComment, escapeProtocolMarkers, isTrustedProtocolComment } from "./provenance.js";
+import { createProtocolComment, escapeProtocolMarkers } from "./provenance.js";
 import { currentQaAttestations } from "./reviews.js";
+import { currentHumanAcknowledgement } from "./submissions.js";
 
 const INTEGRATION_FAILURE_START = "<!-- fugue-integration-failure";
 const MARKER_END = "-->";
@@ -320,17 +320,7 @@ async function verifyPrerequisites(
     }
   }
 
-  let humanAcknowledgement: HumanControlPlaneAttestation | null = null;
-  if (snapshot.qa.controlPlaneChanged) {
-    humanAcknowledgement = await findCurrentHumanAcknowledgement(github, snapshot);
-    if (!humanAcknowledgement) {
-      throw new IntegrationGateFailure(
-        "control-plane",
-        "Control-plane changes require a current head-bound Human acknowledgement.",
-      );
-    }
-  }
-
+  const humanAcknowledgement = await verifyHumanControlPlanePrerequisite(github, snapshot);
   return { qa, codeAttestation, humanAcknowledgement };
 }
 
@@ -359,32 +349,19 @@ function qaGate(
   return attestations.get(role)?.verdict === "approved" ? "passed" : "not_required";
 }
 
-async function findCurrentHumanAcknowledgement(
+export async function verifyHumanControlPlanePrerequisite(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
 ): Promise<HumanControlPlaneAttestation | null> {
-  const { owner, repo } = github.repository;
-  const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
-    owner,
-    repo,
-    issue_number: snapshot.pr.number,
-    per_page: 100,
-  });
-
-  let current: HumanControlPlaneAttestation | null = null;
-  for (const comment of comments) {
-    if (!(await isTrustedProtocolComment(github, comment))) continue;
-    let parsed;
-    try {
-      parsed = parseAttestation(comment.body ?? "");
-    } catch {
-      continue;
-    }
-    if (parsed?.kind !== "human_control_plane") continue;
-    if (!sameEvaluationIdentity(parsed.identity, snapshot.identity)) continue;
-    current = parsed;
+  if (!snapshot.qa.controlPlaneChanged) return null;
+  const acknowledgement = await currentHumanAcknowledgement(github, snapshot);
+  if (!acknowledgement) {
+    throw new IntegrationGateFailure(
+      "control-plane",
+      "Control-plane changes require a current head-bound Human acknowledgement.",
+    );
   }
-  return current;
+  return acknowledgement;
 }
 
 function truncate(value: string, max: number): string {
