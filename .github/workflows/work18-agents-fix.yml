@@ -1,0 +1,54 @@
+name: Work 18 Focused AGENTS Repair
+
+on:
+  push:
+    branches: [bootstrap/work18-worker-repair-20260818-4]
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  fix:
+    if: contains(github.event.head_commit.message, '[work18-agents-fix]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+      - name: Confirm exact post-restore Worker head and unchanged Issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "a64aa9b09acd02c4a70510aff026a20393be9d9d"
+          test "$(gh api repos/JohnnyZLi/Fugue/issues/18 --jq .updated_at)" = "2026-08-18T04:28:24Z"
+      - name: Replace only invariants 30 and 31
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('AGENTS.md')
+          lines=p.read_text().splitlines()
+          replacements={
+            '30. ': "30. Protected Integration never records attempt existence before the workflow-dispatch POST creates a run. The protected `prepare` job references `fugue-authority` with a request/run-correlation environment URL, causing GitHub itself to persist a deployment/status carrying the exact run ID before any in-job environment audit or Authority App token-mint step. Recovery derives the expected correlation token from the one-use Authority-anchor secret, requires two identical complete scans of that protected environment-deployment history, and chooses the globally lowest matching run ID; mutable workflow-run pages and the public token/title are never binding authority. The deployment witness survives shared `actions:write` deletion of the Actions run, so a created-but-unbound attempt cannot become a pre-POST abort/retry and a later replay cannot replace it. If no matching deployment exists after a stable recovery grace window, only then may never-created transport abort/retry; once a deployment/run-start/returned binding exists, disappearance fails closed to terminal failure unless cancellation was actually observed.",
+            '31. ': "31. Every Human control-plane acknowledgement consumer—including hosted Integration prepare/finalize and final merge-readiness planning—resolves the exact current acknowledgement from protected d3 authority. A PR comment is only a repairable mirror and deleting it cannot change a gate result. QA/Human request comments are authoritative only when GraphQL creation provenance shows no editor/`lastEditedAt`; edited bodies are rejected rather than attributed to their original author. Rejected/stale/conflicting/untrusted submissions are reduced to finite semantic rejection classes and recorded before any optional receipt in a fixed-size d3 Bloom filter scoped to the exact evaluation identity. Legacy ID-only/raw-fingerprint receipts remain presentation/migration history and cannot suppress a distinct valid submission; hostile IDs, whitespace, summaries, or presentation variants cannot grow durable rejection authority without bound.",
+          }
+          seen={key:0 for key in replacements}
+          out=[]
+          for line in lines:
+            matched=False
+            for prefix,value in replacements.items():
+              if line.startswith(prefix):
+                seen[prefix]+=1; out.append(value); matched=True; break
+            if not matched: out.append(line)
+          if seen != {'30. ':1,'31. ':1}: raise SystemExit(f'unexpected invariant counts: {seen}')
+          p.write_text('\n'.join(out)+'\n')
+          PY
+          git diff --check
+          test "$(git diff --name-only)" = "AGENTS.md"
+      - name: Publish focused AGENTS repair
+        run: |
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add AGENTS.md
+          git commit -m 'Document current submission and Integration authority boundaries'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
