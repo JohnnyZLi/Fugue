@@ -1,4 +1,4 @@
-name: Work18 Cleanup Lifecycle Exact Head
+name: Work18 Cleanup Lifecycle Final Exact Head
 
 on:
   push:
@@ -6,74 +6,127 @@ on:
 
 jobs:
   repair:
-    if: contains(github.event.head_commit.message, '[cleanup-lifecycle-v1]')
+    if: contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v1]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
-          path: work
           fetch-depth: 1
-      - uses: actions/checkout@v4
-        with:
-          ref: bootstrap/work18-identity-lost-20260818
-          path: helper
-          fetch-depth: 1
-      - name: Prevalidate full repair and publish non-workflow files
-        working-directory: work
+      - name: Distinguish unresolved from resolved-empty current identities
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "e8ebca4f528c7e8657e6418448f551004e77fbaa"
+          test "$(git rev-parse HEAD)" = "6cfec15202464a5b8d0a0e0ad1a589f62675aae2"
           python <<'PY'
           from pathlib import Path
-          src = Path('../helper/.github/work18-cleanup-lifecycle-v1.py').read_text()
-          src = src.replace('''  const expectedUrl = `https://github.com/${record.identity.prNumber ? "" : ""}`; // keep URL validation below repository-aware\n  void expectedUrl;\n''', '')
-          src = src.replace('''currentRequests.set(`${identity.prNumber}:${identity.headSha}:${identity.baseSha}:${identity.workSpecDigest}`, current.request.request_id);''', '''currentRequests.set(JSON.stringify([identity.prNumber, identity.headSha.toLowerCase(), identity.baseBranch, identity.baseSha.toLowerCase(), identity.policyDigest, identity.protocolVersion, identity.issueNumber, identity.workId, identity.workSpecDigest]), current.request.request_id);''')
-          src = src.replace('''currentRequests.get(`${currentIdentity.prNumber}:${currentIdentity.headSha}:${currentIdentity.baseSha}:${currentIdentity.workSpecDigest}`)''', '''currentRequests.get(JSON.stringify([currentIdentity.prNumber, currentIdentity.headSha.toLowerCase(), currentIdentity.baseBranch, currentIdentity.baseSha.toLowerCase(), currentIdentity.policyDigest, currentIdentity.protocolVersion, currentIdentity.issueNumber, currentIdentity.workId, currentIdentity.workSpecDigest]))''')
-          src = src.replace('''s = replace_once(s, old, new, "work historical reclaim")''', '''\nif old not in s:\n    raise SystemExit("missing anchor: work historical reclaim")\ns = s.replace(old, new, 1)''')
-          src = src.replace('''s = replace_once(s, old, new, "authorize current identity")''', '''\nif old not in s:\n    raise SystemExit("missing anchor: authorize current identity")\ns = s.replace(old, new)''')
-          Path('/tmp/work18-cleanup-lifecycle-v1.py').write_text(src)
-          PY
-          python /tmp/work18-cleanup-lifecycle-v1.py
-          python <<'PY'
-          from pathlib import Path
-          path = Path('tests/state-authority-blockers.test.ts')
+          path = Path('src/core/integration-status.ts')
           text = path.read_text()
-          text = text.replace('''prNumber, headSha: headChar.repeat(40), baseBranch: "main", baseSha: BASE,''', '''prNumber, headSha: headChar.length === 1 ? headChar.repeat(40) : headChar, baseBranch: "main", baseSha: BASE,''')
-          text = text.replace('''return { ...seeded.identity, headSha: headChar.repeat(40), workSpecDigest: `sha256:spec-${headChar}` };''', '''return { ...seeded.identity, headSha: headChar.length === 1 ? headChar.repeat(40) : headChar, workSpecDigest: `sha256:spec-${headChar}` };''')
-          text = text.replace('''const headChar = (index % 15).toString(16);''', '''const headChar = index.toString(16).padStart(40, "0");''')
-          path.write_text(text)
+          old = '''async function reclaimHistoricalIntegrationAuthorityVariables(
+            github: FugueGitHub,
+            variables: Array<{ name: string; value: string }>,
+            now: number,
+            currentIdentities: IntegrationRequest["identity"][],
+          ): Promise<void> {
+            if (!currentIdentities.length) return;
+'''
+          new = '''async function reclaimHistoricalIntegrationAuthorityVariables(
+            github: FugueGitHub,
+            variables: Array<{ name: string; value: string }>,
+            now: number,
+            currentIdentities: IntegrationRequest["identity"][],
+          ): Promise<void> {
+'''
+          if old not in text: raise SystemExit('historical helper guard anchor missing')
+          text = text.replace(old, new, 1)
+          old = '''export async function reclaimOrphanIntegrationAuthorityVariables(
+            github: FugueGitHub,
+            now = Date.now(),
+            currentIdentities: IntegrationRequest["identity"][] = [],
+          ): Promise<void> {'''
+          new = '''export async function reclaimOrphanIntegrationAuthorityVariables(
+            github: FugueGitHub,
+            now = Date.now(),
+            currentIdentities?: IntegrationRequest["identity"][],
+          ): Promise<void> {'''
+          if old not in text: raise SystemExit('reclaim signature anchor missing')
+          text = text.replace(old, new, 1)
+          old = '  await reclaimHistoricalIntegrationAuthorityVariables(github, variables, now, currentIdentities);\n'
+          new = '  if (currentIdentities !== undefined) await reclaimHistoricalIntegrationAuthorityVariables(github, variables, now, currentIdentities);\n'
+          if old not in text: raise SystemExit('historical call anchor missing')
+          path.write_text(text.replace(old, new, 1))
           PY
-          changed="$(git diff --name-only | sort)"
-          expected="$(printf '%s\n' '.github/workflows/fugue-integration.yml' 'AGENTS.md' 'src/core/integration-status.ts' 'src/core/reconcile.ts' 'tests/integration-plan.test.ts' 'tests/state-authority-blockers.test.ts' | sort)"
-          test "$changed" = "$expected"
+          test "$(git diff --name-only)" = "src/core/integration-status.ts"
           ! git diff --name-only | grep -Fx package-lock.json
           git diff --check
           npm ci
           npm run check
           npm test
           npm run build
-          cp .github/workflows/fugue-integration.yml ../helper/.github/work18-fugue-integration-candidate.txt
-          git -C ../helper config user.name Johnny
-          git -C ../helper config user.email 92900710+JohnnyZLi@users.noreply.github.com
-          git -C ../helper add .github/work18-fugue-integration-candidate.txt
-          git -C ../helper commit -m 'Stage validated Integration workflow body' || true
-          git -C ../helper push origin HEAD:bootstrap/work18-identity-lost-20260818
-          git restore .github/workflows/fugue-integration.yml
-          changed="$(git diff --name-only | sort)"
-          expected="$(printf '%s\n' 'AGENTS.md' 'src/core/integration-status.ts' 'src/core/reconcile.ts' 'tests/integration-plan.test.ts' 'tests/state-authority-blockers.test.ts' | sort)"
-          test "$changed" = "$expected"
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-          git add AGENTS.md src/core/integration-status.ts src/core/reconcile.ts tests/integration-plan.test.ts tests/state-authority-blockers.test.ts
+          git add src/core/integration-status.ts
           git diff --cached --check
-          git commit -m 'Repair Integration cleanup lifecycle core'
+          git commit -m 'Finish historical Integration cleanup with empty current set'
           git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
-          partial="$(git rev-parse HEAD)"
-          git -C ../helper pull --ff-only origin bootstrap/work18-identity-lost-20260818
-          printf 'partial_sha=%s\nwork_spec_digest=%s\n' "$partial" 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > ../helper/.github/work18-cleanup-lifecycle-partial.txt
-          git -C ../helper add .github/work18-cleanup-lifecycle-partial.txt
-          git -C ../helper commit -m 'Record cleanup lifecycle partial head' || true
-          git -C ../helper push origin HEAD:bootstrap/work18-identity-lost-20260818
+      - id: head
+        name: Resolve final exact head
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: repair
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ""
+      GH_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.repair.outputs.sha }}
+          persist-credentials: false
+      - name: Confirm detached exact head and no publication credential
+        env:
+          EXPECTED_SHA: ${{ needs.repair.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git symbolic-ref -q HEAD || true)"
+          test -z "$(git config --local --get-regexp 'http.*extraheader' || true)"
+          test -z "$GITHUB_TOKEN"
+          test -z "$GH_TOKEN"
+          ! git diff --name-only e8ebca4f528c7e8657e6418448f551004e77fbaa HEAD | grep -Fx package-lock.json
+          test ! -e src/core/integration-commit.ts
+          test ! -e tests/integration-terminal-serialization.test.ts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  record:
+    needs: [repair, test]
+    if: always() && contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v1]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-identity-lost-20260818
+      - name: Record result
+        run: |
+          set -euo pipefail
+          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '${{ needs.repair.outputs.sha }}' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-cleanup-lifecycle-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-cleanup-lifecycle-result.txt
+          git commit -m 'Record cleanup lifecycle final validation' || exit 0
+          git push origin HEAD:bootstrap/work18-identity-lost-20260818
