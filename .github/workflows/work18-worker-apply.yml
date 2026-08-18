@@ -1,4 +1,4 @@
-# worker-apply v6
+# worker-apply v7
 name: Work 18 Worker Apply
 
 on:
@@ -51,6 +51,8 @@ jobs:
         run: python3 control/.github/work18-worker-patch.py work
       - name: Refine generated implementation
         run: python3 control/.github/work18-worker-refine-run.py control/.github/work18-worker-fix-generated.py work
+      - name: Fix durable review helpers
+        run: python3 control/.github/work18-worker-fix3.py work
       - run: cd work && npm ci
       - name: Compute current canonical Issue work-spec digest
         env:
