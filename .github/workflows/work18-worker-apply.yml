@@ -1,4 +1,4 @@
-# worker-apply v5
+# worker-apply v6
 name: Work 18 Worker Apply
 
 on:
@@ -50,7 +50,7 @@ jobs:
       - name: Apply current absorbed blockers
         run: python3 control/.github/work18-worker-patch.py work
       - name: Refine generated implementation
-        run: python3 control/.github/work18-worker-fix-generated.py work
+        run: python3 control/.github/work18-worker-refine-run.py control/.github/work18-worker-fix-generated.py work
       - run: cd work && npm ci
       - name: Compute current canonical Issue work-spec digest
         env:
