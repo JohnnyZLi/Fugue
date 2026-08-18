@@ -1,0 +1,241 @@
+---500-570---
+   500	      await assertRepositoryDefaultBranchRevision(github, input.publisherSha);
+   501	      const manifestResponse = await github.octokit.rest.repos.createCommitStatus({
+   502	        owner,
+   503	        repo,
+   504	        sha: input.storageSha,
+   505	        state: "success",
+   506	        context: bundle.manifest.context,
+   507	        description: `n=${bundle.data.length};c=${nonce};b=${bodyDigest};a=${firstStatusId};z=${lastStatusId}`,
+   508	        target_url: manifestTarget,
+   509	      });
+   510	
+   511	      // The status manifest is still only prospective transport. Re-prove the current protected
+   512	      // default-branch revision after GitHub assigns its exact server ID and before any Authority
+   513	      // witness can be signed or persisted.
+   514	      await assertRepositoryDefaultBranchRevision(github, input.publisherSha);
+   515	
+   516	      // A status-only manifest is prospective transport, not committed d3 authority. The protected
+   517	      // Authority App certifies the exact server-assigned manifest/chunk identity in a signed,
+   518	      // write-once witness before publication is allowed to succeed. Readers therefore never need
+   519	      // a moving reverse-chronological page coordinate to discover committed authority.
+   520	      const committedManifest = recoveryManifestSchema.parse({
+   521	        id: manifestResponse.data.id,
+   522	        key,
+   523	        nonce,
+   524	        body_digest: bodyDigest,
+   525	        authority_order_b64: Buffer.from(input.authorityOrder, "utf8").toString("base64url"),
+   526	        first_status_id: firstStatusId,
+   527	        last_status_id: lastStatusId,
+   528	        chunk_count: bundle.data.length,
+   529	        status_ids: writtenIds,
+   530	        proof: manifestProof,
+   531	        created_at: manifestResponse.data.created_at,
+   532	      });
+   533	      const recoveryIdentityOptions: RecoveryIdentityOptions = {
+   534	        storageSha: input.storageSha,
+   535	        publisherSha: input.publisherSha,
+   536	        scope: input.scope,
+   537	      };
+   538	      const previous = await findRecoveryCursorForPublisher(github, recoveryIdentityOptions);
+   539	      let bestManifest = committedManifest;
+   540	      let bestSignedBody = signedBody;
+   541	      if (previous?.cursor.commit_witness && previous.cursor.best_manifest && previous.cursor.best_body_b64) {
+   542	        const previousSignedBody = Buffer.from(previous.cursor.best_body_b64, "base64url").toString("utf8");
+   543	        const manifestComparison = compareManifest(previous.cursor.best_manifest, committedManifest);
+   544	        if (manifestComparison > 0) {
+   545	          bestManifest = previous.cursor.best_manifest;
+   546	          bestSignedBody = previousSignedBody;
+   547	        } else if (manifestComparison === 0) {
+   548	          if (logicalAuthorityBody(previousSignedBody) !== input.unsignedBody) {
+   549	            throw new CanonicalWorkStateIntegrityError(
+   550	              `Conflicting protected durable bodies share authority order ${input.authorityOrder}.`,
+   551	            );
+   552	          }
+   553	          // Equal logical authority is the same protocol version. Keep the already durable witness
+   554	          // instead of letting transport manifest ID or completion order choose between retries.
+   555	          bestManifest = previous.cursor.best_manifest;
+   556	          bestSignedBody = previousSignedBody;
+   557	        }
+   558	      }
+   559	      const completeTopId = Math.max(previous?.cursor.complete_top_id ?? 0, committedManifest.id);
+   560	      await writeRecoveryCursor(github, recoveryIdentityOptions, recoveryCursorSchema.parse({
+   561	        version: 1,
+   562	        kind: "durable_recovery",
+   563	        scope: input.scope,
+   564	        storage_sha: input.storageSha,
+   565	        publisher_sha: input.publisherSha,
+   566	        complete_top_id: completeTopId,
+   567	        scan_top_id: completeTopId,
+   568	        scan_floor_id: completeTopId,
+   569	        before_id: completeTopId + 1,
+   570	        page: 1,
+---1450-1535---
+  1450	        }
+  1451	        const cursor = await verifyRecoveryCursorBody(github, signedBody);
+  1452	        if (cursor) verified.push({ sourceVariableName: variable.name, signedBody, cursor });
+  1453	        else sourceFullyVerified = false;
+  1454	      }
+  1455	      // A readable pack is rewrite-safe only when every member revalidates. Valid siblings remain
+  1456	      // readable for winner selection, but a transiently unverifiable sibling quarantines the whole
+  1457	      // source from rename/delete/compaction so its only durable copy cannot be destroyed.
+  1458	      if (sourceFullyVerified) compactableSources.add(variable.name);
+  1459	      continue;
+  1460	    }
+  1461	    const cursor = await verifyRecoveryCursorBody(github, variable.value);
+  1462	    if (!cursor || recoveryCursorBucket(cursor) !== bucket) {
+  1463	      // Verification can fail transiently (for example while provenance/JWKS reads are unavailable).
+  1464	      // This protected source may be the sole committed witness, so never delete it on read failure.
+  1465	      continue;
+  1466	    }
+  1467	    verified.push({ sourceVariableName: variable.name, signedBody: variable.value, cursor });
+  1468	    compactableSources.add(variable.name);
+  1469	  }
+  1470	  return { entries: verified, compactableSources };
+  1471	}
+  1472	
+  1473	async function captureRecoveryReadEpoch(github: FugueGitHub): Promise<string> {
+  1474	  if (await recoverInterruptedRecoveryMutation(github)) {
+  1475	    throw new DurableProtocolRecoveryPendingError("Protected recovery mutation is still provisional; committed authority remains fenced.");
+  1476	  }
+  1477	  const epoch = await ensureRecoveryMutationGuardIdle(github);
+  1478	  if (!epoch || (await activeRecoveryMutationGuards(github)).length ||
+  1479	      await getFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_IDLE) !== epoch) {
+  1480	    throw new DurableProtocolRecoveryPendingError("Protected recovery authority changed while the reader was starting.");
+  1481	  }
+  1482	  return epoch;
+  1483	}
+  1484	
+  1485	async function assertRecoveryReadEpoch(github: FugueGitHub, epoch: string): Promise<void> {
+  1486	  if ((await activeRecoveryMutationGuards(github)).length ||
+  1487	      await getFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_IDLE) !== epoch) {
+  1488	    throw new DurableProtocolRecoveryPendingError(
+  1489	      "Protected recovery authority changed during the read; retry from a fresh committed epoch.",
+  1490	    );
+  1491	  }
+  1492	}
+  1493	
+  1494	async function findRecoveryCursorForPublisher(
+  1495	  github: FugueGitHub,
+  1496	  options: RecoveryIdentityOptions,
+  1497	): Promise<{ variableName: string; cursor: RecoveryCursor } | undefined> {
+  1498	  let lastPending: DurableProtocolRecoveryPendingError | undefined;
+  1499	  for (let attempt = 0; attempt < RECOVERY_COMPACTION_RETRY_LIMIT; attempt += 1) {
+  1500	    try { return await findRecoveryCursor(github, options); }
+  1501	    catch (error) {
+  1502	      if (!(error instanceof DurableProtocolRecoveryPendingError)) throw error;
+  1503	      lastPending = error;
+  1504	      await Promise.resolve();
+  1505	    }
+  1506	  }
+  1507	  throw lastPending ?? new DurableProtocolRecoveryPendingError("Protected recovery authority remained busy during publication.");
+  1508	}
+  1509	
+  1510	async function findRecoveryCursor(
+  1511	  github: FugueGitHub,
+  1512	  options: RecoveryIdentityOptions,
+  1513	): Promise<{ variableName: string; cursor: RecoveryCursor } | undefined> {
+  1514	  const readEpoch = await captureRecoveryReadEpoch(github);
+  1515	  const identity = recoveryOptionsIdentity(options);
+  1516	  let best: VerifiedRecoveryEntry | undefined;
+  1517	  const variables = await listFugueAuthorityVariables(github, "FUGUE_D3");
+  1518	  const bucket = await verifiedRecoveryEntriesForBucket(github, recoveryOptionsBucket(options), variables);
+  1519	  for (const entry of bucket.entries) {
+  1520	    if (recoveryIdentity(entry.cursor) !== identity) continue;
+  1521	    if (best && recoveryAuthorityConflict(entry.cursor, best.cursor)) {
+  1522	      await assertRecoveryReadEpoch(github, readEpoch);
+  1523	      throw new CanonicalWorkStateIntegrityError(
+  1524	        `Conflicting protected durable witnesses share one authority order for ${options.scope}.`,
+  1525	      );
+  1526	    }
+  1527	    if (!best || compareRecoveryProgress(entry.cursor, best.cursor) > 0 ||
+  1528	        (compareRecoveryProgress(entry.cursor, best.cursor) === 0 &&
+  1529	          recoveryBodyTieBreak(entry.signedBody) < recoveryBodyTieBreak(best.signedBody))) {
+  1530	      best = entry;
+  1531	    }
+  1532	  }
+  1533	  await assertRecoveryReadEpoch(github, readEpoch);
+  1534	  return best ? { variableName: best.sourceVariableName, cursor: best.cursor } : undefined;
+  1535	}
+---800-860 integration---
+   790	  }), anchorBody))) {
+   791	    await abandonIntegrationAuthorization(github, authorized.electionName, authorized.request);
+   792	    return { dispatch: false };
+   793	  }
+   794	
+   795	  let afterElection = await getCurrentIntegrationRecord(github, snapshot.identity);
+   796	  const predecessorStillCurrent = predecessorRequestId
+   797	    ? afterElection?.request.request_id === predecessorRequestId && afterElection.terminal?.state === "aborted"
+   798	    : afterElection === undefined;
+   799	  if (afterElection && afterElection.request.request_id === authorized.request.request_id && !afterElection.terminal) {
+   800	    // A concurrent protected writer already published the elected request; converge on it.
+   801	  } else if (!predecessorStillCurrent) {
+   802	    await abandonIntegrationAuthorization(github, authorized.electionName, authorized.request);
+   803	    return afterElection ? { request: afterElection.request, dispatch: false } : { dispatch: false };
+   804	  } else {
+   805	    afterElection = await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+   806	      dispatch: authorized.authorization,
+   807	      createdAt: authorized.authorization.authorized_at,
+   808	    }));
+   809	  }
+   810	  const confirmed = await getCurrentIntegrationRecord(github, snapshot.identity);
+   811	  if (!confirmed || confirmed.request.request_id !== authorized.request.request_id || confirmed.terminal) {
+   812	    await abandonIntegrationAuthorization(github, authorized.electionName, authorized.request);
+   813	    return confirmed ? { request: confirmed.request, dispatch: false } : { dispatch: false };
+   814	  }
+   815	  await retireIntegrationElection(github, authorized.electionName);
+   816	  await createProtocolComment(
+   817	    github,
+   818	    snapshot.identity.prNumber,
+   819	    `INTEGRATION — REQUESTED\n\nHead: \`${snapshot.identity.headSha}\`\nRequest: \`${authorized.request.request_id}\`\n\n<!-- fugue-integration-request-mirror\nversion: 1\nrequest_id: ${authorized.request.request_id}\n-->`,
+   820	  );
+   821	  return {
+   822	    request: confirmed.request,
+   823	    dispatch: true,
+   824	    dispatchSecret: authorized.secret,
+   825	    authorityAnchor: authorized.authorization.anchor_name,
+   826	  };
+   827	}
+   828	
+   829	export async function bindIntegrationRun(
+   830	  github: FugueGitHub,
+   831	  snapshot: EvaluationSnapshot,
+   832	  requestId: string,
+   833	  runId: number,
+   834	): Promise<IntegrationRecord> {
+   835	  const current = await getCurrentIntegrationRecord(github, snapshot.identity);
+   836	  if (!current || current.request.request_id !== requestId || current.terminal) {
+   837	    throw new Error(`Integration run ${runId} does not match an active durable request ${requestId}.`);
+   838	  }
+   839	  if (current.run) {
+   840	    if (current.run.id !== runId) throw new Error(`Integration request ${requestId} is already bound to protected run ${current.run.id}.`);
+   841	    await releaseIntegrationAuthorityVariable(github, current);
+   842	    return current;
+   843	  }
+   844	  const evidence = await getIntegrationRunStartEvidence(github, current);
+   845	  if (!evidence || evidence.run_id !== runId) {
+   846	    throw new Error(`Integration run ${runId} does not match the one-use protected dispatch evidence for request ${requestId}.`);
+   847	  }
+   848	  const bound = await publishIntegrationRecord(github, {
+   849	    ...current,
+   850	    run: integrationRunBindingFromEvidence(github, evidence),
+   851	    created_at: new Date().toISOString(),
+   852	  });
+   853	  await releaseIntegrationAuthorityVariable(github, bound);
+   854	  return bound;
+   855	}
+   856	
+   857	export async function bindDispatchedIntegrationRun(
+   858	  github: FugueGitHub,
+   859	  snapshot: EvaluationSnapshot,
+   860	  requestId: string,
+   861	  runId: number,
+   862	  htmlUrl: string,
+   863	  createdAt = new Date().toISOString(),
+   864	): Promise<IntegrationRecord> {
+   865	  if (!Number.isInteger(runId) || runId <= 0 || !htmlUrl) throw new Error("Protected Integration dispatch did not return a valid run identity.");
+   866	  const current = await getCurrentIntegrationRecord(github, snapshot.identity);
+   867	  if (!current || current.request.request_id !== requestId || current.terminal || !current.dispatch) {
+   868	    throw new Error(`Integration run ${runId} does not match an active authorized durable request ${requestId}.`);
+   869	  }
+   870	  if (current.run) {
