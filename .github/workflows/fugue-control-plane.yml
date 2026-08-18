@@ -166,6 +166,12 @@ jobs:
               throw new Error(`Unable to create protected Integration variable ${name} (${response.status}).`);
             }
           }
+          async function deleteVariable(name) {
+            const response = await request(`/actions/variables/${encodeURIComponent(name)}`, { method: 'DELETE' });
+            if (response.status !== 204 && response.status !== 404) {
+              throw new Error(`Unable to delete protected Integration variable ${name} (${response.status}).`);
+            }
+          }
 
           const fenceRaw = await readVariable(fenceName, true);
           // A durable exact binding or terminal authority may already have committed and reclaimed F.
@@ -211,6 +217,18 @@ jobs:
               committed.anchor_name !== fence.anchor_name || committed.run_id !== runId || committed.run_attempt !== 1 ||
               !Number.isFinite(Date.parse(String(committed.run_created_at ?? ''))) || committed.html_url !== htmlUrl) {
             throw new Error('Protected Integration request-local commit was already claimed by another run.');
+          }
+
+          // Cleanup removes F before C. Re-read F after winning/recovering C so an already-running
+          // workflow_run consumer cannot recreate C/B after terminal cleanup has invalidated the
+          // request. A missing F makes this delayed exact writer inert and self-reclaims C.
+          const fenceAfterCommit = await readVariable(fenceName, true);
+          if (fenceAfterCommit === null) {
+            await deleteVariable(commitName);
+            process.exit(0);
+          }
+          if (fenceAfterCommit !== fenceRaw) {
+            throw new Error('Protected Integration dispatch fence changed across exact-run serialization.');
           }
 
           const witness = {
