@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: JohnnyZLi/Fugue
-          ref: 5a28968a8463e39cb009e2f9537b3498808fe84a
+          ref: 630fadfd409f08d3f75c99b9b0c25c342520d7a7
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -44,7 +44,7 @@ jobs:
           cat > .github/work18-exact-validation-result.txt <<EOF
           run_id=${{ github.run_id }}
           test_result=${{ needs.test.result }}
-          validated_sha=5a28968a8463e39cb009e2f9537b3498808fe84a
+          validated_sha=630fadfd409f08d3f75c99b9b0c25c342520d7a7
           EOF
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
