@@ -699,8 +699,12 @@ export async function recoverExistingProtectedIntegration(
     if (current.terminal.state === "identity_lost") {
       await releaseIntegrationAuthorityVariable(github, current);
       await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
+      return true;
     }
-    return true;
+    await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
+    // A genuinely aborted no-fence transport remains the existing retryable case. The revised
+    // no-retry rule is specific to identity_lost and must not suppress fresh-request recovery here.
+    return current.terminal.state !== "aborted";
   }
   if (current.run) {
     await cleanupProtectedIntegrationRecovery(github, current.request.request_id);

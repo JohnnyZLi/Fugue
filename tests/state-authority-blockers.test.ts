@@ -1227,4 +1227,30 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     });
   });
 
+
+  it("preserves hosted fresh-request recovery for a genuinely aborted no-fence transport", async () => {
+    await withHostedAuthority(async () => {
+      const github = makeGithub();
+      const identity = {
+        prNumber: 23, headSha: "3".repeat(40), baseBranch: "main", baseSha: BASE,
+        policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
+        workSpecDigest: "sha256:revised-spec",
+      };
+      const snapshot = { identity, pr: { number: 23 } } as unknown as EvaluationSnapshot;
+      const request = createIntegrationRequest(identity, "2026-08-17T15:00:00.000Z", "3".repeat(16));
+      const aborted = await publishIntegrationRecord(github, createIntegrationRecord(request, {
+        terminal: { state: "aborted", detail: "provably no protected attempt-1 run was created", created_at: "2026-08-17T15:11:00.000Z" },
+        createdAt: "2026-08-17T15:11:00.000Z",
+      }));
+
+      await expect(recoverExistingProtectedIntegration(
+        github, snapshot, Date.parse("2026-08-17T15:12:00.000Z"),
+      )).resolves.toBe(false);
+      const next = await ensureIntegrationDispatch(github, snapshot, Date.parse("2026-08-17T15:12:00.000Z"));
+      expect(next.dispatch).toBe(true);
+      expect(next.request?.request_id).not.toBe(aborted.request.request_id);
+      expect((await getCurrentIntegrationRecord(github, identity))?.request.request_id).toBe(next.request?.request_id);
+    });
+  });
+
 });
