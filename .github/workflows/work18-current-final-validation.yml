@@ -1,0 +1,56 @@
+name: Work 18 Current Final Validation 4
+
+on:
+  push:
+    branches: [bootstrap/work18-worker-repair-20260818-4]
+
+jobs:
+  test:
+    if: contains(github.event.head_commit.message, '[work18-current-final-validate]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ""
+      GH_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: JohnnyZLi/Fugue
+          ref: 08bdb2707cb5cf5cfc2562d3822762c4a96620a2
+          persist-credentials: false
+      - name: Confirm detached exact head
+        run: |
+          test "$(git rev-parse HEAD)" = "08bdb2707cb5cf5cfc2562d3822762c4a96620a2"
+          test "$(git symbolic-ref -q HEAD || true)" = ""
+          test -z "$(git config --local --get-regexp 'http.*extraheader' || true)"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  record:
+    needs: test
+    if: needs.test.result == 'success' && contains(github.event.head_commit.message, '[work18-current-final-validate]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-worker-repair-20260818-4
+      - name: Record exact validation result
+        run: |
+          echo "run_id=${{ github.run_id }}" > .github/work18-current-final-validation-result.txt
+          echo "test_result=${{ needs.test.result }}" >> .github/work18-current-final-validation-result.txt
+          echo "validated_sha=08bdb2707cb5cf5cfc2562d3822762c4a96620a2" >> .github/work18-current-final-validation-result.txt
+          echo "work_spec_digest=sha256:d68ce1214ed0aee5e8d1cad0539d535ef2c9d7ce90ea1a74be06359e0c6953e1" >> .github/work18-current-final-validation-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-current-final-validation-result.txt
+          git commit -m 'Record exact current work-18 validation' || exit 0
+          git push origin HEAD:bootstrap/work18-worker-repair-20260818-4
