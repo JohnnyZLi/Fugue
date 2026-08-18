@@ -1,0 +1,89 @@
+name: Work 18 Worker Apply
+
+on:
+  push:
+    branches:
+      - bootstrap/fugue-work18-validation
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  apply:
+    if: contains(github.event.head_commit.message, '[worker-apply]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/fugue-work18-validation
+          path: control
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+          path: work
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: work/package-lock.json
+      - name: Confirm exact Worker head
+        run: |
+          test "$(git -C work rev-parse HEAD)" = "630fadfd409f08d3f75c99b9b0c25c342520d7a7"
+      - name: Apply current absorbed blockers
+        run: python3 control/.github/work18-worker-patch.py work
+      - name: Compute current canonical Issue work-spec digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd work
+          node <<'NODE' | tee ../work-spec.txt
+          (async () => {
+            const crypto = require('node:crypto');
+            const YAML = require('yaml');
+            const issue = await fetch('https://api.github.com/repos/JohnnyZLi/Fugue/issues/18', { headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' } }).then(async r => { if (!r.ok) throw new Error(`${r.status} ${await r.text()}`); return r.json(); });
+            const body = issue.body ?? '';
+            const START = '<!-- fugue-work\n', END = '-->';
+            const start = body.lastIndexOf(START), end = body.indexOf(END, start + START.length);
+            if (start < 0 || end < 0 || body.slice(end + END.length).trim()) throw new Error('bad work metadata block');
+            const metadata = YAML.parse(body.slice(start + START.length, end).trim());
+            const requirements = body.slice(0, start).replace(/\r\n?/g, '\n').split('\n').map(line => line.replace(/[ \t]+$/g, '')).join('\n').trim();
+            const canonical = { requirements, spec: metadata.spec };
+            const sortValue = value => Array.isArray(value) ? value.map(sortValue) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).sort(([a],[b]) => a.localeCompare(b)).map(([k,v]) => [k, sortValue(v)])) : value;
+            const digest = `sha256:${crypto.createHash('sha256').update(JSON.stringify(sortValue(canonical)), 'utf8').digest('hex')}`;
+            console.log(`CURRENT_WORK_SPEC_DIGEST=${digest}`);
+            console.log(`ISSUE_UPDATED_AT=${issue.updated_at}`);
+            console.log(`WORKER_ID=${metadata.execution.worker_id}`);
+            console.log(`WORKER_BRANCH=${metadata.execution.branch}`);
+            console.log(`STATE_AUTHORITY_TEST_OWNED=${metadata.spec.ownership.owned.includes('tests/state-authority-blockers.test.ts')}`);
+          })().catch(error => { console.error(error); process.exit(1); });
+          NODE
+      - run: cd work && npm ci
+      - run: cd work && npm run check
+      - run: cd work && npm test
+      - run: cd work && npm run build
+      - name: Commit Worker changes
+        run: |
+          cd work
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add AGENTS.md README.md docs/leader-chat.md src/core/state.ts src/core/reconcile.ts src/core/reviews.ts src/core/submissions.ts src/core/integration-status.ts tests/state-authority-blockers.test.ts
+          git diff --cached --check
+          git commit -m 'Close newly absorbed QA authority blockers'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+          git rev-parse HEAD | tee ../worker-head.txt
+      - name: Record apply result
+        if: always()
+        run: |
+          cd control
+          {
+            echo "run_id=${{ github.run_id }}"
+            echo "job_status=${{ job.status }}"
+            test -f ../worker-head.txt && echo "worker_head=$(cat ../worker-head.txt)" || true
+            test -f ../work-spec.txt && cat ../work-spec.txt || true
+          } > .github/work18-worker-apply-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-worker-apply-result.txt
+          git commit -m 'Record work-18 worker apply result' || exit 0
+          git push origin HEAD:bootstrap/fugue-work18-validation
