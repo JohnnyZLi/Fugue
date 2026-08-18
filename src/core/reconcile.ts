@@ -645,9 +645,13 @@ export async function cleanupTerminalProtectedIntegrationRecovery(
   snapshot: Awaited<ReturnType<typeof captureEvaluation>>,
 ): Promise<boolean> {
   const current = await getCurrentIntegrationRecord(github, snapshot.identity);
-  if (!current || current.terminal?.state !== "identity_lost") return false;
-  // Durable d3 terminal authority already exists. Every delete below is request-specific and idempotent;
+  const durableCleanupAuthority = Boolean(current && (
+    current.run || current.terminal?.state === "identity_lost"
+  ));
+  if (!current || !durableCleanupAuthority) return false;
+  // Durable d3 run/terminal authority already exists. Every delete below is request-specific and idempotent;
   // a crash at any point can only leave redundant transient state for the next reconciliation to remove.
+  // releaseIntegrationAuthorityVariable preserves F -> A -> B -> S -> C ordering with C last.
   await releaseIntegrationAuthorityVariable(github, current);
   await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
   return true;
@@ -696,17 +700,21 @@ export async function recoverExistingProtectedIntegration(
   let current = await getCurrentIntegrationRecord(github, snapshot.identity);
   if (!current) return false;
   if (current.terminal) {
-    if (current.terminal.state === "identity_lost") {
+    if (current.terminal.state !== "aborted" || current.run) {
+      // Durable terminal authority (known L or identity_lost) makes every request-local producer
+      // transient. Resume the full F/A/B/S/C cleanup after any crash; C remains last.
       await releaseIntegrationAuthorityVariable(github, current);
       await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
       return true;
     }
+    // A genuinely aborted no-fence/no-attempt transport remains the sole retryable case.
     await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
-    // A genuinely aborted no-fence transport remains the existing retryable case. The revised
-    // no-retry rule is specific to identity_lost and must not suppress fresh-request recovery here.
-    return current.terminal.state !== "aborted";
+    return false;
   }
   if (current.run) {
+    // Exact L is already durable in d3. Re-run the complete cleanup so delayed B/S publication
+    // or a prior crash between deletion steps cannot strand A/B/C/F/S authority slots.
+    await releaseIntegrationAuthorityVariable(github, current);
     await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
     return true;
   }
