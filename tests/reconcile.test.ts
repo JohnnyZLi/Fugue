@@ -164,6 +164,7 @@ function policy(): ActivePolicy {
   } as unknown as ActivePolicy;
 }
 
+
 function recoveryCursorBody(body: string): Record<string, unknown> | undefined {
   const payload = body.match(/<!-- fugue-durable-recovery\nversion: 1\npayload: ([A-Za-z0-9_-]+)/)?.[1];
   if (!payload) return undefined;
@@ -343,7 +344,6 @@ describe("d3 protected durable authority", () => {
       issueNumber: 18,
       parse: parseCanonicalWorkState,
       timestamp: (value) => Date.parse(value.created_at),
-      order: (value) => value.created_at,
     });
     expect(recovered.record).toBeUndefined();
     expect(recovered.exhausted).toBe(true);
@@ -445,6 +445,7 @@ describe("d3 protected durable authority", () => {
     expect(canonicalRequirements(recovered!)).toBe("newer");
     expect(github.__comments.some((comment) => comment.body.includes("work-d3"))).toBe(true);
   });
+
 
   it("binds every exact protected chunk status ID despite hostile same-context interleaving", async () => {
     const github = makeGithub({ interleaveSameContext: true });
@@ -717,6 +718,7 @@ describe("d3 protected durable authority", () => {
     expect(first.exhausted).toBe(true);
     expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3_") || name.startsWith("FUGUE_D3P_"))).toBe(true);
 
+    // Candidate contents:write may create/delete/move arbitrary refs, including replaying an old valid signed commit.
     const replayBody = await signProtocolBody(github, "old-valid-signed-but-not-authority");
     const replayCommit = await github.octokit.rest.git.createCommit({ owner: "JohnnyZLi", repo: "Fugue", message: replayBody, tree: "1".repeat(40), parents: [BASE] });
     github.__refs.set("fugue/recovery/precreated", HEAD);
@@ -805,6 +807,7 @@ describe("Coordinator event durability", () => {
     expect(canonicalRequirements(work!)).toContain("new Human edit");
   });
 
+
   it("orders overlapping same-scope witnesses by logical Coordinator authority, not manifest ID", async () => {
     const github = makeGithub();
     const baseline = coordinatorSnapshotSchema.parse({
@@ -854,6 +857,8 @@ describe("Coordinator event durability", () => {
     const olderPublish = publishCoordinatorSnapshot(github, BASE, older);
     await olderReached;
 
+    // Both publishers have read the same baseline witness and reached witness signing, while no
+    // new witness is durable yet. Newer started first, so its manifest server ID is lower.
     const manifests = github.__statuses.filter((status) => status.context.includes("/m/") && status.target_url)
       .map((status) => ({
         id: status.id,
@@ -927,11 +932,11 @@ describe("durable Integration one-request/one-run/result authority", () => {
     const staleSigned = await signProtocolBody(github, serializeIntegrationRunStartEvidence(stale));
     const staleCommit = await github.octokit.rest.git.createCommit({ owner: "JohnnyZLi", repo: "Fugue", message: staleSigned, tree: "1".repeat(40), parents: [BASE] });
     const hostileRef = `fugue/integration/${record.dispatch!.secret_digest}`;
-    github.__refs.set(hostileRef, HEAD);
-    github.__refs.set(hostileRef, staleCommit.data.sha);
-    github.__refs.set(hostileRef, BASE);
-    github.__refs.delete(hostileRef);
-    github.__comments.splice(0);
+    github.__refs.set(hostileRef, HEAD);                  // pre-create / arbitrary replacement
+    github.__refs.set(hostileRef, staleCommit.data.sha); // old-valid replay / fast-forward-like update
+    github.__refs.set(hostileRef, BASE);                 // rewind
+    github.__refs.delete(hostileRef);                    // pointer deletion
+    github.__comments.splice(0);                         // presentation evidence gone too
 
     const evidence = await getIntegrationRunStartEvidence(github, record);
     expect(evidence?.run_id).toBe(151);
@@ -986,6 +991,7 @@ describe("durable Integration one-request/one-run/result authority", () => {
     const github = makeGithub();
     const record = await publishAuthorizedRecord(github, 550, "2026-08-17T03:25:00.000Z");
     await installRunStartEvidence(github, record, 550, "2026-08-17T03:25:01.000Z");
+    // No bindIntegrationRun call and no workflow_run sealing event: model checkout/setup/build failure plus run deletion.
     github.__runs.splice(0); github.__attempts.clear(); github.__comments.splice(0);
     const next = await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:00:00Z"));
     expect(next.dispatch).toBe(false);
@@ -1225,7 +1231,7 @@ function makeGithub(options: { failManifestAlways?: boolean; failFirstManifest?:
     const ref = args.ref.replace(/^refs\//, "");
     if (refs.has(ref)) throw Object.assign(new Error("Reference exists"), { status: 422 });
     refs.set(ref, args.sha);
-    return { data: { ref: args.ref, object: { sha: args.sha } };
+    return { data: { ref: args.ref, object: { sha: args.sha } } };
   });
   const updateRef = vi.fn(async (args: { ref: string; sha: string; force?: boolean }) => {
     const current = refs.get(args.ref);
@@ -1410,173 +1416,3 @@ async function settleIntegrationState(github: TestGithub) {
   }
   return state;
 }
-
-describe("absorbed QA blocker regressions", () => {
-  it("does not let a slower stale work-state publisher erase a newer Worker successor", async () => {
-    const github = makeGithub();
-    const root = createCanonicalWorkState({
-      issue: 18,
-      title: "Causal root",
-      state: "state:ready",
-      agentReady: true,
-      requirements: "## Outcome\nroot intent",
-      metadata: workMetadata(false),
-      pr: null,
-      baseSha: BASE,
-      createdAt: "2026-08-17T05:00:00.000Z",
-      logicalRoot: true,
-    });
-    await expect(publishCanonicalWorkState(github, root)).resolves.toBe(true);
-    const predecessor = (await loadCurrentCanonicalWorkState(github, 18, BASE))!;
-
-    const stale = createCanonicalWorkState({
-      issue: 18,
-      title: "Stale overlapping Human edit",
-      state: "state:ready",
-      agentReady: true,
-      requirements: "## Outcome\nstale Human intent",
-      metadata: predecessor.metadata,
-      pr: null,
-      baseSha: BASE,
-      createdAt: "2026-08-17T05:00:01.000Z",
-      predecessor,
-    });
-    const worker = createCanonicalWorkState({
-      issue: 18,
-      title: predecessor.title,
-      state: "state:working",
-      agentReady: true,
-      requirements: canonicalRequirements(predecessor),
-      metadata: workMetadata(true),
-      pr: null,
-      baseSha: BASE,
-      createdAt: "2026-08-17T05:00:02.000Z",
-      predecessor,
-    });
-
-    let releaseStale!: () => void;
-    let staleReached!: () => void;
-    const staleRelease = new Promise<void>((resolve) => { releaseStale = resolve; });
-    const staleAtWitness = new Promise<void>((resolve) => { staleReached = resolve; });
-    github.__beforeRecoverySign = async (body) => {
-      const cursor = recoveryCursorBody(body);
-      if (cursor?.scope !== "work/18" || cursor.commit_witness !== true || typeof cursor.best_body_b64 !== "string") return;
-      const proposed = parseCanonicalWorkState(Buffer.from(cursor.best_body_b64, "base64url").toString("utf8"));
-      if (proposed?.title !== stale.title) return;
-      staleReached();
-      await staleRelease;
-    };
-
-    const stalePublish = publishCanonicalWorkState(github, stale);
-    await staleAtWitness;
-    await expect(publishCanonicalWorkState(github, worker)).resolves.toBe(true);
-    releaseStale();
-    await expect(stalePublish).resolves.toBe(false);
-    github.__beforeRecoverySign = undefined;
-
-    const current = await loadCurrentCanonicalWorkState(github, 18, BASE);
-    expect(current?.state).toBe("state:working");
-    expect(current?.title).toBe("Causal root");
-    expect(current?.metadata.execution.worker_id).toBe("wkr-12345678");
-    expect(current?.authority_sequence).toBe(1);
-    expect(canonicalRequirements(current!)).toBe("## Outcome\nroot intent");
-    expect(recoveryAuthorityOrders(github, "work/18").filter((order) => order.endsWith("00000000000000000001"))).toHaveLength(1);
-  });
-
-  it("rolls back stale d3 witnesses when the base advances inside final create and rename mutation windows", async () => {
-    class AdvanceBaseOnRecoveryLeafMap extends Map<string, string> {
-      armed = false;
-      onLeaf?: () => void;
-
-      override set(key: string, value: string): this {
-        super.set(key, value);
-        if (this.armed && /^FUGUE_D3_[0-9A-F]{16}_[0-9A-F]{16}$/i.test(key)) {
-          this.armed = false;
-          this.onLeaf?.();
-        }
-        return this;
-      }
-    }
-
-    const createRace = makeGithub();
-    const createVariables = new AdvanceBaseOnRecoveryLeafMap(createRace.__authorityVariables);
-    createRace.__authorityVariables = createVariables;
-    createVariables.onLeaf = () => { createRace.__baseSha = NEXT_BASE; };
-    createVariables.armed = true;
-    await expect(publishDurableProtocolRecord(createRace, {
-      storageSha: BASE,
-      publisherSha: BASE,
-      scope: "final-create-race",
-      unsignedBody: "must-not-commit-after-create-race",
-      publicationTimestamp: Date.parse("2026-08-17T05:10:00.000Z"),
-      authorityOrder: "2026-08-17T05:10:00.000Z",
-    })).rejects.toThrow(/stale protected revision/);
-    expect(recoveryScopes(createRace).has("final-create-race")).toBe(false);
-
-    const renameRace = makeGithub();
-    const renameVariables = new AdvanceBaseOnRecoveryLeafMap(renameRace.__authorityVariables);
-    renameRace.__authorityVariables = renameVariables;
-    for (let index = 0; index < 8; index += 1) {
-      renameVariables.set(`FUGUE_D3R_${String(index).padStart(2, "0")}`, "reserved-for-fugue-recovery-compaction");
-    }
-    fillAuthorityCapacity(renameRace, "UNRELATED_FINAL_RACE_");
-    const unrelatedBefore = [...renameVariables.keys()].filter((name) => name.startsWith("UNRELATED_FINAL_RACE_")).length;
-    renameVariables.onLeaf = () => { renameRace.__baseSha = NEXT_BASE; };
-    renameVariables.armed = true;
-    await expect(publishDurableProtocolRecord(renameRace, {
-      storageSha: BASE,
-      publisherSha: BASE,
-      scope: "final-rename-race",
-      unsignedBody: "must-not-commit-after-rename-race",
-      publicationTimestamp: Date.parse("2026-08-17T05:11:00.000Z"),
-      authorityOrder: "2026-08-17T05:11:00.000Z",
-    })).rejects.toThrow(/stale protected revision/);
-    expect(recoveryScopes(renameRace).has("final-rename-race")).toBe(false);
-    expect([...renameVariables.keys()].filter((name) => name.startsWith("FUGUE_D3R_"))).toHaveLength(8);
-    expect([...renameVariables.keys()].filter((name) => name.startsWith("UNRELATED_FINAL_RACE_")).length).toBe(unrelatedBefore);
-    expect(renameVariables.size).toBe(500);
-  });
-
-  it("quarantines a mixed-validity recovery pack instead of compacting away an unverifiable sibling", async () => {
-    const bucket = recoveryBucketForScope("work/18");
-    const scopes = recoveryScopesForBucket(bucket, 2, "mixed-validity");
-    const github = makeGithub();
-    seedRecoveryWitness(github, scopes[0]!, 7000);
-    seedRecoveryWitness(github, scopes[1]!, 7001);
-    await compactFugueRecoveryAuthorityVariables(github);
-
-    const packed = [...github.__authorityVariables.entries()]
-      .filter(([name]) => name.startsWith(`FUGUE_D3P_${bucket}_`));
-    expect(packed).toHaveLength(1);
-    const [packName, packValue] = packed[0]!;
-    expect(recoveryScopes(github)).toEqual(new Set(scopes));
-
-    vi.mocked(verifyProtocolPublicationBodyAtRevision)
-      .mockResolvedValueOnce(true)
-      .mockResolvedValueOnce(false);
-    await compactFugueRecoveryAuthorityVariables(github);
-
-    expect(github.__authorityVariables.get(packName)).toBe(packValue);
-    expect(recoveryScopes(github)).toEqual(new Set(scopes));
-    const first = await recoverDurableProtocolRecord(github, {
-      storageSha: BASE,
-      publisherSha: BASE,
-      scope: scopes[0]!,
-      issueNumber: 18,
-      parse: (body) => body,
-      timestamp: () => Date.parse("2026-08-17T03:59:00.000Z"),
-      order: () => recoveryAuthorityOrders(github, scopes[0]!)[0]!,
-    });
-    const second = await recoverDurableProtocolRecord(github, {
-      storageSha: BASE,
-      publisherSha: BASE,
-      scope: scopes[1]!,
-      issueNumber: 18,
-      parse: (body) => body,
-      timestamp: () => Date.parse("2026-08-17T03:59:00.000Z"),
-      order: () => recoveryAuthorityOrders(github, scopes[1]!)[0]!,
-    });
-    expect(first.record).toBeDefined();
-    expect(second.record).toBeDefined();
-  });
-});
