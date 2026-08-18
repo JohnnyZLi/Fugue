@@ -1,5 +1,5 @@
 from __future__ import annotations
-import pathlib, sys
+import pathlib, subprocess, sys
 
 root=pathlib.Path(sys.argv[1])
 p=root/'src/core/reviews.ts'
@@ -69,4 +69,5 @@ new='''    if (!value || !sameEvaluationIdentity(value.identity, snapshot.identi
 if old not in s: raise SystemExit('review activity narrowing anchor missing')
 s=s.replace(old,new,1)
 p.write_text(s)
-print('fixed durable review helpers')
+subprocess.check_call([sys.executable, str(pathlib.Path(__file__).with_name('work18-worker-fix4.py')), str(root)])
+print('fixed durable review helpers and guard lifecycle')
