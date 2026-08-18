@@ -1,0 +1,53 @@
+name: Work 18 Current Exact Head Validation
+
+on:
+  push:
+    branches:
+      - bootstrap/fugue-work18-validation
+
+jobs:
+  test:
+    if: contains(github.event.head_commit.message, '[exact-validate]')
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ""
+      GH_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: JohnnyZLi/Fugue
+          ref: d4320f18fa60e8ad78288dc8ab365bc929c6ec48
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  record:
+    needs: test
+    if: always() && contains(github.event.head_commit.message, '[exact-validate]')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/fugue-work18-validation
+      - name: Record exact validation identity
+        run: |
+          cat > .github/work18-exact-validation-current-result.txt <<EOF
+          run_id=${{ github.run_id }}
+          test_result=${{ needs.test.result }}
+          validated_sha=d4320f18fa60e8ad78288dc8ab365bc929c6ec48
+          EOF
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-exact-validation-current-result.txt
+          git commit -m 'Record current work-18 exact validation'
+          git push origin HEAD:bootstrap/fugue-work18-validation
