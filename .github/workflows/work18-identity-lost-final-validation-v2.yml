@@ -17,81 +17,39 @@ jobs:
         with:
           ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fetch-depth: 1
-      - name: Apply source/test terminal-state repair if needed
+      - name: Update crash-interrupted cleanup regression if needed
         run: |
           set -euo pipefail
-          if ! grep -q 'keeps known attempt cancellation terminal and refuses replacement after deletion' tests/reconcile.test.ts; then
+          if grep -q 'Simulate a crash immediately after durable terminal commit, before F/B cleanup.' tests/state-authority-blockers.test.ts; then
             python <<'PY'
           from pathlib import Path
-          import re
 
-          status_path = Path('src/core/integration-status.ts')
-          status = status_path.read_text()
-          status = status.replace(
-              'const INTEGRATION_RUN_START_PREFIX = "FUGUE_INT_S_";\nexport const INTEGRATION_AUTHORITY_SLOT_LIMIT = 64;',
-              'const INTEGRATION_RUN_START_PREFIX = "FUGUE_INT_S_";\nconst INTEGRATION_DISPATCH_FENCE_PREFIX = "FUGUE_INT_F_";\nconst INTEGRATION_BINDING_WITNESS_PREFIX = "FUGUE_INT_B_";\nexport const INTEGRATION_AUTHORITY_SLOT_LIMIT = 64;',
-              1,
-          )
-          needle = '''export function integrationRunStartVariableName(request: IntegrationRequest): string {\n  return `${INTEGRATION_RUN_START_PREFIX}${String(request.identity.prNumber).padStart(10, "0")}_${integrationRequestToken(request.request_id)}`;\n}\n'''
-          insert = needle + '''\nfunction integrationRecoverySuffix(requestId: string): string {\n  return createHash("sha256").update(requestId, "utf8").digest("hex").slice(0, 32).toUpperCase();\n}\n\nfunction integrationDispatchFenceName(requestId: string): string {\n  return `${INTEGRATION_DISPATCH_FENCE_PREFIX}${integrationRecoverySuffix(requestId)}`;\n}\n\nfunction integrationBindingWitnessName(requestId: string): string {\n  return `${INTEGRATION_BINDING_WITNESS_PREFIX}${integrationRecoverySuffix(requestId)}`;\n}\n'''
-          if needle not in status:
-              raise SystemExit('run-start helper insertion point missing')
-          status = status.replace(needle, insert, 1)
-          old_release = '''export async function releaseIntegrationAuthorityVariable(github: FugueGitHub, record: IntegrationRecord): Promise<void> {\n  if (!record.dispatch) return;\n  await deleteFugueAuthorityVariable(github, integrationRunStartVariableName(record.request));\n  await deleteFugueAuthorityVariable(github, record.dispatch.anchor_name);\n  await releaseIntegrationCommit(github, record.request.request_id);\n}\n'''
-          new_release = '''export async function releaseIntegrationAuthorityVariable(github: FugueGitHub, record: IntegrationRecord): Promise<void> {\n  if (!record.dispatch) return;\n  // Keep C as the request-local tombstone until every producer prerequisite/evidence slot is gone.\n  // A crash during cleanup therefore remains fail-closed; the next reconciliation repeats the same\n  // request-specific deletes and removes C last without reopening or rebinding the request.\n  await deleteFugueAuthorityVariable(github, integrationDispatchFenceName(record.request.request_id));\n  await deleteFugueAuthorityVariable(github, record.dispatch.anchor_name);\n  await deleteFugueAuthorityVariable(github, integrationBindingWitnessName(record.request.request_id));\n  await deleteFugueAuthorityVariable(github, integrationRunStartVariableName(record.request));\n  await releaseIntegrationCommit(github, record.request.request_id);\n}\n'''
-          if old_release not in status:
-              raise SystemExit('release function not found')
-          status = status.replace(old_release, new_release, 1)
-          status = status.replace(
-              '        await releaseIntegrationCommit(github, record.request.request_id);\n        return latest;',
-              '        await releaseIntegrationAuthorityVariable(github, latest);\n        return latest;',
-              1,
-          )
-          status = status.replace(
-              '      await releaseIntegrationCommit(github, record.request.request_id);\n      return bound;',
-              '      await releaseIntegrationAuthorityVariable(github, bound);\n      return bound;',
-              1,
-          )
-          status = status.replace(
-              '  await releaseIntegrationCommit(github, requestId);\n  return bound;',
-              '  await releaseIntegrationAuthorityVariable(github, bound);\n  return bound;',
-              1,
-          )
-          status_path.write_text(status)
-
-          tests_path = Path('tests/reconcile.test.ts')
-          tests = tests_path.read_text()
-          cancellation = '''  it("keeps known attempt cancellation terminal and refuses replacement after deletion", async () => {\n    const github = makeGithub();\n    const record = await publishAuthorizedRecord(github, 700, "2026-08-17T03:36:00.000Z");\n    await installRunStartEvidence(github, record, 700, "2026-08-17T03:36:01.000Z");\n    await expect(sealIntegrationWorkflowRunEvent(github, completionEvent(record.request, 700, "cancelled", "2026-08-17T03:36:05.000Z"))).resolves.toBe(true);\n    let current = await getCurrentIntegrationRecord(github, snapshot().identity);\n    expect(current?.run?.id).toBe(700);\n    expect(current?.terminal?.state).toBe("error");\n    expect((await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:00:00Z"))).dispatch).toBe(false);\n\n    github.__runs.splice(0); github.__attempts.clear(); github.__comments.splice(0);\n    current = await getCurrentIntegrationRecord(github, snapshot().identity);\n    expect(current?.run?.id).toBe(700);\n    expect(current?.terminal?.state).toBe("error");\n    expect((await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T05:00:00Z"))).dispatch).toBe(false);\n  });\n'''
-          tests, count = re.subn(
-              r'  it\("keeps an observed cancellation retryable but never guesses cancellation after evidence/run deletion", async \(\) => \{.*?^  \}\);\n',
-              cancellation,
-              tests,
-              count=1,
-              flags=re.S | re.M,
-          )
-          if count != 1:
-              raise SystemExit('old cancellation regression not found')
-          no_attempt = '''  it("reclaims the bounded per-PR Integration authority slot across repeated proven no-attempt aborts", async () => {\n    const github = makeGithub();\n    let now = Date.parse("2026-08-17T03:50:00.000Z");\n    let priorRequestId: string | undefined;\n    for (let index = 0; index < 12; index += 1) {\n      const next = await ensureIntegrationDispatch(github, snapshot(), now);\n      expect(next.dispatch).toBe(true);\n      expect(next.request?.request_id).not.toBe(priorRequestId);\n      priorRequestId = next.request?.request_id;\n      expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_A_")).length).toBeLessThanOrEqual(1);\n      // No F, B, S, C or run exists: protected dispatch never crossed its may-have-dispatched\n      // boundary, so this is the sole retryable aborted transport class.\n      now += 11 * 60 * 1000;\n    }\n  });\n'''
-          tests, count = re.subn(
-              r'  it\("reclaims the bounded per-PR Integration authority slot across repeated cancellations", async \(\) => \{.*?^  \}\);\n',
-              no_attempt,
-              tests,
-              count=1,
-              flags=re.S | re.M,
-          )
-          if count != 1:
-              raise SystemExit('old repeated cancellation regression not found')
-          tests_path.write_text(tests)
+          path = Path('tests/state-authority-blockers.test.ts')
+          text = path.read_text()
+          old_import = 'import { createIntegrationRecord, createIntegrationRequest, type IntegrationRecord } from "../src/core/integration-plan.js";'
+          new_import = 'import { createIntegrationRecord, createIntegrationRequest, serializeIntegrationRecord, type IntegrationRecord } from "../src/core/integration-plan.js";'
+          if old_import not in text:
+              raise SystemExit('integration-plan import not found')
+          text = text.replace(old_import, new_import, 1)
+          status_import = 'import { authorizeIntegrationDispatch, bindDispatchedIntegrationRun, ensureIntegrationDispatch, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, integrationDispatchRunToken, publishIntegrationRecord, sealIntegrationWorkflowRunEvent } from "../src/core/integration-status.js";'
+          commit_import = status_import + '\nimport { claimIdentityLostIntegrationCommit } from "../src/core/integration-commit.js";'
+          if status_import not in text:
+              raise SystemExit('integration-status import not found')
+          text = text.replace(status_import, commit_import, 1)
+          old = '''      // Simulate a crash immediately after durable terminal commit, before F/B cleanup.\n      const terminalAt = "2026-08-17T14:11:00.000Z";\n      record = await publishIntegrationRecord(github, {\n        ...record,\n        dispatch_started_at: protectedFence.fence.created_at as string,\n        run: null,\n        terminal: {\n          state: "identity_lost", attempt: 1,\n          boundary_created_at: protectedFence.fence.created_at as string,\n          fence_digest: `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`,\n          detail: "simulated post-commit cleanup crash", created_at: terminalAt,\n        },\n        created_at: terminalAt,\n      });\n      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(true);\n      const durableBefore = await getCurrentIntegrationRecord(github, identity);\n'''
+          new = '''      // Simulate the exact crash boundary: request-local identity_lost serialization and d3\n      // terminal authority have committed, but none of the transient F/A/B/S/C cleanup has run.\n      const terminalAt = "2026-08-17T14:11:00.000Z";\n      const fenceDigest = `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`;\n      const terminalRecord: IntegrationRecord = {\n        ...record,\n        dispatch_started_at: protectedFence.fence.created_at as string,\n        run: null,\n        terminal: {\n          state: "identity_lost", attempt: 1,\n          boundary_created_at: protectedFence.fence.created_at as string,\n          fence_digest: fenceDigest,\n          detail: "simulated post-commit cleanup crash", created_at: terminalAt,\n        },\n        created_at: terminalAt,\n      };\n      await claimIdentityLostIntegrationCommit(github, {\n        requestId: record.request.request_id,\n        prNumber: identity.prNumber,\n        headSha: identity.headSha,\n        baseSha: identity.baseSha,\n        anchorName: authorized.authorization.anchor_name,\n      }, {\n        boundaryCreatedAt: protectedFence.fence.created_at as string,\n        fenceDigest,\n        createdAt: terminalAt,\n      });\n      await publishDurableProtocolRecord(github, {\n        storageSha: identity.headSha,\n        publisherSha: identity.baseSha,\n        scope: `integration/${identity.prNumber}`,\n        unsignedBody: `${serializeIntegrationRecord(terminalRecord)}\\n\\nINTEGRATION RECORD — CANONICAL`,\n        publicationTimestamp: Date.parse(terminalAt),\n        authorityOrder: terminalAt,\n      });\n      record = terminalRecord;\n      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(true);\n      const durableBefore = await getCurrentIntegrationRecord(github, identity);\n'''
+          if old not in text:
+              raise SystemExit('old crash simulation block not found')
+          path.write_text(text.replace(old, new, 1))
           PY
             git config user.name Johnny
             git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-            git add src/core/integration-status.ts tests/reconcile.test.ts
+            git add tests/state-authority-blockers.test.ts
             git diff --cached --check
-            git commit -m 'Linearize terminal cleanup and known cancellation'
+            git commit -m 'Model crash after terminal authority before cleanup'
             git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fi
-          grep -q 'keeps known attempt cancellation terminal and refuses replacement after deletion' tests/reconcile.test.ts
-          grep -q 'Keep C as the request-local tombstone' src/core/integration-status.ts
+          grep -q 'request-local identity_lost serialization and d3' tests/state-authority-blockers.test.ts
       - id: head
         name: Resolve final exact head
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
