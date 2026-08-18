@@ -6,7 +6,7 @@ on:
 
 jobs:
   repair:
-    if: contains(github.event.head_commit.message, '[ownership-fold-v1]')
+    if: contains(github.event.head_commit.message, '[ownership-fold-v2]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,68 +17,22 @@ jobs:
         with:
           ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fetch-depth: 1
-      - name: Fold unassigned Integration implementation and tests
+      - name: Restore folded Integration plan import
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "d90d511d671930837d4bf5a2c8741822cb82670a"
+          test "$(git rev-parse HEAD)" = "10043105b164237baac9c81c18ca6476b9f60e6c"
           python <<'PY'
           from pathlib import Path
-          import re
-
-          status_path = Path('src/core/integration-status.ts')
-          commit_path = Path('src/core/integration-commit.ts')
-          target_test_path = Path('tests/integration-plan.test.ts')
-          source_test_path = Path('tests/integration-terminal-serialization.test.ts')
-          blockers_path = Path('tests/state-authority-blockers.test.ts')
-
-          if not commit_path.exists() or not source_test_path.exists():
-              raise SystemExit('expected unassigned ownership paths are missing')
-
-          status = status_path.read_text()
-          commit_text = commit_path.read_text()
-          body_marker = 'const INTEGRATION_COMMIT_PREFIX = "FUGUE_INT_C_";'
-          if body_marker not in commit_text:
-              raise SystemExit('integration commit body marker missing')
-          commit_body = commit_text[commit_text.index(body_marker):].rstrip() + '\n\n'
-
-          status, count = re.subn(
-              r'import \{\n.*?\} from "\./integration-commit\.js";\n',
-              '',
-              status,
-              count=1,
-              flags=re.S,
-          )
-          if count != 1:
-              raise SystemExit('integration-status import fold point missing')
-          insertion = 'export type IntegrationState ='
-          if insertion not in status:
-              raise SystemExit('integration-status insertion point missing')
-          status = status.replace(insertion, commit_body + insertion, 1)
-          if 'integration-commit.js' in status:
-              raise SystemExit('integration-status still references deleted module')
-          status_path.write_text(status)
-
-          focused = source_test_path.read_text()
-          focused = focused.replace('import { describe, expect, it } from "vitest";\n', '', 1)
-          focused = focused.replace('../src/core/integration-commit.js', '../src/core/integration-status.js')
-          target = target_test_path.read_text()
-          suite_marker = 'describe("request-local Integration terminal serialization"'
-          if suite_marker in target:
-              raise SystemExit('focused terminal serialization suite already folded')
-          target_test_path.write_text(
-              target.rstrip() + '\n\n// Focused request-local Integration terminal serialization regressions.\n' + focused
-          )
-
-          blockers = blockers_path.read_text()
-          old = 'import { claimIdentityLostIntegrationCommit } from "../src/core/integration-commit.js";'
-          new = 'import { claimIdentityLostIntegrationCommit } from "../src/core/integration-status.js";'
-          if old not in blockers:
-              raise SystemExit('state-authority integration-commit import missing')
-          blockers_path.write_text(blockers.replace(old, new, 1))
-
-          commit_path.unlink()
-          source_test_path.unlink()
+          path = Path('src/core/integration-status.ts')
+          text = path.read_text()
+          if 'from "./integration-plan.js";' not in text:
+              anchor = 'import type { FugueGitHub } from "./github.js";\n'
+              block = '''import type { FugueGitHub } from "./github.js";\nimport {\n  createIntegrationRecord,\n  createIntegrationRequest,\n  integrationDispatchAuthorizationSchema,\n  integrationRunTitle,\n  integrationRequestSchema,\n  parseIntegrationRecord,\n  serializeIntegrationRecord,\n  type IntegrationDispatchAuthorization,\n  type IntegrationRecord,\n  type IntegrationRequest,\n  type IntegrationRunBinding,\n} from "./integration-plan.js";\n'''
+              if anchor not in text:
+                  raise SystemExit('github import anchor missing')
+              path.write_text(text.replace(anchor, block, 1))
           PY
+          grep -q 'from "./integration-plan.js";' src/core/integration-status.ts
           test ! -e src/core/integration-commit.ts
           test ! -e tests/integration-terminal-serialization.test.ts
           ! grep -R --line-number --fixed-strings 'integration-commit.js' src tests
@@ -86,10 +40,9 @@ jobs:
           git diff --check
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-          git add src/core/integration-status.ts tests/integration-plan.test.ts tests/state-authority-blockers.test.ts
-          git rm src/core/integration-commit.ts tests/integration-terminal-serialization.test.ts
+          git add src/core/integration-status.ts
           git diff --cached --check
-          git commit -m 'Fold Integration terminal serialization into assigned paths'
+          git commit -m 'Restore Integration plan import after ownership fold'
           git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
       - id: head
         name: Resolve final exact head
@@ -120,7 +73,6 @@ jobs:
           test -z "$GH_TOKEN"
           test ! -e src/core/integration-commit.ts
           test ! -e tests/integration-terminal-serialization.test.ts
-          ! git diff-tree --no-commit-id --name-only -r "$EXPECTED_SHA" | grep -Fx package-lock.json
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -132,7 +84,7 @@ jobs:
 
   record:
     needs: [repair, test]
-    if: always() && contains(github.event.head_commit.message, '[ownership-fold-v1]')
+    if: always() && contains(github.event.head_commit.message, '[ownership-fold-v2]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
