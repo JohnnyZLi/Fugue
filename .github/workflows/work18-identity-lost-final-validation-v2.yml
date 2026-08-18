@@ -17,27 +17,35 @@ jobs:
         with:
           ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fetch-depth: 1
-      - name: Update protected Integration invariant if needed
+      - name: Add focused delayed-d3 race regressions if needed
         run: |
           set -euo pipefail
-          if ! grep -q 'FUGUE_INT_C_\*' AGENTS.md; then
+          if ! grep -q 'delayed d3 exact binding cannot reopen identity_lost' tests/state-authority-blockers.test.ts; then
             python <<'PY'
           from pathlib import Path
-          path = Path('AGENTS.md')
+          path = Path('tests/state-authority-blockers.test.ts')
           text = path.read_text()
-          old = next(line for line in text.splitlines() if line.startswith('30. Protected Integration never treats Deployment'))
-          new = "30. Protected Integration never treats Deployment, Deployment Status, mutable workflow-run/history pagination, actor/login presentation, environment/ref/SHA matching, or the public request/token/title as run-selection authority. Before POST, protected Authority creates a request-specific create-only `FUGUE_INT_F_*` may-have-dispatched fence. The API `2026-03-10` synchronous dispatch uses `return_run_details: true`; a valid exact returned run ID/URL is bound to d3 immediately. Independently, protected `workflow_run` lifecycle delivery authenticated to the Authority App numeric Bot identity may create one request-specific create-only `FUGUE_INT_B_*` exact-run witness, and the Integration workflow can later create its OIDC-signed run-start. Exact-L B/S writers, synchronous/d3 exact binding, and `identity_lost` terminalization all serialize through one request-local create-only `FUGUE_INT_C_*` commit slot: exact L winning C first makes stale `identity_lost` inert, while `identity_lost` winning C first permanently blocks delayed B/S/d3 rebinding. Exact writers revalidate their protected F/A or durable request authority after C before publication, and terminal cleanup deletes F/A/B/S before C so an already-running stale writer cannot recreate authority after cleanup. Any surviving exact witness binds only its real request/run/attempt and later replay cannot replace it; a known attempt-1 terminal completion—including hostile cancellation—is terminal and never retryable, while `aborted` is reserved for protected evidence affirmatively proving that no attempt was created. A known bound run that disappears remains exact terminal failure after grace. If F exists but the synchronous response and every attacker-resistant exact-run witness are unavailable/destroyed through the bounded grace period, the revised protocol commits terminal `identity_lost`: exact request ID, attempt 1, exact evaluation identity, protected F-boundary digest/time, and outcome are durable, while numeric run ID is intentionally absent only for this outcome. `identity_lost` is irreversible, never PASS/merge-ready/retry/replacement/later-run election, and any fresh Integration requires explicit Human action/new request. Request-specific F/B/C/anchor/run-start state is reclaimed only after durable terminal authority commits; cleanup is bounded, idempotent, request-local, and resumed by later reconciliation without changing terminal authority."
-          path.write_text(text.replace(old, new, 1))
+          first = '''      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);\n      expect(github.__authorityVariables.has(protectedFence.names.binding)).toBe(false);\n\n      github.__comments.splice(0);'''
+          first_replacement = '''      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);\n      expect(github.__authorityVariables.has(protectedFence.names.binding)).toBe(false);\n\n      // delayed d3 exact binding cannot reopen identity_lost after terminal cleanup.\n      await expect(bindDispatchedIntegrationRun(\n        github, snapshot, request.request_id, 99003,\n        "https://github.com/JohnnyZLi/Fugue/actions/runs/99003", "2026-08-17T10:20:01.000Z",\n      )).rejects.toThrow(/active authorized durable request/);\n      expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_INT_C_"))).toBe(false);\n      expect((await getCurrentIntegrationRecord(github, identity))?.terminal?.state).toBe("identity_lost");\n\n      github.__comments.splice(0);'''
+          if first not in text:
+              raise SystemExit('identity_lost delayed-d3 insertion point missing')
+          text = text.replace(first, first_replacement, 1)
+
+          second = '''      const bound = await getCurrentIntegrationRecord(github, identity);\n      expect(bound?.run).toMatchObject({ id: 99101, attempt: 1, html_url: htmlUrl });\n      expect(bound?.terminal).toBeNull();\n      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);'''
+          second_replacement = '''      const bound = await getCurrentIntegrationRecord(github, identity);\n      expect(bound?.run).toMatchObject({ id: 99101, attempt: 1, html_url: htmlUrl });\n      expect(bound?.terminal).toBeNull();\n\n      // W bound exact L into d3 first; a stale T proposal with run:null can never clear it.\n      const staleTerminalAt = new Date(Date.parse(bound!.created_at) + 1).toISOString();\n      await expect(publishIntegrationRecord(github, {\n        ...(bound!),\n        run: null,\n        terminal: {\n          state: "identity_lost", attempt: 1,\n          boundary_created_at: protectedFence.fence.created_at as string,\n          fence_digest: `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`,\n          detail: "stale terminalizer must not clear exact L", created_at: staleTerminalAt,\n        },\n        created_at: staleTerminalAt,\n      } as IntegrationRecord)).rejects.toThrow(/cannot clear protected run/);\n      expect((await getCurrentIntegrationRecord(github, identity))?.run?.id).toBe(99101);\n      expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_INT_C_"))).toBe(false);\n      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);'''
+          if second not in text:
+              raise SystemExit('known-L stale-terminal insertion point missing')
+          path.write_text(text.replace(second, second_replacement, 1))
           PY
             git config user.name Johnny
             git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-            git add AGENTS.md
+            git add tests/state-authority-blockers.test.ts
             git diff --cached --check
-            git commit -m 'Document Integration terminal serialization invariant'
+            git commit -m 'Regress delayed d3 terminal serialization races'
             git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fi
-          grep -q 'FUGUE_INT_C_\*' AGENTS.md
-          grep -q 'hostile cancellation' AGENTS.md
+          grep -q 'delayed d3 exact binding cannot reopen identity_lost' tests/state-authority-blockers.test.ts
+          grep -q 'stale T proposal with run:null can never clear it' tests/state-authority-blockers.test.ts
       - id: head
         name: Resolve final exact head
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
