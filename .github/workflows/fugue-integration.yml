@@ -30,13 +30,90 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  witness:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Seal protected attempt-1 run identity
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash, createHmac } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+
+          const repository = process.env.GITHUB_REPOSITORY;
+          const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          const inputs = event.inputs ?? {};
+          const requestId = String(inputs.request_id ?? '');
+          const prNumber = Number(inputs.pr);
+          const secret = String(inputs.dispatch_secret ?? '');
+          const anchorName = String(inputs.authority_anchor ?? '');
+          const runToken = String(inputs.run_token ?? '');
+          const runId = Number(process.env.GITHUB_RUN_ID);
+          const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
+          const baseSha = process.env.GITHUB_SHA;
+          if (!/^int-[0-9a-f]{16}-[0-9a-f]{16}$/.test(requestId) || !Number.isInteger(prNumber) || prNumber <= 0 ||
+              !/^[0-9a-f]{64}$/i.test(secret) || !/^FUGUE_INT_A_\d{10}_[0-9A-F]{16}$/.test(anchorName) ||
+              !/^[0-9a-f]{24}$/.test(runToken) || !Number.isInteger(runId) || runId <= 0 || runAttempt !== 1 ||
+              !/^[0-9a-f]{40}$/i.test(baseSha)) {
+            throw new Error('Invalid protected Integration dispatch context.');
+          }
+          process.stdout.write('::add-mask::' + secret + '\n');
+          const digest = createHash('sha256').update(secret, 'utf8').digest('hex');
+          const expectedRunToken = createHmac('sha256', Buffer.from(secret, 'hex'))
+            .update(`fugue-integration-run\0${requestId}`, 'utf8').digest('hex').slice(0, 24);
+          if (runToken !== expectedRunToken) throw new Error('Protected Integration run token does not match its one-use dispatch capability.');
+
+          const witness = {
+            version: 1,
+            kind: 'integration_run_witness',
+            request_id: requestId,
+            pr_number: prNumber,
+            base_sha: baseSha,
+            secret_digest: digest,
+            anchor_name: anchorName,
+            run_id: runId,
+            run_attempt: 1,
+            created_at: new Date().toISOString(),
+          };
+          const payload = Buffer.from(JSON.stringify(witness), 'utf8').toString('base64url');
+          const canonical = `<!-- fugue-integration-run-witness\nversion: 1\npayload: ${payload}\n-->\n\nINTEGRATION RUN — STARTED`;
+          const bodyDigest = createHash('sha256').update(canonical, 'utf8').digest('hex');
+          const audience = `fugue:v1:${repository}:comment:${bodyDigest}`;
+          const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+          oidcUrl.searchParams.set('audience', audience);
+          const oidcResponse = await fetch(oidcUrl, {
+            headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+          });
+          if (!oidcResponse.ok) throw new Error(`Unable to mint protected Integration run witness (${oidcResponse.status}).`);
+          const oidc = await oidcResponse.json();
+          if (typeof oidc.value !== 'string' || !oidc.value) throw new Error('GitHub OIDC response did not contain a token.');
+          const signed = `${canonical}\n\n<!-- fugue-publisher-proof\nversion: 1\ntoken: ${oidc.value}\n-->`;
+          const response = await fetch(`https://api.github.com/repos/${repository}/commits/${baseSha}/comments`, {
+            method: 'POST',
+            headers: {
+              Accept: 'application/vnd.github+json',
+              Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+              'X-GitHub-Api-Version': '2026-03-10',
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ body: signed }),
+          });
+          if (response.status !== 201) {
+            const detail = await response.text();
+            throw new Error(`Unable to persist protected Integration run witness (${response.status}): ${detail.slice(0, 300)}`);
+          }
+          NODE
+
   prepare:
+    needs: witness
     runs-on: ubuntu-latest
     # SECURITY INVARIANT (external): configure the restrictive default-branch-only deployment
     # policy before installing the Authority App key. The in-job audit is drift detection only.
-    environment:
-      name: fugue-authority
-      url: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}?fugue_request=${{ inputs.request_id }}&fugue_run_token=${{ inputs.run_token }}"
+    environment: fugue-authority
     permissions:
       actions: read
       checks: read
