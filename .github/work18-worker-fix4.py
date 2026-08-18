@@ -62,10 +62,14 @@ p.write_text(s)
 
 p=root/'tests/state-authority-blockers.test.ts'; s=p.read_text()
 s=once(s,
+'''authorizeIntegrationDispatch, bindDispatchedIntegrationRun, getCurrentIntegrationRecord, publishIntegrationRecord, sealIntegrationWorkflowRunEvent''',
+'''authorizeIntegrationDispatch, bindDispatchedIntegrationRun, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, publishIntegrationRecord, sealIntegrationWorkflowRunEvent''',
+'focused Integration import')
+s=once(s,
 '''  if (body.includes("<!-- fugue-durable-recovery")) return body.includes("token: test-proof");
   const key = body.match(/Fugue-Authority-Key: ([0-9a-f]{32})/i)?.[1];''',
 '''  if (body.includes("<!-- fugue-durable-recovery") || body.includes("INTEGRATION DISPATCH — AUTHORIZED") ||
       body.includes("INTEGRATION RUN — STARTED")) return body.includes("token: test-proof");
   const key = body.match(/Fugue-Authority-Key: ([0-9a-f]{32})/i)?.[1];''','focused integration verifier')
 p.write_text(s)
-print('fixed guard lifecycle and Integration verifier')
+print('fixed guard lifecycle and Integration verifier/import')
