@@ -1202,7 +1202,7 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
 
       // Simulate the exact crash boundary: request-local identity_lost serialization and d3
       // terminal authority have committed, but none of the transient F/A/B/S/C cleanup has run.
-      const terminalAt = "2026-08-17T14:11:00.000Z";
+      const terminalAt = new Date(Date.parse(record.created_at) + 11 * 60 * 1000).toISOString();
       const fenceDigest = `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`;
       const terminalRecord: IntegrationRecord = {
         ...record,
