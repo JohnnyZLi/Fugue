@@ -1,0 +1,38 @@
+name: Work 18 Integration Workflow Export
+on:
+  push:
+    branches: [bootstrap/work18-worker-repair-20260818]
+permissions:
+  contents: write
+jobs:
+  export:
+    if: contains(github.event.head_commit.message, '[work18-export-integration]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: bootstrap/work18-worker-repair-20260818, path: control}
+      - uses: actions/checkout@v4
+        with: {ref: 32ddda85c08d01263383de4f4b3269c9be63fc42, path: work, persist-credentials: false}
+      - name: Reproduce the already-gated workflow transformation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          src=Path('work/.github/workflows/fugue-integration.yml').read_text()
+          def once(old,new,label):
+            global src
+            if src.count(old)!=1: raise SystemExit(f'{label}: {src.count(old)} matches')
+            src=src.replace(old,new,1)
+          once('run-name: "Fugue Integration PR #${{ inputs.pr }} ${{ inputs.request_id }}"', 'run-name: "Fugue Integration PR #${{ inputs.pr }} ${{ inputs.request_id }} ${{ inputs.run_token }}"', 'run name')
+          once('''      authority_anchor:\n        description: Exact immutable Fugue Authority request anchor\n        required: true\n        type: string''','''      authority_anchor:\n        description: Exact immutable Fugue Authority request anchor\n        required: true\n        type: string\n      run_token:\n        description: Secret-derived one-run correlation token\n        required: true\n        type: string''','run token input')
+          once("          import { createHash } from 'node:crypto';", "          import { createHash, createHmac } from 'node:crypto';", 'hmac import')
+          once("          const anchorName = String(inputs.authority_anchor ?? '');\n          const runId = Number(process.env.GITHUB_RUN_ID);", "          const anchorName = String(inputs.authority_anchor ?? '');\n          const runToken = String(inputs.run_token ?? '');\n          const runId = Number(process.env.GITHUB_RUN_ID);", 'run token read')
+          once("""              !/^[0-9a-f]{64}$/i.test(secret) || !/^FUGUE_INT_A_\\d{10}_[0-9A-F]{16}$/.test(anchorName) ||\n              !Number.isInteger(runId) || runId <= 0 || runAttempt !== 1 || !/^[0-9a-f]{40}$/i.test(baseSha)) {""", """              !/^[0-9a-f]{64}$/i.test(secret) || !/^FUGUE_INT_A_\\d{10}_[0-9A-F]{16}$/.test(anchorName) ||\n              !/^[0-9a-f]{24}$/.test(runToken) || !Number.isInteger(runId) || runId <= 0 || runAttempt !== 1 ||\n              !/^[0-9a-f]{40}$/i.test(baseSha)) {""", 'token validation')
+          once("""          const digest = createHash('sha256').update(secret, 'utf8').digest('hex');\n          const requestToken = createHash('sha256').update(requestId, 'utf8').digest('hex').slice(0, 16).toUpperCase();""", """          const digest = createHash('sha256').update(secret, 'utf8').digest('hex');\n          const expectedRunToken = createHmac('sha256', Buffer.from(secret, 'hex'))\n            .update(`fugue-integration-run\\0${requestId}`, 'utf8').digest('hex').slice(0, 24);\n          if (runToken !== expectedRunToken) throw new Error('Protected Integration run token does not match its one-use dispatch capability.');\n          const requestToken = createHash('sha256').update(requestId, 'utf8').digest('hex').slice(0, 16).toUpperCase();""", 'token secret binding')
+          Path('control/.github/work18-fugue-integration-transformed.txt').write_text(src)
+          PY
+          cd control
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-fugue-integration-transformed.txt
+          git commit -m 'Record validated Integration workflow transformation'
+          git push origin HEAD:bootstrap/work18-worker-repair-20260818
