@@ -1,3 +1,4 @@
+# trigger known-run cleanup repair
 name: Work 18 Known Run Cleanup Exact Head Validation
 
 on:
@@ -208,8 +209,6 @@ describe("durable known-run cleanup restart completeness", () => {
     await withHostedAuthority(async () => {
       const github = makeGithub();
       const seeded = await seedBound(github, 320, "0000000000000320", 99520);
-      // Model a producer that passed its post-C prerequisite revalidation before the binder completed
-      // durable d3 binding/cleanup, then resumed after cleanup and recreated S (or B).
       github.__authorityVariables.set(seeded.names[3]!, "late-run-start");
       github.__authorityVariables.set(seeded.names[2]!, "late-binding-witness");
       github.__workflowRuns.splice(0);
@@ -228,7 +227,7 @@ describe("durable known-run cleanup restart completeness", () => {
       for (let index = 0; index < 65; index += 1) {
         const prNumber = 400 + index;
         const seeded = await seedBound(github, prNumber, index.toString(16).padStart(16, "0"), 99600 + index);
-        recreateTransientCut(github, seeded.names, 3); // F/A/B gone; S/C survive the simulated crash.
+        recreateTransientCut(github, seeded.names, 3);
         await expect(recoverExistingProtectedIntegration(github, seeded.snapshot, Date.parse("2026-08-18T16:00:00.000Z") + index))
           .resolves.toBe(true);
         expect(seeded.names.filter((name) => github.__authorityVariables.has(name))).toEqual([]);
