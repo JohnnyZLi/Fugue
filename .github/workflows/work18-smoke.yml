@@ -1,10 +1,81 @@
-name: Work18 Bootstrap Smoke
+name: Work18 Known Run Cleanup
 on:
   push:
     branches: [bootstrap/work18-identity-lost-20260818]
 jobs:
-  smoke:
-    if: contains(github.event.head_commit.message, '[work18-smoke]')
+  repair:
+    if: contains(github.event.head_commit.message, '[known-run-cleanup-v3]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-identity-lost-20260818
+          path: helper
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+          fetch-depth: 1
+          path: repo
+      - name: Apply focused cleanup repair
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "a735d824b5b745e4dd30234d4fda6d6516dfbe94"
+          python ../helper/.github/work18-known-run-cleanup.py
+          test ! -e src/core/integration-commit.ts
+          test ! -e tests/integration-terminal-serialization.test.ts
+          ! git diff --name-only | grep -Fx package-lock.json
+          git diff --check
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add src/core/reconcile.ts tests/state-authority-blockers.test.ts
+          git diff --cached --check
+          git commit -m 'Resume full Integration cleanup from durable authority'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+      - id: head
+        name: Resolve final exact head
+        working-directory: repo
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  test:
+    needs: repair
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ""
+      GH_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.repair.outputs.sha }}
+          persist-credentials: false
+      - name: Confirm detached exact head and no publication credential
+        env:
+          EXPECTED_SHA: ${{ needs.repair.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git symbolic-ref -q HEAD || true)"
+          test -z "$(git config --local --get-regexp 'http.*extraheader' || true)"
+          test -z "$GITHUB_TOKEN"
+          test -z "$GH_TOKEN"
+          test ! -e src/core/integration-commit.ts
+          test ! -e tests/integration-terminal-serialization.test.ts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+  record:
+    needs: [repair, test]
+    if: always() && contains(github.event.head_commit.message, '[known-run-cleanup-v3]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -12,11 +83,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: bootstrap/work18-identity-lost-20260818
-      - run: |
+      - name: Record result
+        run: |
           set -euo pipefail
-          echo "run_id=${GITHUB_RUN_ID}" > .github/work18-smoke-result.txt
+          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '${{ needs.repair.outputs.sha }}' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-known-run-cleanup-result.txt
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-          git add .github/work18-smoke-result.txt
-          git commit -m 'Record work18 smoke result' || exit 0
+          git add .github/work18-known-run-cleanup-result.txt
+          git commit -m 'Record known-run cleanup validation' || exit 0
           git push origin HEAD:bootstrap/work18-identity-lost-20260818
