@@ -1,0 +1,45 @@
+name: Work 18 Current Validation Cleanup
+
+on:
+  push:
+    branches:
+      - bootstrap/fugue-work18-validation
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: contains(github.event.head_commit.message, '[current-cleanup]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/fugue-work18-validation
+      - name: Remove current Worker helper artifacts
+        run: |
+          git rm -f --ignore-unmatch \
+            .github/work18-exact-final-trigger.txt \
+            .github/work18-exact-validation-current-result.txt \
+            .github/work18-guard-apply-result.txt \
+            .github/work18-guard-testfix.py \
+            .github/work18-guard-trigger.txt \
+            .github/work18-worker-apply-result.txt \
+            .github/work18-worker-apply-trigger.txt \
+            .github/work18-worker-fix-generated.py \
+            .github/work18-worker-fix3.py \
+            .github/work18-worker-fix4.py \
+            .github/work18-worker-guard-slot.py \
+            .github/work18-worker-inspect-output.txt \
+            .github/work18-worker-patch.py \
+            .github/work18-worker-refine-run.py \
+            .github/work18-guard-trigger.txt \
+            .github/workflows/work18-worker-apply.yml \
+            .github/workflows/work18-worker-inspect.yml \
+            .github/workflows/work18-exact-validation-current.yml \
+            .github/workflows/work18-guard-apply.yml \
+            .github/workflows/work18-current-cleanup.yml
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git commit -m 'Clean current work-18 validation helpers'
+          git push origin HEAD:bootstrap/fugue-work18-validation
