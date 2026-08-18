@@ -10,7 +10,7 @@ import { hasCurrentHumanAcknowledgement, processCurrentSubmissions } from "../sr
 import { verifyHumanControlPlanePrerequisite } from "../src/core/integration.js";
 import { createIntegrationRecord, createIntegrationRequest, serializeIntegrationRecord, type IntegrationRecord } from "../src/core/integration-plan.js";
 import { authorizeIntegrationDispatch, bindDispatchedIntegrationRun, ensureIntegrationDispatch, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, integrationDispatchRunToken, publishIntegrationRecord, sealIntegrationWorkflowRunEvent } from "../src/core/integration-status.js";
-import { claimIdentityLostIntegrationCommit } from "../src/core/integration-commit.js";
+import { claimIdentityLostIntegrationCommit } from "../src/core/integration-status.js";
 import { humanControlPlaneAttestationSchema, qaAttestationSchema, reviewStartSchema, serializeAttestation } from "../src/core/attestations.js";
 import {
   assertRepositoryDefaultBranchRevision,
