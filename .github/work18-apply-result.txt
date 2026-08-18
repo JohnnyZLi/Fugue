@@ -1,2 +1,4 @@
-run_id=32100774082
-status=failure
+run_id=32100858104
+status=success
+worker_head=32ddda85c08d01263383de4f4b3269c9be63fc42
+work_spec_digest=sha256:d68ce1214ed0aee5e8d1cad0539d535ef2c9d7ce90ea1a74be06359e0c6953e1
