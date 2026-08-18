@@ -272,8 +272,6 @@ describe("GitHub-hosted Integration plan", () => {
   it("makes bounded monotonic progress across arbitrarily deep later history and page shifts", () => {
     const requestCreatedAt = "2026-08-18T07:00:00.000Z";
     const fenceCreatedAt = "2026-08-18T07:00:01.000Z";
-    // Adversarial history is intentionally not an input to the authoritative transition. A million
-    // later records can be inserted/deleted/reordered without changing the request-local decision.
     const laterHistory = Array.from({ length: 1_000_000 }, (_, index) => 9_000_000 + index);
     const first = protectedIntegrationRecoveryDecision({
       requestCreatedAt, fenceCreatedAt, now: Date.parse("2026-08-18T07:00:02.000Z"),
@@ -318,10 +316,6 @@ describe("GitHub-hosted Integration plan", () => {
   it("does not invent exact L when dispatch creation outruns both the synchronous response and every protected witness", () => {
     const legitimateCreatedRunL = 4242;
     const laterReplayA = 4243;
-    // F was committed before POST. GitHub then created L, but the response/process was lost and an
-    // actions:write adversary prevented requested/completed witness consumers and deleted L. Neither
-    // L nor A is trusted input now; attacker-writable Deployment/Status/history cannot fill that gap.
-    // The revised exact-identity exception therefore terminalizes the request as identity_lost.
     const result = protectedIntegrationRecoveryDecision({
       requestCreatedAt: "2026-08-18T07:00:00.000Z",
       fenceCreatedAt: "2026-08-18T07:00:01.000Z",
@@ -403,8 +397,6 @@ function createOnlyStore(): IntegrationCommitStore & { value(): string | undefin
 describe("request-local Integration terminal serialization", () => {
   it("lets exact L win when B/S commits after terminal final-read but before terminal commit", async () => {
     const store = createOnlyStore();
-    // T has already performed its final B/S reads and observed no witness. W then reaches the
-    // shared create-only commit point first. T's later identity_lost claim must observe W's L.
     expect((await claimIntegrationCommitWithStore(store, context, exact)).kind).toBe("integration_exact_run_commit");
     const terminalWinner = await claimIntegrationCommitWithStore(store, context, lost);
     expect(terminalWinner).toMatchObject({ kind: "integration_exact_run_commit", run_id: exact.run_id });
@@ -493,5 +485,355 @@ describe("request-local Integration terminal serialization", () => {
     expect(startDelete).toBeGreaterThan(release);
     expect(commitDelete).toBeGreaterThan(startDelete);
     expect(status).toContain("if (normalized.terminal) await releaseIntegrationAuthorityVariable(github, normalized)");
+  });
+});
+
+// Cross-protected-base historical identity_lost recovery regressions.
+import { vi } from "vitest";
+import type { FugueGitHub } from "../src/core/github.js";
+import {
+  authorizeIntegrationDispatch,
+  bindDispatchedIntegrationRun,
+  claimIdentityLostIntegrationCommit,
+  currentIntegrationState,
+  getCurrentIntegrationRecord,
+  integrationCommitVariableName,
+  integrationDispatchRunToken,
+  integrationRunStartVariableName,
+  publishIntegrationRecord,
+  reclaimOrphanIntegrationAuthorityVariables,
+  serializeIntegrationRunStartEvidence,
+} from "../src/core/integration-status.js";
+
+interface HistoricalTestStatus {
+  id: number;
+  sha: string;
+  context: string;
+  description: string;
+  target_url?: string;
+  created_at: string;
+}
+
+interface HistoricalTestGithub extends FugueGitHub {
+  __baseSha: string;
+  __authorityVariables: Map<string, string>;
+  __statuses: HistoricalTestStatus[];
+  __beforeRevisionCheck?: () => Promise<void> | void;
+}
+
+vi.mock("../src/core/provenance.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/core/provenance.js")>();
+  const verifyPublication = async (_github: FugueGitHub, body: string, _expected: string): Promise<boolean> => {
+    if (body.includes("<!-- fugue-durable-recovery") || body.includes("INTEGRATION DISPATCH — AUTHORIZED") ||
+        body.includes("INTEGRATION RUN — STARTED")) return body.includes("token: test-proof");
+    const key = body.match(/Fugue-Authority-Key: ([0-9a-f]{32})/i)?.[1];
+    const commit = body.match(/Fugue-Authority-Commit: ([0-9a-f]{32})/i)?.[1];
+    return Boolean(key && commit && !/^0+$/.test(key) && !/^0+$/.test(commit));
+  };
+  return {
+    ...actual,
+    assertRepositoryDefaultBranchRevision: vi.fn(async (github: FugueGitHub, expected: string) => {
+      await (github as HistoricalTestGithub).__beforeRevisionCheck?.();
+      const actualSha = (github as HistoricalTestGithub).__baseSha;
+      if (actualSha.toLowerCase() !== expected.toLowerCase()) throw new Error(`stale protected revision ${actualSha.slice(0, 8)}`);
+    }),
+    readRepositoryDefaultBranchIdentity: vi.fn(async (github: FugueGitHub) => ({ branch: "main", sha: (github as HistoricalTestGithub).__baseSha })),
+    signProtocolBody: vi.fn(async (_github: FugueGitHub, body: string) => `${body}\n\n<!-- fugue-publisher-proof\nversion: 1\ntoken: test-proof\n-->`),
+    createDurableManifestProof: vi.fn(async () => "manifest-proof"),
+    verifyDurableManifestProof: vi.fn(async (_github: FugueGitHub, proof: string) => proof === "manifest-proof"),
+    verifyProtocolPublicationBodyAtRevision: vi.fn(verifyPublication),
+    isTrustedProtocolComment: vi.fn(async () => false),
+    createProtocolComment: vi.fn(async (_github: FugueGitHub, _issueNumber: number, body: string) => ({
+      data: { id: 1, html_url: "https://github.com/JohnnyZLi/Fugue/pull/19#issuecomment-1", body, created_at: new Date().toISOString() },
+    })),
+  };
+});
+
+const HIST_B1 = "b".repeat(40);
+const HIST_B2 = "c".repeat(40);
+const HIST_B3 = "d".repeat(40);
+
+function makeHistoricalGithub(): HistoricalTestGithub {
+  const authorityVariables = new Map<string, string>();
+  const statuses: HistoricalTestStatus[] = [];
+  let nextStatusId = 10_000;
+  return {
+    repository: { owner: "JohnnyZLi", repo: "Fugue", fullName: "JohnnyZLi/Fugue" },
+    __baseSha: HIST_B1,
+    __authorityVariables: authorityVariables,
+    __statuses: statuses,
+    octokit: {
+      paginate: vi.fn(async (method: (args: Record<string, unknown>) => Promise<{ data: unknown }>, args: Record<string, unknown>) => (await method(args)).data),
+      rest: {
+        issues: {
+          get: vi.fn(async () => ({ data: { comments: 0 } })),
+          listComments: vi.fn(async () => ({ data: [] })),
+          deleteComment: vi.fn(async () => ({ data: {} })),
+        },
+        repos: {
+          createCommitStatus: vi.fn(async (args: { sha: string; context: string; description?: string; target_url?: string }) => {
+            const status: HistoricalTestStatus = {
+              id: ++nextStatusId,
+              sha: args.sha,
+              context: args.context,
+              description: args.description ?? "",
+              ...(args.target_url ? { target_url: args.target_url } : {}),
+              created_at: new Date().toISOString(),
+            };
+            statuses.push(status);
+            return { data: status };
+          }),
+        },
+      },
+    },
+  } as unknown as HistoricalTestGithub;
+}
+
+function historicalIdentity(prNumber: number, headChar: string, baseSha = HIST_B1) {
+  return {
+    prNumber,
+    headSha: headChar.repeat(40),
+    baseBranch: "main",
+    baseSha,
+    policyDigest: `sha256:policy-${baseSha.slice(0, 4)}`,
+    protocolVersion: 1 as const,
+    issueNumber: 8000 + prNumber,
+    workId: `work-${8000 + prNumber}`,
+    workSpecDigest: `sha256:spec-${headChar}-${baseSha.slice(0, 4)}`,
+  };
+}
+
+function protectedRecoveryVariableNames(requestId: string) {
+  const suffix = createHash("sha256").update(requestId, "utf8").digest("hex").slice(0, 32).toUpperCase();
+  return { fence: `FUGUE_INT_F_${suffix}`, binding: `FUGUE_INT_B_${suffix}` };
+}
+
+async function seedHistoricalAmbiguity(github: HistoricalTestGithub, prNumber: number, nonce: string) {
+  const oldIdentity = historicalIdentity(prNumber, "1", HIST_B1);
+  const request = createIntegrationRequest(oldIdentity, "2026-08-18T20:00:00.000Z", nonce);
+  const secret = prNumber.toString(16).padStart(64, "0");
+  const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-18T20:00:00.000Z", secret);
+  const anchorBody = github.__authorityVariables.get(authorized.authorization.anchor_name)!;
+  const record = await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+    dispatch: authorized.authorization,
+    createdAt: "2026-08-18T20:00:00.000Z",
+  }));
+  github.__authorityVariables.delete(authorized.electionName);
+  const names = protectedRecoveryVariableNames(request.request_id);
+  const runToken = integrationDispatchRunToken(request.request_id, secret);
+  const fence = {
+    version: 1,
+    kind: "integration_dispatch_fence",
+    request_id: request.request_id,
+    pr_number: oldIdentity.prNumber,
+    head_sha: oldIdentity.headSha,
+    base_sha: oldIdentity.baseSha,
+    anchor_name: authorized.authorization.anchor_name,
+    secret_digest: authorized.authorization.secret_digest,
+    run_token: runToken,
+    authority_actor_id: 424242,
+    created_at: "2026-08-18T20:00:01.000Z",
+  };
+  const fenceRaw = JSON.stringify(fence);
+  github.__authorityVariables.set(names.fence, fenceRaw);
+  return { oldIdentity, request, secret, authorized, anchorBody, record, names, fence, fenceRaw, runToken };
+}
+
+async function claimHistoricalLostC(github: HistoricalTestGithub, seeded: Awaited<ReturnType<typeof seedHistoricalAmbiguity>>) {
+  const createdAt = new Date(Date.parse(seeded.record.created_at) + 1).toISOString();
+  const fenceDigest = `sha256:${createHash("sha256").update(seeded.fenceRaw, "utf8").digest("hex")}`;
+  await claimIdentityLostIntegrationCommit(github, {
+    requestId: seeded.request.request_id,
+    prNumber: seeded.oldIdentity.prNumber,
+    headSha: seeded.oldIdentity.headSha,
+    baseSha: seeded.oldIdentity.baseSha,
+    anchorName: seeded.authorized.authorization.anchor_name,
+  }, { boundaryCreatedAt: seeded.fence.created_at, fenceDigest, createdAt });
+  return { createdAt, fenceDigest };
+}
+
+function recoveryCheckpointBodiesForHistoricalTest(github: HistoricalTestGithub): string[] {
+  const result: string[] = [];
+  for (const [name, value] of github.__authorityVariables) {
+    if (name.startsWith("FUGUE_D3_")) { result.push(value); continue; }
+    if (!name.startsWith("FUGUE_D3P_")) continue;
+    try {
+      const pack = JSON.parse(value) as { kind?: unknown; entries?: unknown };
+      if (pack.kind !== "durable_recovery_pack" || !Array.isArray(pack.entries)) continue;
+      for (const entry of pack.entries) if (typeof entry === "string") result.push(entry);
+    } catch { /* malformed packs are irrelevant */ }
+  }
+  return result;
+}
+
+function historicalTombstoneScope(requestId: string, prNumber: number): string {
+  const requestToken = createHash("sha256").update(requestId, "utf8").digest("hex").slice(0, 16).toUpperCase();
+  return `int-hist/${prNumber}/${requestToken}`;
+}
+
+function historicalTombstones(github: HistoricalTestGithub, requestId: string, prNumber: number): Array<Record<string, unknown>> {
+  const scope = historicalTombstoneScope(requestId, prNumber);
+  return recoveryCheckpointBodiesForHistoricalTest(github).flatMap((body) => {
+    const cursorPayload = body.match(/<!-- fugue-durable-recovery\nversion: 1\npayload: ([A-Za-z0-9_-]+)/)?.[1];
+    if (!cursorPayload) return [];
+    let cursor: { scope?: unknown; commit_witness?: unknown; best_body_b64?: unknown };
+    try { cursor = JSON.parse(Buffer.from(cursorPayload, "base64url").toString("utf8")); } catch { return []; }
+    if (cursor.scope !== scope || cursor.commit_witness !== true || typeof cursor.best_body_b64 !== "string") return [];
+    const bestBody = Buffer.from(cursor.best_body_b64, "base64url").toString("utf8");
+    const payload = bestBody.match(/<!-- fugue-historical-integration-identity-lost\nversion: 1\npayload: ([A-Za-z0-9_-]+)/)?.[1];
+    if (!payload) return [];
+    try { return [JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>]; } catch { return []; }
+  });
+}
+
+function currentDriftIdentity(oldIdentity: ReturnType<typeof historicalIdentity>, baseSha: string, headChar: string) {
+  return {
+    ...oldIdentity,
+    headSha: headChar.repeat(40),
+    baseSha,
+    policyDigest: `sha256:policy-${baseSha.slice(0, 4)}`,
+    workSpecDigest: `sha256:spec-${headChar}-${baseSha.slice(0, 4)}`,
+  };
+}
+
+async function installDelayedHistoricalBindingAndStart(
+  github: HistoricalTestGithub,
+  seeded: Awaited<ReturnType<typeof seedHistoricalAmbiguity>>,
+  runId: number,
+): Promise<void> {
+  const htmlUrl = `https://github.com/JohnnyZLi/Fugue/actions/runs/${runId}`;
+  github.__authorityVariables.set(seeded.names.binding, JSON.stringify({
+    version: 1, kind: "integration_binding_witness", request_id: seeded.request.request_id,
+    pr_number: seeded.oldIdentity.prNumber, head_sha: seeded.oldIdentity.headSha, base_sha: seeded.oldIdentity.baseSha,
+    anchor_name: seeded.authorized.authorization.anchor_name, run_token: seeded.runToken, authority_actor_id: 424242,
+    run_id: runId, run_attempt: 1, run_created_at: "2026-08-18T20:10:00.000Z", html_url: htmlUrl,
+  }));
+  const start = serializeIntegrationRunStartEvidence({
+    version: 1, kind: "integration_run_start", request_id: seeded.request.request_id,
+    pr_number: seeded.oldIdentity.prNumber, head_sha: seeded.oldIdentity.headSha, base_sha: seeded.oldIdentity.baseSha,
+    secret_digest: seeded.authorized.authorization.secret_digest, anchor_name: seeded.authorized.authorization.anchor_name,
+    run_id: runId + 1, run_attempt: 1, created_at: "2026-08-18T20:10:01.000Z",
+  });
+  github.__authorityVariables.set(integrationRunStartVariableName(seeded.request), `${start}\n\n<!-- fugue-publisher-proof\nversion: 1\ntoken: test-proof\n-->`);
+}
+
+describe("cross-protected-base historical identity_lost recovery", () => {
+  it("seals B1 lost-C under B2, reclaims F/A/C, survives presentation deletion, and cannot satisfy current B2 Integration", async () => {
+    const github = makeHistoricalGithub();
+    const seeded = await seedHistoricalAmbiguity(github, 601, "0000000000000601");
+    const lostC = await claimHistoricalLostC(github, seeded);
+    const historicalBefore = await getCurrentIntegrationRecord(github, seeded.oldIdentity);
+    github.__statuses.splice(0);
+    github.__baseSha = HIST_B2;
+    const b2 = currentDriftIdentity(seeded.oldIdentity, HIST_B2, "2");
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse(lostC.createdAt) + 60_000, [b2]);
+    expect(github.__authorityVariables.has(seeded.names.fence)).toBe(false);
+    expect(github.__authorityVariables.has(seeded.authorized.authorization.anchor_name)).toBe(false);
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(false);
+    expect(await getCurrentIntegrationRecord(github, seeded.oldIdentity)).toEqual(historicalBefore);
+    const tombstones = historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber);
+    expect(tombstones).toHaveLength(1);
+    expect(tombstones[0]).toMatchObject({
+      kind: "historical_integration_identity_lost",
+      recovery_base_sha: HIST_B2,
+      request: { request_id: seeded.request.request_id, identity: seeded.oldIdentity },
+      commit: { kind: "integration_identity_lost_commit", attempt: 1, boundary_created_at: seeded.fence.created_at, fence_digest: lostC.fenceDigest },
+    });
+    await expect(currentIntegrationState(github, { identity: b2, pr: { number: b2.prNumber } } as unknown as EvaluationSnapshot, Date.parse(lostC.createdAt) + 120_000))
+      .resolves.toMatchObject({ state: "none" });
+  });
+
+  it("recovers a crash after lost C when B1 is no longer current instead of trying to publish fresh B1 d3", async () => {
+    const github = makeHistoricalGithub();
+    const seeded = await seedHistoricalAmbiguity(github, 602, "0000000000000602");
+    const lostC = await claimHistoricalLostC(github, seeded);
+    const oldBefore = await getCurrentIntegrationRecord(github, seeded.oldIdentity);
+    github.__baseSha = HIST_B2;
+    const b2 = currentDriftIdentity(seeded.oldIdentity, HIST_B2, "3");
+    await expect(reclaimOrphanIntegrationAuthorityVariables(github, Date.parse(lostC.createdAt) + 1, [b2])).resolves.toBeUndefined();
+    const oldAfter = await getCurrentIntegrationRecord(github, seeded.oldIdentity);
+    expect(oldAfter).toEqual(oldBefore);
+    expect(oldAfter?.terminal).toBeNull();
+    expect(historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toHaveLength(1);
+  });
+
+  it("makes monotonic B1 to B2 to B3 progress when B2 advances during tombstone publication", async () => {
+    const github = makeHistoricalGithub();
+    const seeded = await seedHistoricalAmbiguity(github, 603, "0000000000000603");
+    const lostC = await claimHistoricalLostC(github, seeded);
+    github.__baseSha = HIST_B2;
+    const b2 = currentDriftIdentity(seeded.oldIdentity, HIST_B2, "4");
+    let advanced = false;
+    github.__beforeRevisionCheck = () => { if (!advanced) { advanced = true; github.__baseSha = HIST_B3; } };
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse(lostC.createdAt) + 1, [b2]);
+    expect(advanced).toBe(true);
+    expect(github.__authorityVariables.has(seeded.names.fence)).toBe(true);
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(true);
+    expect(historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toEqual([]);
+    github.__beforeRevisionCheck = undefined;
+    const b3 = currentDriftIdentity(seeded.oldIdentity, HIST_B3, "5");
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse(lostC.createdAt) + 2, [b3]);
+    expect(github.__authorityVariables.has(seeded.names.fence)).toBe(false);
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(false);
+    const tombstones = historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber);
+    expect(tombstones).toHaveLength(1);
+    expect(tombstones[0]?.recovery_base_sha).toBe(HIST_B3);
+  });
+
+  it("keeps delayed historical B/S inert after lost C cleanup and removes them from the durable tombstone alone", async () => {
+    const github = makeHistoricalGithub();
+    const seeded = await seedHistoricalAmbiguity(github, 604, "0000000000000604");
+    const lostC = await claimHistoricalLostC(github, seeded);
+    github.__baseSha = HIST_B2;
+    const b2 = currentDriftIdentity(seeded.oldIdentity, HIST_B2, "6");
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse(lostC.createdAt) + 1, [b2]);
+    await installDelayedHistoricalBindingAndStart(github, seeded, 160401);
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse(lostC.createdAt) + 2, [b2]);
+    expect(github.__authorityVariables.has(seeded.names.binding)).toBe(false);
+    expect(github.__authorityVariables.has(integrationRunStartVariableName(seeded.request))).toBe(false);
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(false);
+    expect((await getCurrentIntegrationRecord(github, seeded.oldIdentity))?.run).toBeNull();
+    expect(historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toHaveLength(1);
+  });
+
+  it("preserves exact L that won before the protected-base advance and never replaces it with identity_lost", async () => {
+    const github = makeHistoricalGithub();
+    const seeded = await seedHistoricalAmbiguity(github, 605, "0000000000000605");
+    const htmlUrl = "https://github.com/JohnnyZLi/Fugue/actions/runs/160501";
+    const bound = await bindDispatchedIntegrationRun(
+      github,
+      { identity: seeded.oldIdentity, pr: { number: seeded.oldIdentity.prNumber } } as unknown as EvaluationSnapshot,
+      seeded.request.request_id, 160501, htmlUrl, "2026-08-18T20:00:02.000Z",
+    );
+    github.__authorityVariables.set(seeded.names.binding, JSON.stringify({
+      version: 1, kind: "integration_binding_witness", request_id: seeded.request.request_id,
+      pr_number: seeded.oldIdentity.prNumber, head_sha: seeded.oldIdentity.headSha, base_sha: seeded.oldIdentity.baseSha,
+      anchor_name: seeded.authorized.authorization.anchor_name, run_token: seeded.runToken, authority_actor_id: 424242,
+      run_id: 160501, run_attempt: 1, run_created_at: bound.run!.created_at, html_url: htmlUrl,
+    }));
+    github.__baseSha = HIST_B2;
+    const b2 = currentDriftIdentity(seeded.oldIdentity, HIST_B2, "7");
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T20:30:00.000Z"), [b2]);
+    expect(github.__authorityVariables.has(seeded.names.binding)).toBe(false);
+    expect((await getCurrentIntegrationRecord(github, seeded.oldIdentity))?.run?.id).toBe(160501);
+    expect(historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toEqual([]);
+  });
+
+  it("preserves proven-no-attempt historical aborted as the only retryable outcome and does not mint lost tombstone", async () => {
+    const github = makeHistoricalGithub();
+    const seeded = await seedHistoricalAmbiguity(github, 606, "0000000000000606");
+    const abortedAt = new Date(Date.parse(seeded.record.created_at) + 1).toISOString();
+    const aborted = await publishIntegrationRecord(github, {
+      ...seeded.record,
+      terminal: { state: "aborted", detail: "protected evidence proves no attempt was created", created_at: abortedAt },
+      created_at: abortedAt,
+    });
+    github.__authorityVariables.set(seeded.authorized.authorization.anchor_name, seeded.anchorBody);
+    github.__baseSha = HIST_B2;
+    const b2 = currentDriftIdentity(seeded.oldIdentity, HIST_B2, "8");
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse(abortedAt) + 1, [b2]);
+    expect((await getCurrentIntegrationRecord(github, seeded.oldIdentity))?.terminal).toEqual(aborted.terminal);
+    expect(github.__authorityVariables.has(seeded.authorized.authorization.anchor_name)).toBe(false);
+    expect(historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toEqual([]);
   });
 });
