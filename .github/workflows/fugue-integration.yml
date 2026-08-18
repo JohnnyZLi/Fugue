@@ -1,5 +1,5 @@
 name: Fugue Integration
-run-name: "Fugue Integration PR #${{ inputs.pr }} ${{ inputs.request_id }}"
+run-name: "Fugue Integration PR #${{ inputs.pr }} ${{ inputs.request_id }} ${{ inputs.run_token }}"
 
 on:
   workflow_dispatch:
@@ -18,6 +18,10 @@ on:
         type: string
       authority_anchor:
         description: Exact immutable Fugue Authority request anchor
+        required: true
+        type: string
+      run_token:
+        description: Secret-derived one-run correlation token
         required: true
         type: string
 
@@ -88,7 +92,7 @@ jobs:
           FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}
         run: |
           node --input-type=module <<'NODE'
-          import { createHash } from 'node:crypto';
+          import { createHash, createHmac } from 'node:crypto';
           import { readFileSync } from 'node:fs';
 
           const repository = process.env.GITHUB_REPOSITORY;
@@ -99,16 +103,21 @@ jobs:
           const prNumber = Number(inputs.pr);
           const secret = String(inputs.dispatch_secret ?? '');
           const anchorName = String(inputs.authority_anchor ?? '');
+          const runToken = String(inputs.run_token ?? '');
           const runId = Number(process.env.GITHUB_RUN_ID);
           const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
           const baseSha = process.env.GITHUB_SHA;
           if (!/^int-[0-9a-f]{16}-[0-9a-f]{16}$/.test(requestId) || !Number.isInteger(prNumber) || prNumber <= 0 ||
               !/^[0-9a-f]{64}$/i.test(secret) || !/^FUGUE_INT_A_\d{10}_[0-9A-F]{16}$/.test(anchorName) ||
-              !Number.isInteger(runId) || runId <= 0 || runAttempt !== 1 || !/^[0-9a-f]{40}$/i.test(baseSha)) {
+              !/^[0-9a-f]{24}$/.test(runToken) || !Number.isInteger(runId) || runId <= 0 || runAttempt !== 1 ||
+              !/^[0-9a-f]{40}$/i.test(baseSha)) {
             throw new Error('Invalid protected Integration dispatch context.');
           }
           process.stdout.write('::add-mask::' + secret + '\n');
           const digest = createHash('sha256').update(secret, 'utf8').digest('hex');
+          const expectedRunToken = createHmac('sha256', Buffer.from(secret, 'hex'))
+            .update(`fugue-integration-run\0${requestId}`, 'utf8').digest('hex').slice(0, 24);
+          if (runToken !== expectedRunToken) throw new Error('Protected Integration run token does not match its one-use dispatch capability.');
           const requestToken = createHash('sha256').update(requestId, 'utf8').digest('hex').slice(0, 16).toUpperCase();
           const startName = `FUGUE_INT_S_${String(prNumber).padStart(10, '0')}_${requestToken}`;
           const apiBase = `https://api.github.com/repos/${owner}/${repo}`;
