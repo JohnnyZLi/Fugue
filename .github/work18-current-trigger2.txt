@@ -1,0 +1,1 @@
+apply refined current Issue #18 QA repairs
