@@ -66,7 +66,7 @@ d3 durable Coordinator snapshot on protected base
     immutable authorized Human issue-event contents before canonicalization
 
 d3 durable Integration record on candidate head
-    exact request ID, one protected run ID / attempt 1, and terminal result
+    exact request ID, attempt 1, and terminal result; numeric run ID is omitted only for terminal identity_lost
 
 ordinary issue/PR/protocol comments
     repairable Human-facing mirrors unless explicitly canonical QA/Human evidence
@@ -171,13 +171,13 @@ VALIDATE
     validation evidence carries the exact request ID + run ID + attempt 1
 
 TERMINAL
-    protected Fugue commits PASS/failure/error to the d3 Integration record first
-    then writes presentation attestation comment / fugue/integration status
+    protected Fugue commits PASS/failure/error or the sole run-ID-optional identity_lost outcome
+    to the d3 Integration record first, then writes presentation mirrors
 ```
 
 Deployment, Deployment Status, workflow-run/history pagination, public run titles/tokens, actor/login presentation, and custom Git refs are not binding authority. Protected reconciliation creates one request-specific `FUGUE_INT_F_*` fence before POST, keeps the API `2026-03-10` `return_run_details: true` response as the primary exact binding, and can independently recover from a create-only Authority-App-authenticated `FUGUE_INT_B_*` exact-run witness or the OIDC-signed run-start. F/B lookup is request-local constant work, so later history volume, deletion, or page shifting cannot lower or replace L. Concurrent protected reconcilers still converge through first-create-wins request authority; no live Authority name is PATCHed or reused.
 
-If no pre-dispatch fence exists, the existing pre-POST no-run recovery may safely abort/retry after grace. Once F exists, the request can never be redispatched or replaced. A returned binding, B witness, or OIDC run-start establishes exact L; deletion of that Actions run then fails closed to terminal failure while preserving its run ID. There is one explicit information-loss boundary: if GitHub creates L, the synchronous response is lost, and `actions:write` prevents every protected exact-run witness before deleting L, only the may-have-dispatched fence survives. No GitHub-only trusted record then contains L's numeric run ID, so Fugue remains unresolved rather than inventing a terminal run or consulting attacker-writable history. Full liveness for that literal sequence requires an atomic create-and-durable-bind primitive or an attacker-independent durable observer.
+If no pre-dispatch fence exists, the existing provably-pre-POST no-run recovery may safely abort/retry after grace. Once F exists, the ambiguous request can never be redispatched or replaced. A returned binding, B witness, or OIDC run-start establishes exact L and always wins before terminalization; deletion of that known Actions run then fails closed to terminal failure while preserving its run ID. If F survives but the synchronous response and every attacker-resistant exact-run witness are unavailable or destroyed through bounded grace—including the indistinguishable crash immediately before POST—the revised protocol commits terminal `identity_lost`. That protected d3 terminal carries the exact request/evaluation identity, attempt 1, and F-boundary digest/time, deliberately omits numeric run ID, is never PASS or merge-ready, never retries/elects a later run, and requires explicit Human action for any fresh Integration. Only after the terminal commit are request-specific F/B/anchor/run-start slots reclaimed, with idempotent reconciliation completing cleanup after crashes.
 
 Terminal PASS/failure is stored in the durable record and therefore survives deletion of the workflow run, request comment, Integration result/attestation comment, or UI status. A terminal PASS embeds the full Integration attestation plus exact request ID, run ID, and attempt 1. `fugue/integration` remains the branch-protection/UI signal; it is not durable authority by itself.
 
@@ -218,7 +218,7 @@ work ID
 work-spec digest
 ```
 
-Integration additionally binds its exact request ID, protected workflow-run ID, and attempt 1.
+Integration additionally binds its exact request ID and attempt 1. Known-run outcomes also bind the protected workflow-run ID; terminal `identity_lost` is the sole intentional run-ID exception.
 
 ## Repository bootstrap
 

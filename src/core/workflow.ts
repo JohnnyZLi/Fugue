@@ -106,6 +106,9 @@ export function planWork(observation: WorkflowObservation): WorkflowAction {
 
   if (observation.integration === "success") return { kind: "ready_to_merge" };
   if (observation.integration === "pending") return { kind: "wait_integration" };
+  if (observation.integration === "identity_lost") {
+    return { kind: "blocked", reason: "Integration attempt-1 identity is durably lost; explicit Human action is required to authorize a fresh Integration request." };
+  }
   if (observation.integration === "failure" || observation.integration === "error") {
     return { kind: "blocked", reason: `Integration is ${observation.integration}; inspect durable evidence before retrying.` };
   }

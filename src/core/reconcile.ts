@@ -39,7 +39,9 @@ import {
   INTEGRATION_REQUEST_RECOVERY_GRACE_MS,
   integrationDispatchRunToken,
   markIntegrationDispatchStarted,
+  publishIntegrationRecord,
   reclaimOrphanIntegrationAuthorityVariables,
+  releaseIntegrationAuthorityVariable,
   sealIntegrationWorkflowRunEvent,
 } from "./integration-status.js";
 import { FUGUE_PROTOCOL_ACTOR } from "./provenance.js";
@@ -109,21 +111,13 @@ interface ProtectedIntegrationBindingWitness {
 export type ProtectedIntegrationRecoveryDecision =
   | { kind: "bind"; runId: number; createdAt: string; htmlUrl: string }
   | { kind: "pending" }
-  | { kind: "unresolved" };
-
-export class IntegrationExactRunIdentityUnavailableError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "IntegrationExactRunIdentityUnavailableError";
-  }
-}
+  | { kind: "identity_lost" };
 
 /**
- * The hosted lost-bind state machine has no history cursor. Its complete authoritative input is the
- * request-local Authority fence plus, if GitHub created attempt 1, the create-only exact-run witness.
- * Repeated invocations therefore do constant work and can only move fence -> exact witness -> d3 binding,
- * remain pending, or become explicitly unresolved. An unresolved fence is never converted into retry or a
- * terminal record missing the exact run ID; later workflow/deployment/history records cannot replace it.
+ * Hosted lost-bind recovery does constant request-local work: exact protected evidence wins immediately;
+ * an F-only may-have-dispatched boundary waits through one bounded grace interval and then converges to the
+ * sole run-ID-optional terminal outcome, identity_lost. It never consults mutable history, retries the
+ * ambiguous request, or elects a later run.
  */
 export function protectedIntegrationRecoveryDecision(input: {
   requestCreatedAt: string;
@@ -138,7 +132,7 @@ export function protectedIntegrationRecoveryDecision(input: {
   const boundary = input.fenceCreatedAt ?? input.dispatchStartedAt ?? input.requestCreatedAt;
   const started = Date.parse(boundary);
   if (!Number.isFinite(started) || input.now - started >= INTEGRATION_REQUEST_RECOVERY_GRACE_MS) {
-    return { kind: "unresolved" };
+    return { kind: "identity_lost" };
   }
   return { kind: "pending" };
 }
@@ -195,6 +189,7 @@ export async function reconcileWork(github: FugueGitHub, issueNumber: number): P
 
     if (work.pr) {
       const snapshot = await captureEvaluation(github, work.pr.number);
+      await cleanupTerminalProtectedIntegrationRecovery(github, snapshot);
       const submissions = await processCurrentSubmissions(github, snapshot);
       if (submissions.blockedReason) {
         await upsertStateComment(github, work, { kind: "blocked", reason: submissions.blockedReason });
@@ -645,6 +640,23 @@ async function cleanupProtectedIntegrationRecovery(github: FugueGitHub, requestI
   await deleteFugueAuthorityVariable(github, integrationDispatchFenceName(requestId));
 }
 
+export async function cleanupTerminalProtectedIntegrationRecovery(
+  github: FugueGitHub,
+  snapshot: Awaited<ReturnType<typeof captureEvaluation>>,
+): Promise<boolean> {
+  const current = await getCurrentIntegrationRecord(github, snapshot.identity);
+  if (!current || current.terminal?.state !== "identity_lost") return false;
+  // Durable d3 terminal authority already exists. Every delete below is request-specific and idempotent;
+  // a crash at any point can only leave redundant transient state for the next reconciliation to remove.
+  await releaseIntegrationAuthorityVariable(github, current);
+  await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
+  return true;
+}
+
+function protectedIntegrationFenceDigest(fence: ProtectedIntegrationDispatchFence): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(fence), "utf8").digest("hex")}`;
+}
+
 function assertProtectedFenceMatchesRecord(
   fence: ProtectedIntegrationDispatchFence,
   current: Awaited<ReturnType<typeof getCurrentIntegrationRecord>>,
@@ -674,15 +686,22 @@ function assertProtectedWitnessMatchesFence(
   }
 }
 
-async function recoverExistingProtectedIntegration(
+export async function recoverExistingProtectedIntegration(
   github: FugueGitHub,
   snapshot: Awaited<ReturnType<typeof captureEvaluation>>,
   now: number,
 ): Promise<boolean> {
   const actorId = integrationAuthorityActorId();
   if (actorId === undefined) return false;
-  const current = await getCurrentIntegrationRecord(github, snapshot.identity);
-  if (!current || current.terminal) return false;
+  let current = await getCurrentIntegrationRecord(github, snapshot.identity);
+  if (!current) return false;
+  if (current.terminal) {
+    if (current.terminal.state === "identity_lost") {
+      await releaseIntegrationAuthorityVariable(github, current);
+      await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
+    }
+    return true;
+  }
   if (current.run) {
     await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
     return true;
@@ -696,17 +715,17 @@ async function recoverExistingProtectedIntegration(
   }
 
   const fence = await readProtectedIntegrationDispatchFence(github, current.request.request_id);
-  // No F means the protected caller never crossed the pre-POST may-have-dispatched boundary. Let the
-  // canonical request state machine retain its existing pre-POST abort/retry recovery.
+  // No F means the protected caller never crossed the may-have-dispatched boundary. The older
+  // provably-pre-POST path remains separate; identity_lost is reserved for an existing protected F.
   if (!fence) return false;
   assertProtectedFenceMatchesRecord(fence, current, actorId);
-  const witness = await readProtectedIntegrationBindingWitness(github, current.request.request_id);
-  if (witness && fence) assertProtectedWitnessMatchesFence(witness, fence, github);
+  let witness = await readProtectedIntegrationBindingWitness(github, current.request.request_id);
+  if (witness) assertProtectedWitnessMatchesFence(witness, fence, github);
 
   const decision = protectedIntegrationRecoveryDecision({
     requestCreatedAt: current.request.created_at,
     dispatchStartedAt: current.dispatch_started_at,
-    fenceCreatedAt: fence?.created_at,
+    fenceCreatedAt: fence.created_at,
     witness: witness ? { runId: witness.run_id, createdAt: witness.run_created_at, htmlUrl: witness.html_url } : undefined,
     now,
   });
@@ -718,23 +737,54 @@ async function recoverExistingProtectedIntegration(
     return true;
   }
   if (decision.kind === "pending") {
-    if (fence && !current.dispatch_started_at) {
+    if (!current.dispatch_started_at) {
       await markIntegrationDispatchStarted(github, snapshot, current.request.request_id, fence.created_at);
     }
     return true;
   }
 
   if (!current.dispatch_started_at) {
-    await markIntegrationDispatchStarted(github, snapshot, current.request.request_id, fence.created_at);
+    current = await markIntegrationDispatchStarted(github, snapshot, current.request.request_id, fence.created_at);
   }
-  // GitHub created-attempt identity is information that cannot be reconstructed from F alone. If the
-  // synchronous response and every protected exact-run witness were both lost/prevented, fabricating a
-  // terminal result would violate the record schema's exact request/run/attempt authority. Retain F and
-  // block indefinitely: no retry/replay is allowed, and a late authentic B/run-start may still recover L.
-  throw new IntegrationExactRunIdentityUnavailableError(
-    `Integration request ${current.request.request_id} may have created attempt 1, but no attacker-resistant exact run-ID witness survived. ` +
-    "Fugue will not consult Deployment/Status/history, fabricate a run ID, or retry this request.",
-  );
+
+  // Give every attacker-resistant exact-L source one final request-local read before committing the
+  // irreversible exception. Any genuine exact evidence observed here wins over identity_lost.
+  const finalStart = await getIntegrationRunStartEvidence(github, current);
+  if (finalStart) {
+    await bindIntegrationRun(github, snapshot, current.request.request_id, finalStart.run_id);
+    await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
+    return true;
+  }
+  witness = await readProtectedIntegrationBindingWitness(github, current.request.request_id);
+  if (witness) {
+    assertProtectedWitnessMatchesFence(witness, fence, github);
+    await bindDispatchedIntegrationRun(
+      github, snapshot, current.request.request_id, witness.run_id, witness.html_url, witness.run_created_at,
+    );
+    await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
+    return true;
+  }
+
+  const terminalAt = new Date(now).toISOString();
+  const terminal = await publishIntegrationRecord(github, {
+    ...current,
+    dispatch_started_at: current.dispatch_started_at ?? fence.created_at,
+    run: null,
+    terminal: {
+      state: "identity_lost",
+      attempt: 1,
+      boundary_created_at: fence.created_at,
+      fence_digest: protectedIntegrationFenceDigest(fence),
+      detail: "Protected dispatch may have created attempt 1, but the synchronous returned run identity and every attacker-resistant exact-run witness are unavailable; this request is terminal and requires explicit Human action for any fresh Integration.",
+      created_at: terminalAt,
+    },
+    created_at: terminalAt,
+  });
+  // Cleanup is strictly post-commit. If either delete crashes, the next work reconciliation sees the
+  // same irreversible d3 terminal and resumes these idempotent request-specific deletions.
+  await releaseIntegrationAuthorityVariable(github, terminal);
+  await cleanupProtectedIntegrationRecovery(github, terminal.request.request_id);
+  return true;
 }
 
 async function createProtectedIntegrationDispatchFence(
@@ -831,10 +881,9 @@ async function dispatchProtectedIntegrationWithAuthorityApp(
     return;
   }
   // The POST succeeded but the exact synchronous identity did not survive. F remains create-only and
-  // prevents redispatch; requested/completed B or the OIDC run-start may still recover the exact L.
-  throw new IntegrationExactRunIdentityUnavailableError(
-    `Protected Integration dispatch for ${requestId} succeeded without a valid exact returned run identity; the dispatch fence is retained.`,
-  );
+  // prevents redispatch; B/run-start may still recover exact L through grace, otherwise F converges to
+  // durable terminal identity_lost on a later reconciliation.
+  return;
 }
 
 async function bindProtectedIntegrationWorkflowRunEvent(
@@ -877,10 +926,8 @@ export async function dispatchIntegration(github: FugueGitHub, policy: ActivePol
   const actorId = integrationAuthorityActorId();
   if (actorId !== undefined) {
     const existing = await getCurrentIntegrationRecord(github, snapshot.identity);
-    if (existing && !existing.terminal) {
-      if (await recoverExistingProtectedIntegration(github, snapshot, now)) return;
-      // No F/B/start/run exists: this remains the canonical pre-POST recovery path.
-    }
+    if (existing && await recoverExistingProtectedIntegration(github, snapshot, now)) return;
+    // No F/B/start/run exists: this remains the canonical provably-pre-POST recovery path.
   }
 
   const next = await ensureIntegrationDispatch(github, snapshot, now);

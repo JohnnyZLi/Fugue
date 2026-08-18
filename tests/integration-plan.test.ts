@@ -262,7 +262,7 @@ describe("GitHub-hosted Integration plan", () => {
     expect(result.kind === "bind" ? result.runId : 0).not.toBe(laterReplayA.runId);
   });
 
-  it("keeps a stranded may-have-dispatched fence unresolved without fabricating terminal authority or retry", () => {
+  it("terminalizes a stranded may-have-dispatched fence as identity_lost without fabricating run authority or retry", () => {
     const input = {
       requestCreatedAt: "2026-08-18T07:00:00.000Z",
       fenceCreatedAt: "2026-08-18T07:00:01.000Z",
@@ -272,7 +272,7 @@ describe("GitHub-hosted Integration plan", () => {
         ...input,
         now: Date.parse("2026-08-18T07:11:00.000Z") + invocation * 15 * 60 * 1000,
       });
-      expect(result).toEqual({ kind: "unresolved" });
+      expect(result).toEqual({ kind: "identity_lost" });
       expect(result).not.toHaveProperty("runId");
     }
   });
@@ -283,12 +283,13 @@ describe("GitHub-hosted Integration plan", () => {
     // F was committed before POST. GitHub then created L, but the response/process was lost and an
     // actions:write adversary prevented requested/completed witness consumers and deleted L. Neither
     // L nor A is trusted input now; attacker-writable Deployment/Status/history cannot fill that gap.
+    // The revised exact-identity exception therefore terminalizes the request as identity_lost.
     const result = protectedIntegrationRecoveryDecision({
       requestCreatedAt: "2026-08-18T07:00:00.000Z",
       fenceCreatedAt: "2026-08-18T07:00:01.000Z",
       now: Date.parse("2026-08-18T07:30:00.000Z"),
     });
-    expect(result).toEqual({ kind: "unresolved" });
+    expect(result).toEqual({ kind: "identity_lost" });
     expect(result).not.toHaveProperty("runId");
     expect(legitimateCreatedRunL).not.toBe(laterReplayA);
   });

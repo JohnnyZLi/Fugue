@@ -35,7 +35,7 @@ import {
   recoverDurableProtocolRecord,
 } from "./state.js";
 
-export type IntegrationState = "none" | "pending" | "success" | "failure" | "error" | "stale";
+export type IntegrationState = "none" | "pending" | "success" | "failure" | "error" | "identity_lost" | "stale";
 
 export interface CurrentIntegrationState {
   state: IntegrationState;
@@ -971,6 +971,7 @@ async function createIntegrationLocator(github: FugueGitHub, record: Integration
   const label = record.terminal?.state === "success" ? "PASS" :
     record.terminal?.state === "failure" ? "FAILED" :
     record.terminal?.state === "error" ? "ERROR" :
+    record.terminal?.state === "identity_lost" ? "IDENTITY LOST" :
     record.terminal?.state === "aborted" ? "ABORTED" : record.run ? "BOUND" : "REQUESTED";
   await createProtocolComment(
     github,

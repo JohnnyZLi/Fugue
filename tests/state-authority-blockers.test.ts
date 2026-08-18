@@ -4,11 +4,11 @@ import type { FugueGitHub } from "../src/core/github.js";
 import type { EvaluationSnapshot } from "../src/core/evaluation.js";
 import type { ActivePolicy } from "../src/core/policy.js";
 import { workMetadataSchema } from "../src/core/metadata.js";
-import { ingestCoordinatorIssueEvent, protectedIntegrationRecoveryDecision } from "../src/core/reconcile.js";
+import { cleanupTerminalProtectedIntegrationRecovery, ingestCoordinatorIssueEvent, protectedIntegrationRecoveryDecision, recoverExistingProtectedIntegration } from "../src/core/reconcile.js";
 import { completeReview, currentReviewActivities } from "../src/core/reviews.js";
 import { hasCurrentHumanAcknowledgement, processCurrentSubmissions } from "../src/core/submissions.js";
 import { verifyHumanControlPlanePrerequisite } from "../src/core/integration.js";
-import { createIntegrationRecord, createIntegrationRequest } from "../src/core/integration-plan.js";
+import { createIntegrationRecord, createIntegrationRequest, type IntegrationRecord } from "../src/core/integration-plan.js";
 import { authorizeIntegrationDispatch, bindDispatchedIntegrationRun, ensureIntegrationDispatch, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, integrationDispatchRunToken, publishIntegrationRecord, sealIntegrationWorkflowRunEvent } from "../src/core/integration-status.js";
 import { humanControlPlaneAttestationSchema, qaAttestationSchema, reviewStartSchema, serializeAttestation } from "../src/core/attestations.js";
 import {
@@ -396,6 +396,80 @@ function immutableUserComment(id: number, body: string, login = "attacker"): Tes
     created_at: timestamp,
     updated_at: timestamp,
   };
+}
+
+
+const TEST_AUTHORITY_ACTOR_ID = 424242;
+
+function protectedRecoveryNames(requestId: string): { fence: string; binding: string } {
+  const suffix = createHash("sha256").update(requestId, "utf8").digest("hex").slice(0, 32).toUpperCase();
+  return { fence: `FUGUE_INT_F_${suffix}`, binding: `FUGUE_INT_B_${suffix}` };
+}
+
+function installProtectedFence(
+  github: TestGithub,
+  record: IntegrationRecord,
+  secret: string,
+  createdAt: string,
+): { raw: string; runToken: string; fence: Record<string, unknown>; names: { fence: string; binding: string } } {
+  if (!record.dispatch) throw new Error("test request lacks dispatch authorization");
+  const runToken = integrationDispatchRunToken(record.request.request_id, secret);
+  const fence = {
+    version: 1,
+    kind: "integration_dispatch_fence",
+    request_id: record.request.request_id,
+    pr_number: record.identity.prNumber,
+    head_sha: record.identity.headSha,
+    base_sha: record.identity.baseSha,
+    anchor_name: record.dispatch.anchor_name,
+    secret_digest: record.dispatch.secret_digest,
+    run_token: runToken,
+    authority_actor_id: TEST_AUTHORITY_ACTOR_ID,
+    created_at: createdAt,
+  };
+  const raw = JSON.stringify(fence);
+  const names = protectedRecoveryNames(record.request.request_id);
+  github.__authorityVariables.set(names.fence, raw);
+  return { raw, runToken, fence, names };
+}
+
+function installProtectedBinding(
+  github: TestGithub,
+  record: IntegrationRecord,
+  fence: Record<string, unknown>,
+  runId: number,
+  runCreatedAt: string,
+): string {
+  const names = protectedRecoveryNames(record.request.request_id);
+  const htmlUrl = `https://github.com/JohnnyZLi/Fugue/actions/runs/${runId}`;
+  github.__authorityVariables.set(names.binding, JSON.stringify({
+    version: 1,
+    kind: "integration_binding_witness",
+    request_id: record.request.request_id,
+    pr_number: record.identity.prNumber,
+    head_sha: record.identity.headSha,
+    base_sha: record.identity.baseSha,
+    anchor_name: record.dispatch?.anchor_name,
+    run_token: fence.run_token,
+    authority_actor_id: TEST_AUTHORITY_ACTOR_ID,
+    run_id: runId,
+    run_attempt: 1,
+    run_created_at: runCreatedAt,
+    html_url: htmlUrl,
+  }));
+  return htmlUrl;
+}
+
+async function withHostedAuthority<T>(callback: () => Promise<T>): Promise<T> {
+  const oldToken = process.env.FUGUE_AUTHORITY_TOKEN;
+  const oldActor = process.env.FUGUE_AUTHORITY_ACTOR_ID;
+  process.env.FUGUE_AUTHORITY_TOKEN = "test-authority-token";
+  process.env.FUGUE_AUTHORITY_ACTOR_ID = String(TEST_AUTHORITY_ACTOR_ID);
+  try { return await callback(); }
+  finally {
+    if (oldToken === undefined) delete process.env.FUGUE_AUTHORITY_TOKEN; else process.env.FUGUE_AUTHORITY_TOKEN = oldToken;
+    if (oldActor === undefined) delete process.env.FUGUE_AUTHORITY_ACTOR_ID; else process.env.FUGUE_AUTHORITY_ACTOR_ID = oldActor;
+  }
 }
 
 describe("absorbed Code QA / Security QA authority blockers", () => {
@@ -942,5 +1016,215 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     );
   });
 
+
+
+  it("terminalizes lost returned run identity as durable identity_lost and rejects later replay", async () => {
+    await withHostedAuthority(async () => {
+      const github = makeGithub();
+      const identity = {
+        prNumber: 19, headSha: "d".repeat(40), baseBranch: "main", baseSha: BASE,
+        policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
+        workSpecDigest: "sha256:revised-spec",
+      };
+      const snapshot = { identity, pr: { number: 19 } } as unknown as EvaluationSnapshot;
+      const request = createIntegrationRequest(identity, "2026-08-17T10:00:00.000Z", "a".repeat(16));
+      const secret = "b".repeat(64);
+      const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T10:00:00.000Z", secret);
+      let record = await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+        dispatch: authorized.authorization, createdAt: "2026-08-17T10:00:00.000Z",
+      }));
+      github.__authorityVariables.delete(authorized.electionName);
+      const protectedFence = installProtectedFence(github, record, secret, "2026-08-17T10:00:01.000Z");
+
+      // Model POST creating L, loss of the synchronous response/process, suppression of every
+      // protected exact-run consumer, and Actions deletion of L before run-start. Only F survives.
+      await expect(recoverExistingProtectedIntegration(
+        github, snapshot, Date.parse("2026-08-17T10:05:00.000Z"),
+      )).resolves.toBe(true);
+      expect((await getCurrentIntegrationRecord(github, identity))?.terminal).toBeNull();
+
+      await expect(recoverExistingProtectedIntegration(
+        github, snapshot, Date.parse("2026-08-17T10:11:00.000Z"),
+      )).resolves.toBe(true);
+      record = (await getCurrentIntegrationRecord(github, identity))!;
+      expect(record.run).toBeNull();
+      expect(record.terminal).toMatchObject({
+        state: "identity_lost",
+        attempt: 1,
+        boundary_created_at: "2026-08-17T10:00:01.000Z",
+        fence_digest: `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`,
+      });
+      expect(record.request.request_id).toBe(request.request_id);
+      expect(record.identity).toEqual(identity);
+      await expect(ensureIntegrationDispatch(github, snapshot, Date.parse("2026-08-17T10:30:00.000Z")))
+        .resolves.toEqual({ request: record.request, dispatch: false });
+      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);
+      expect(github.__authorityVariables.has(protectedFence.names.binding)).toBe(false);
+
+      github.__comments.splice(0);
+      github.__statuses.splice(0);
+      github.__workflowRuns.splice(0);
+      expect((await getCurrentIntegrationRecord(github, identity))?.terminal?.state).toBe("identity_lost");
+
+      const A = {
+        id: 99002, actor: BOT, event: "workflow_dispatch", head_sha: BASE,
+        display_title: `Fugue Integration PR #19 ${request.request_id} ${protectedFence.runToken}`,
+        created_at: "2026-08-17T10:20:00.000Z", run_attempt: 1, status: "completed", conclusion: "success",
+        html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/99002",
+      };
+      github.__workflowRuns.push(A);
+      await expect(sealIntegrationWorkflowRunEvent(github, {
+        eventName: "workflow_run", workflowName: "Fugue Integration", runId: A.id, runAttempt: 1,
+        conclusion: A.conclusion, status: A.status, headSha: BASE, displayTitle: A.display_title,
+        createdAt: A.created_at, htmlUrl: A.html_url, actor: BOT.login,
+      })).resolves.toBe(false);
+      const afterReplay = await getCurrentIntegrationRecord(github, identity);
+      expect(afterReplay?.run).toBeNull();
+      expect(afterReplay?.terminal?.state).toBe("identity_lost");
+    });
+  });
+
+  it("binds surviving protected exact L before identity_lost terminalization", async () => {
+    await withHostedAuthority(async () => {
+      const github = makeGithub();
+      const identity = {
+        prNumber: 20, headSha: "e".repeat(40), baseBranch: "main", baseSha: BASE,
+        policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
+        workSpecDigest: "sha256:revised-spec",
+      };
+      const snapshot = { identity, pr: { number: 20 } } as unknown as EvaluationSnapshot;
+      const request = createIntegrationRequest(identity, "2026-08-17T11:00:00.000Z", "c".repeat(16));
+      const secret = "d".repeat(64);
+      const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T11:00:00.000Z", secret);
+      const record = await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+        dispatch: authorized.authorization, createdAt: "2026-08-17T11:00:00.000Z",
+      }));
+      github.__authorityVariables.delete(authorized.electionName);
+      const protectedFence = installProtectedFence(github, record, secret, "2026-08-17T11:00:01.000Z");
+      const htmlUrl = installProtectedBinding(github, record, protectedFence.fence, 99101, "2026-08-17T11:00:02.000Z");
+
+      await expect(recoverExistingProtectedIntegration(
+        github, snapshot, Date.parse("2026-08-17T11:30:00.000Z"),
+      )).resolves.toBe(true);
+      const bound = await getCurrentIntegrationRecord(github, identity);
+      expect(bound?.run).toMatchObject({ id: 99101, attempt: 1, html_url: htmlUrl });
+      expect(bound?.terminal).toBeNull();
+      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);
+      expect(github.__authorityVariables.has(protectedFence.names.binding)).toBe(false);
+    });
+  });
+
+  it("converges an F-only pre-POST ambiguity deterministically instead of remaining unresolved", async () => {
+    await withHostedAuthority(async () => {
+      const github = makeGithub();
+      const identity = {
+        prNumber: 21, headSha: "1".repeat(40), baseBranch: "main", baseSha: BASE,
+        policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
+        workSpecDigest: "sha256:revised-spec",
+      };
+      const snapshot = { identity, pr: { number: 21 } } as unknown as EvaluationSnapshot;
+      const request = createIntegrationRequest(identity, "2026-08-17T12:00:00.000Z", "e".repeat(16));
+      const secret = "f".repeat(64);
+      const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T12:00:00.000Z", secret);
+      const record = await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+        dispatch: authorized.authorization, createdAt: "2026-08-17T12:00:00.000Z",
+      }));
+      github.__authorityVariables.delete(authorized.electionName);
+      installProtectedFence(github, record, secret, "2026-08-17T12:00:01.000Z");
+
+      for (let index = 0; index < 8; index += 1) {
+        await expect(recoverExistingProtectedIntegration(
+          github, snapshot, Date.parse("2026-08-17T12:05:00.000Z"),
+        )).resolves.toBe(true);
+        expect((await getCurrentIntegrationRecord(github, identity))?.terminal).toBeNull();
+      }
+      await expect(recoverExistingProtectedIntegration(
+        github, snapshot, Date.parse("2026-08-17T12:11:00.000Z"),
+      )).resolves.toBe(true);
+      const firstTerminal = (await getCurrentIntegrationRecord(github, identity))!;
+      expect(firstTerminal.terminal?.state).toBe("identity_lost");
+      for (let index = 0; index < 12; index += 1) {
+        await expect(recoverExistingProtectedIntegration(
+          github, snapshot, Date.parse("2026-08-17T12:30:00.000Z") + index,
+        )).resolves.toBe(true);
+        expect(await getCurrentIntegrationRecord(github, identity)).toEqual(firstTerminal);
+      }
+    });
+  });
+
+  it("reclaims Authority slots across more than 64 sequential identity_lost requests", async () => {
+    await withHostedAuthority(async () => {
+      const github = makeGithub();
+      for (let index = 0; index < 65; index += 1) {
+        const identity = {
+          prNumber: 100 + index,
+          headSha: index.toString(16).padStart(40, "0"), baseBranch: "main", baseSha: BASE,
+          policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 1000 + index,
+          workId: `work-${1000 + index}`, workSpecDigest: "sha256:revised-spec",
+        };
+        const snapshot = { identity, pr: { number: identity.prNumber } } as unknown as EvaluationSnapshot;
+        const nonce = index.toString(16).padStart(16, "0");
+        const request = createIntegrationRequest(identity, "2026-08-17T13:00:00.000Z", nonce);
+        const secret = (index + 1).toString(16).padStart(64, "0");
+        const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T13:00:00.000Z", secret);
+        const record = await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+          dispatch: authorized.authorization, createdAt: "2026-08-17T13:00:00.000Z",
+        }));
+        github.__authorityVariables.delete(authorized.electionName);
+        installProtectedFence(github, record, secret, "2026-08-17T13:00:01.000Z");
+        await recoverExistingProtectedIntegration(github, snapshot, Date.parse("2026-08-17T13:11:00.000Z"));
+        expect((await getCurrentIntegrationRecord(github, identity))?.terminal?.state).toBe("identity_lost");
+        const transient = [...github.__authorityVariables.keys()].filter((name) =>
+          /^FUGUE_INT_[ABFS]_/.test(name));
+        expect(transient).toEqual([]);
+      }
+    });
+  }, 30000);
+
+  it("resumes crash-interrupted identity_lost cleanup without changing terminal authority", async () => {
+    await withHostedAuthority(async () => {
+      const github = makeGithub();
+      const identity = {
+        prNumber: 22, headSha: "2".repeat(40), baseBranch: "main", baseSha: BASE,
+        policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
+        workSpecDigest: "sha256:revised-spec",
+      };
+      const snapshot = { identity, pr: { number: 22 } } as unknown as EvaluationSnapshot;
+      const request = createIntegrationRequest(identity, "2026-08-17T14:00:00.000Z", "1".repeat(16));
+      const secret = "2".repeat(64);
+      const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T14:00:00.000Z", secret);
+      let record = await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+        dispatch: authorized.authorization, createdAt: "2026-08-17T14:00:00.000Z",
+      }));
+      github.__authorityVariables.delete(authorized.electionName);
+      const protectedFence = installProtectedFence(github, record, secret, "2026-08-17T14:00:01.000Z");
+
+      // Simulate a crash immediately after durable terminal commit, before F/B cleanup.
+      const terminalAt = "2026-08-17T14:11:00.000Z";
+      record = await publishIntegrationRecord(github, {
+        ...record,
+        dispatch_started_at: protectedFence.fence.created_at as string,
+        run: null,
+        terminal: {
+          state: "identity_lost", attempt: 1,
+          boundary_created_at: protectedFence.fence.created_at as string,
+          fence_digest: `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`,
+          detail: "simulated post-commit cleanup crash", created_at: terminalAt,
+        },
+        created_at: terminalAt,
+      });
+      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(true);
+      const durableBefore = await getCurrentIntegrationRecord(github, identity);
+
+      // Model partial cleanup/late redundant B, then let reconciliation finish idempotently.
+      installProtectedBinding(github, record, protectedFence.fence, 99222, "2026-08-17T14:00:02.000Z");
+      github.__authorityVariables.delete(protectedFence.names.fence);
+      await expect(cleanupTerminalProtectedIntegrationRecovery(github, snapshot)).resolves.toBe(true);
+      expect(github.__authorityVariables.has(protectedFence.names.binding)).toBe(false);
+      expect(await getCurrentIntegrationRecord(github, identity)).toEqual(durableBefore);
+      await expect(cleanupTerminalProtectedIntegrationRecovery(github, snapshot)).resolves.toBe(true);
+      expect(await getCurrentIntegrationRecord(github, identity)).toEqual(durableBefore);
+    });
+  });
 
 });

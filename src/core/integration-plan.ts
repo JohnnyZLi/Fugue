@@ -40,6 +40,14 @@ const integrationTerminalSchema = z.discriminatedUnion("state", [
     detail: z.string(),
     created_at: z.string().min(1),
   }),
+  z.object({
+    state: z.literal("identity_lost"),
+    attempt: z.literal(1),
+    boundary_created_at: z.string().min(1),
+    fence_digest: z.string().regex(/^sha256:[0-9a-f]{64}$/i),
+    detail: z.string(),
+    created_at: z.string().min(1),
+  }),
 ]);
 
 export const integrationRecordSchema = z.object({
@@ -52,6 +60,14 @@ export const integrationRecordSchema = z.object({
   run: integrationRunBindingSchema.nullable(),
   terminal: integrationTerminalSchema.nullable(),
   created_at: z.string().min(1),
+}).superRefine((value, context) => {
+  if (value.terminal?.state === "identity_lost" && value.run !== null) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["run"],
+      message: "Terminal identity_lost must intentionally omit numeric run identity.",
+    });
+  }
 });
 
 export const integrationPlanSchema = z.object({
