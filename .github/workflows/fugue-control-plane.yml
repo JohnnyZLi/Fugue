@@ -209,7 +209,7 @@ jobs:
               committed.head_sha?.toLowerCase() !== fence.head_sha.toLowerCase() ||
               committed.base_sha?.toLowerCase() !== fence.base_sha.toLowerCase() ||
               committed.anchor_name !== fence.anchor_name || committed.run_id !== runId || committed.run_attempt !== 1 ||
-              committed.run_created_at !== runCreatedAt || committed.html_url !== htmlUrl) {
+              !Number.isFinite(Date.parse(String(committed.run_created_at ?? ''))) || committed.html_url !== htmlUrl) {
             throw new Error('Protected Integration request-local commit was already claimed by another run.');
           }
 
