@@ -1,0 +1,6 @@
+worker_head=2c83b6c61167ac8714067fcbe6860fe3183dbb17
+work_spec_digest=sha256:d68ce1214ed0aee5e8d1cad0539d535ef2c9d7ce90ea1a74be06359e0c6953e1
+issue_updated_at=2026-08-18T04:28:24Z
+worker_id=wkr-b0057a9e
+worker_branch=agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+owns_blocker_test=true
