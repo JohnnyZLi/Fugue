@@ -49,6 +49,7 @@ jobs:
         run: |
           python3 control/.github/work18-repair.py work
           python3 control/.github/work18-repair-fix.py work
+          python3 control/.github/work18-repair-convergence.py work
       - name: Typecheck
         run: cd work && npm run check
       - name: Test
