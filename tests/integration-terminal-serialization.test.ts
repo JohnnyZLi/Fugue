@@ -98,28 +98,57 @@ describe("request-local Integration terminal serialization", () => {
     expect(status).toContain("known attempt 1 cannot become retryable transport");
   });
 
-  it("serializes both protected B and protected S through C and preserves only no-attempt aborted transport", () => {
+  it("serializes B/S through C and revalidates their cleanup prerequisites after C", () => {
     const control = readFileSync(new URL("../.github/workflows/fugue-control-plane.yml", import.meta.url), "utf8");
     const integration = readFileSync(new URL("../.github/workflows/fugue-integration.yml", import.meta.url), "utf8");
-    const status = readFileSync(new URL("../src/core/integration-status.ts", import.meta.url), "utf8");
 
+    const bCommit = control.indexOf("const committedRaw =");
+    const bRevalidate = control.indexOf("const fenceAfterCommit =", bCommit);
+    const bPublish = control.indexOf("const witness =", bCommit);
     expect(control).toContain("FUGUE_INT_C_${suffix}");
-    expect(control.indexOf("serializedCommit")).toBeLessThan(control.indexOf("const witness ="));
     expect(control).toContain("integration_identity_lost_commit') process.exit(0)");
+    expect(bCommit).toBeGreaterThanOrEqual(0);
+    expect(bRevalidate).toBeGreaterThan(bCommit);
+    expect(bPublish).toBeGreaterThan(bRevalidate);
+    expect(control).toContain("await deleteVariable(commitName)");
 
+    const sCommit = integration.indexOf("const commitVariable =");
+    const sFenceRevalidate = integration.indexOf("const fenceAfterCommit =", sCommit);
+    const sAnchorRevalidate = integration.indexOf("const anchorAfterCommit =", sCommit);
+    const sPublish = integration.indexOf("const startEvidence =", sCommit);
     expect(integration).toContain("FUGUE_INT_C_${suffix}");
-    expect(integration.indexOf("const exactCommit =")).toBeLessThan(integration.indexOf("const startEvidence ="));
     expect(integration).toContain("integration_identity_lost_commit') process.exit(0)");
-
-    // Retryable aborted remains solely on the no-exact-evidence path; known-run completions above it
-    // return a terminal failure/error instead of setting predecessorRequestId for a replacement.
-    expect(status).toContain("protected evidence proves no attempt was created");
-    expect(status).toContain('terminal: {\n          state: "aborted"');
+    expect(sCommit).toBeGreaterThanOrEqual(0);
+    expect(sFenceRevalidate).toBeGreaterThan(sCommit);
+    expect(sAnchorRevalidate).toBeGreaterThan(sCommit);
+    expect(sPublish).toBeGreaterThan(sFenceRevalidate);
+    expect(sPublish).toBeGreaterThan(sAnchorRevalidate);
+    expect(integration).toContain("await deleteVariable(commitName)");
   });
 
-  it("keeps post-durable cleanup request-local and idempotent", () => {
+  it("revalidates d3 request authority after C before either exact-run binding publish", () => {
     const status = readFileSync(new URL("../src/core/integration-status.ts", import.meta.url), "utf8");
-    expect(status).toContain("await releaseIntegrationCommit(github, record.request.request_id)");
+    expect(status).toContain("async function revalidateExactIntegrationCommit");
+    expect(status.match(/await revalidateExactIntegrationCommit\(/g)?.length).toBe(2);
+    expect(status).toContain("ceased to be active after exact-run serialization");
+  });
+
+  it("preserves only proven no-attempt aborted transport and keeps cleanup C-last", () => {
+    const status = readFileSync(new URL("../src/core/integration-status.ts", import.meta.url), "utf8");
+    expect(status).toContain("protected evidence proves no attempt was created");
+    expect(status).toContain('terminal: {\n          state: "aborted"');
+
+    const release = status.indexOf("export async function releaseIntegrationAuthorityVariable");
+    const fenceDelete = status.indexOf("integrationDispatchFenceName", release);
+    const anchorDelete = status.indexOf("record.dispatch.anchor_name", release);
+    const bindingDelete = status.indexOf("integrationBindingWitnessName", release);
+    const startDelete = status.indexOf("integrationRunStartVariableName", release);
+    const commitDelete = status.indexOf("releaseIntegrationCommit", release);
+    expect(fenceDelete).toBeGreaterThan(release);
+    expect(anchorDelete).toBeGreaterThan(release);
+    expect(bindingDelete).toBeGreaterThan(release);
+    expect(startDelete).toBeGreaterThan(release);
+    expect(commitDelete).toBeGreaterThan(startDelete);
     expect(status).toContain("if (normalized.terminal) await releaseIntegrationAuthorityVariable(github, normalized)");
   });
 });
