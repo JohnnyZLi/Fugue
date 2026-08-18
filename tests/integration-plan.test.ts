@@ -168,21 +168,22 @@ describe("GitHub-hosted Integration plan", () => {
     expect(matchesCleanupAwareDurableRunStartBinding(record, { ...context, runAttempt: 2 })).toBe(false);
   });
 
-  it("uses only committed durable d3 Authority witnesses for cleanup-aware run-start fallback", async () => {
+  it("uses only the canonical protected d3 reader for cleanup-aware run-start fallback", async () => {
     const workflow = await readFile(".github/workflows/fugue-integration.yml", "utf8");
-    expect(workflow).toContain("durableExactBindingAfterCleanup");
-    expect(workflow).toContain("FUGUE_D3_");
-    expect(workflow).toContain("FUGUE_D3P_");
-    expect(workflow).toContain("cursor.commit_witness !== true");
-    expect(workflow).toContain("cursor.best_manifest.status_ids.length !== cursor.best_manifest.chunk_count");
-    expect(workflow).toContain("canonicalRequestId !== requestId");
-    expect(workflow).toContain("record.run.id !== runId || record.run.attempt !== runAttempt");
-    expect(workflow).toContain("Protected Integration request anchor is missing without matching durable d3 exact-run authority");
-    expect(workflow).toContain("Protected Integration dispatch fence is missing without matching durable d3 exact-run authority");
-    const runStart = workflow.slice(workflow.indexOf("Commit protected Integration run-start evidence"), workflow.indexOf("- uses: actions/checkout@v4"));
-    expect(runStart).not.toContain("deployments");
-    expect(runStart).not.toContain("workflow-runs");
-    expect(runStart).not.toContain("issues/comments");
+    const cleanupStart = workflow.indexOf("Verify cleanup-aware run-start against canonical d3 authority");
+    const cleanupEnd = workflow.indexOf("- id: prepare", cleanupStart);
+    expect(cleanupStart).toBeGreaterThanOrEqual(0);
+    expect(cleanupEnd).toBeGreaterThan(cleanupStart);
+    const cleanup = workflow.slice(cleanupStart, cleanupEnd);
+    expect(cleanup).toContain("recoverDurableProtocolRecord");
+    expect(cleanup).toContain("matchesCleanupAwareDurableRunStartBinding");
+    expect(cleanup).toContain("listFugueAuthorityVariables(github, 'FUGUE_D3')");
+    expect(cleanup).not.toContain("deployments");
+    expect(cleanup).not.toContain("workflow-runs");
+    expect(cleanup).not.toContain("issues/comments");
+    expect(workflow).toContain("ref: $" + "{{ github.sha }}");
+    expect(workflow).toContain("persist-credentials: false");
+    expect(workflow.indexOf("npm run build")).toBeLessThan(cleanupStart);
   });
 
   it("pins reconciliation to workflow_sha and prevents issue-event pending replacement", async () => {

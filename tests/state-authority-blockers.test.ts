@@ -36,6 +36,10 @@ vi.mock("../src/core/provenance.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/core/provenance.js")>();
   return {
     ...actual,
+    readRepositoryDefaultBranchIdentity: vi.fn(async (github: FugueGitHub) => ({
+      branch: "main",
+      sha: (github as TestGithub).__baseSha,
+    })),
     assertRepositoryDefaultBranchRevision: vi.fn(async (github: FugueGitHub, expected: string) => {
       await (github as TestGithub).__beforeRevisionCheck?.();
       const actualSha = (github as TestGithub).__baseSha;

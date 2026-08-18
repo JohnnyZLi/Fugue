@@ -162,6 +162,7 @@ describe("cleanup-aware Integration run-start", () => {
     };
     const cursor = {
       version: 1,
+      kind: "durable_recovery",
       storage_sha: storageSha,
       publisher_sha: baseSha,
       scope: `integration/${prNumber}`,
