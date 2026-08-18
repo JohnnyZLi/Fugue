@@ -1176,7 +1176,7 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
         await recoverExistingProtectedIntegration(github, snapshot, Date.parse("2026-08-17T13:11:00.000Z"));
         expect((await getCurrentIntegrationRecord(github, identity))?.terminal?.state).toBe("identity_lost");
         const transient = [...github.__authorityVariables.keys()].filter((name) =>
-          /^FUGUE_INT_[ABFS]_/.test(name));
+          /^FUGUE_INT_[ABCFS]_/.test(name));
         expect(transient).toEqual([]);
       }
     });

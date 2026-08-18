@@ -928,6 +928,26 @@ export async function ensureIntegrationDispatch(
   };
 }
 
+async function revalidateExactIntegrationCommit(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+  requestId: string,
+  runId: number,
+): Promise<IntegrationRecord> {
+  const latest = await getCurrentIntegrationRecord(github, snapshot.identity);
+  if (!latest || latest.request.request_id !== requestId || latest.terminal || !latest.dispatch) {
+    // If cleanup already removed C, a stale binder may have recreated it after reading old state.
+    // Its post-C durable re-read makes that writer inert and reclaims only the redundant C slot.
+    await releaseIntegrationCommit(github, requestId);
+    throw new Error(`Integration run ${runId} ceased to be active after exact-run serialization for request ${requestId}.`);
+  }
+  if (latest.run && latest.run.id !== runId) {
+    await releaseIntegrationCommit(github, requestId);
+    throw new Error(`Integration request ${requestId} is already bound to protected run ${latest.run.id}.`);
+  }
+  return latest;
+}
+
 export async function bindIntegrationRun(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
@@ -954,9 +974,14 @@ export async function bindIntegrationRun(
     htmlUrl: proposed.html_url,
   });
   const binding = integrationRunBindingFromCommit(github, winner);
+  const latest = await revalidateExactIntegrationCommit(github, snapshot, requestId, binding.id);
+  if (latest.run) {
+    await releaseIntegrationAuthorityVariable(github, latest);
+    return latest;
+  }
   const bound = await publishIntegrationRecord(github, {
-    ...current,
-    dispatch_started_at: current.dispatch_started_at ?? binding.created_at,
+    ...latest,
+    dispatch_started_at: latest.dispatch_started_at ?? binding.created_at,
     run: binding,
     created_at: binding.created_at,
   });
@@ -983,9 +1008,14 @@ export async function bindDispatchedIntegrationRun(
   }
   const winner = await claimExactIntegrationCommit(github, integrationCommitContext(current)!, { runId, createdAt, htmlUrl });
   const binding = integrationRunBindingFromCommit(github, winner);
+  const latest = await revalidateExactIntegrationCommit(github, snapshot, requestId, binding.id);
+  if (latest.run) {
+    await releaseIntegrationAuthorityVariable(github, latest);
+    return latest;
+  }
   const bound = await publishIntegrationRecord(github, {
-    ...current,
-    dispatch_started_at: current.dispatch_started_at ?? binding.created_at,
+    ...latest,
+    dispatch_started_at: latest.dispatch_started_at ?? binding.created_at,
     run: binding,
     created_at: binding.created_at,
   });
