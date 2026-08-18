@@ -88,12 +88,14 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           permission-variables: write
       - name: Commit protected Integration run-start evidence
+        id: run-start
         env:
           FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           node --input-type=module <<'NODE'
           import { createHash, createHmac } from 'node:crypto';
-          import { readFileSync } from 'node:fs';
+          import { appendFileSync, readFileSync } from 'node:fs';
 
           const repository = process.env.GITHUB_REPOSITORY;
           const [owner, repo] = repository.split('/');
@@ -170,134 +172,14 @@ jobs:
             return `${marker}\nversion: 1\npayload: ${payload}\n-->\n\n${label}`;
           }
 
-          function stableSort(value) {
-            if (Array.isArray(value)) return value.map(stableSort);
-            if (value && typeof value === 'object') {
-              return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, stableSort(v)]));
-            }
-            return value;
-          }
-          function yamlScalar(raw) {
-            const value = String(raw ?? '').trim();
-            if (value === 'null') return null;
-            if (value === 'true') return true;
-            if (value === 'false') return false;
-            if (/^-?\d+$/.test(value)) return Number(value);
-            if (value.startsWith('"') && value.endsWith('"')) {
-              try { return JSON.parse(value); } catch { return value.slice(1, -1); }
-            }
-            if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1).replace(/''/g, "'");
-            return value;
-          }
-          function yamlSection(yaml, key) {
-            const lines = yaml.split('\n');
-            const index = lines.findIndex((line) => line === `${key}:`);
-            if (index < 0) return null;
-            const result = [];
-            for (let i = index + 1; i < lines.length; i += 1) {
-              if (lines[i] && !lines[i].startsWith(' ')) break;
-              result.push(lines[i]);
-            }
-            return result;
-          }
-          function yamlField(lines, key, indent = 2) {
-            if (!lines) return undefined;
-            const prefix = `${' '.repeat(indent)}${key}:`;
-            const line = lines.find((candidate) => candidate.startsWith(prefix));
-            if (!line) return undefined;
-            return yamlScalar(line.slice(prefix.length));
-          }
-          function parseIntegrationRecordBody(body) {
-            const start = body.indexOf('<!-- fugue-integration-record');
-            if (start < 0) return null;
-            const end = body.indexOf('-->', start);
-            if (end < 0) return null;
-            const yaml = body.slice(start + '<!-- fugue-integration-record'.length, end).trim();
-            const identityLines = yamlSection(yaml, 'identity');
-            const requestLines = yamlSection(yaml, 'request');
-            const dispatchLines = yamlSection(yaml, 'dispatch');
-            const runLines = yamlSection(yaml, 'run');
-            if (!identityLines || !requestLines || !dispatchLines || !runLines) return null;
-            const identityKeys = ['prNumber', 'headSha', 'baseBranch', 'baseSha', 'policyDigest', 'protocolVersion', 'issueNumber', 'workId', 'workSpecDigest'];
-            const identity = Object.fromEntries(identityKeys.map((key) => [key, yamlField(identityLines, key, 2)]));
-            const requestIdentity = Object.fromEntries(identityKeys.map((key) => [key, yamlField(requestLines, key, 4)]));
-            return {
-              identity,
-              request: {
-                request_id: yamlField(requestLines, 'request_id', 2),
-                created_at: yamlField(requestLines, 'created_at', 2),
-                identity: requestIdentity,
-              },
-              dispatch: { anchor_name: yamlField(dispatchLines, 'anchor_name', 2) },
-              run: {
-                id: yamlField(runLines, 'id', 2),
-                attempt: yamlField(runLines, 'attempt', 2),
-              },
-              created_at: yamlScalar(yaml.split('\n').find((line) => line.startsWith('created_at:'))?.slice('created_at:'.length) ?? ''),
-            };
-          }
-          async function durableExactBindingAfterCleanup() {
-            const cursorBodies = [];
-            for (let page = 1; page <= 5; page += 1) {
-              const response = await read(`/actions/variables?per_page=100&page=${page}`);
-              const variables = Array.isArray(response.variables) ? response.variables : [];
-              for (const candidate of variables) {
-                const name = String(candidate.name ?? '');
-                const value = String(candidate.value ?? '');
-                if (name.startsWith('FUGUE_D3_')) cursorBodies.push(value);
-                if (name.startsWith('FUGUE_D3P_')) {
-                  try {
-                    const pack = JSON.parse(value);
-                    if (pack?.kind === 'durable_recovery_pack' && Array.isArray(pack.entries)) {
-                      for (const entry of pack.entries) if (typeof entry === 'string') cursorBodies.push(entry);
-                    }
-                  } catch { /* malformed protected pack is not fallback authority */ }
-                }
-              }
-              if (variables.length < 100) break;
-            }
-            const matches = [];
-            for (const cursorBody of cursorBodies) {
-              if (!cursorBody.includes('<!-- fugue-publisher-proof')) continue;
-              let cursor;
-              try { cursor = parseBlock(cursorBody, '<!-- fugue-durable-recovery'); } catch { continue; }
-              if (!cursor || cursor.version !== 1 || cursor.kind !== 'durable_recovery' || cursor.commit_witness !== true ||
-                  cursor.scope !== `integration/${prNumber}` || cursor.publisher_sha?.toLowerCase() !== baseSha.toLowerCase() ||
-                  typeof cursor.best_body_b64 !== 'string' || !cursor.best_manifest ||
-                  !Array.isArray(cursor.best_manifest.status_ids) || cursor.best_manifest.status_ids.length !== cursor.best_manifest.chunk_count ||
-                  typeof cursor.best_manifest.proof !== 'string' || !cursor.best_manifest.proof ||
-                  typeof cursor.best_manifest.authority_order_b64 !== 'string') continue;
-              let bestBody;
-              let order;
-              try {
-                bestBody = Buffer.from(cursor.best_body_b64, 'base64url').toString('utf8');
-                order = Buffer.from(cursor.best_manifest.authority_order_b64, 'base64url').toString('utf8');
-              } catch { continue; }
-              const record = parseIntegrationRecordBody(bestBody);
-              if (!record?.run || record.request?.request_id !== requestId || record.identity?.prNumber !== prNumber ||
-                  record.identity?.baseSha?.toLowerCase() !== baseSha.toLowerCase() || record.dispatch?.anchor_name !== anchorName ||
-                  record.run.id !== runId || record.run.attempt !== runAttempt || record.created_at !== order ||
-                  JSON.stringify(record.identity) !== JSON.stringify(record.request.identity)) continue;
-              const nonce = requestId.match(/^int-[0-9a-f]{16}-([0-9a-f]{16})$/)?.[1];
-              if (!nonce) continue;
-              const canonicalDigest = createHash('sha256').update(JSON.stringify(stableSort(record.identity)), 'utf8').digest('hex').slice(0, 16);
-              const canonicalRequestId = `int-${canonicalDigest}-${nonce}`;
-              const expectedAnchor = `FUGUE_INT_A_${String(prNumber).padStart(10, '0')}_${createHash('sha256').update(requestId, 'utf8').digest('hex').slice(0, 16).toUpperCase()}`;
-              if (canonicalRequestId !== requestId || expectedAnchor !== anchorName || cursor.storage_sha?.toLowerCase() !== record.identity.headSha?.toLowerCase()) continue;
-              matches.push({ order, body: bestBody });
-            }
-            if (!matches.length) return false;
-            matches.sort((a, b) => a.order.localeCompare(b.order));
-            const greatest = matches.at(-1);
-            const conflicts = matches.filter((candidate) => candidate.order === greatest.order && candidate.body !== greatest.body);
-            if (conflicts.length) throw new Error('Conflicting equal-order durable Integration authority cannot authorize cleanup-aware run-start no-op.');
-            return true;
+          function deferCleanupProof(reason) {
+            appendFileSync(process.env.GITHUB_OUTPUT, `cleanup_proof_required=true\ncleanup_proof_reason=${reason}\n`, 'utf8');
+            process.exit(0);
           }
 
           const variable = await read(`/actions/variables/${anchorName}`, true);
           if (!variable) {
-            if (await durableExactBindingAfterCleanup()) process.exit(0);
-            throw new Error('Protected Integration request anchor is missing without matching durable d3 exact-run authority.');
+            deferCleanupProof('anchor-missing-after-cleanup');
           }
           const anchor = parseBlock(String(variable.value ?? ''), '<!-- fugue-integration-dispatch-anchor');
           if (!anchor || anchor.kind !== 'integration_dispatch_anchor' || anchor.anchor_name !== anchorName ||
@@ -311,8 +193,7 @@ jobs:
           // S is a delayed exact-L writer. If durable exact binding or identity_lost already reclaimed F,
           // it must be inert and must not recreate authority for the old request.
           if (!fenceVariable) {
-            if (await durableExactBindingAfterCleanup()) process.exit(0);
-            throw new Error('Protected Integration dispatch fence is missing without matching durable d3 exact-run authority.');
+            deferCleanupProof('fence-missing-after-cleanup');
           }
           let fence;
           try { fence = JSON.parse(String(fenceVariable.value ?? '')); }
@@ -373,8 +254,7 @@ jobs:
           const anchorAfterCommit = await read(`/actions/variables/${anchorName}`, true);
           if (!fenceAfterCommit || !anchorAfterCommit) {
             await deleteVariable(commitName);
-            if (await durableExactBindingAfterCleanup()) process.exit(0);
-            throw new Error('Protected Integration prerequisites disappeared without matching durable d3 exact-run authority.');
+            deferCleanupProof('prerequisites-disappeared-after-commit');
           }
           if (String(fenceAfterCommit.value ?? '') !== String(fenceVariable.value ?? '') ||
               String(anchorAfterCommit.value ?? '') !== String(variable.value ?? '')) {
@@ -426,6 +306,111 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - name: Verify cleanup-aware run-start against canonical d3 authority
+        if: steps.run-start.outputs.cleanup_proof_required == 'true'
+        env:
+          FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          FUGUE_REQUEST_ID: ${{ inputs.request_id }}
+          FUGUE_PR: ${{ inputs.pr }}
+          FUGUE_BASE_SHA: ${{ github.sha }}
+          FUGUE_AUTHORITY_ANCHOR: ${{ inputs.authority_anchor }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { discoverRepository } from './dist/core/git.js';
+          import { requireWritableGitHub } from './dist/core/github.js';
+          import { sameEvaluationIdentity } from './dist/core/evaluation.js';
+          import { parseIntegrationRecord } from './dist/core/integration-plan.js';
+          import { matchesCleanupAwareDurableRunStartBinding } from './dist/core/integration-status.js';
+          import { listFugueAuthorityVariables, recoverDurableProtocolRecord } from './dist/core/state.js';
+
+          const requestId = String(process.env.FUGUE_REQUEST_ID ?? '');
+          const prNumber = Number(process.env.FUGUE_PR);
+          const baseSha = String(process.env.FUGUE_BASE_SHA ?? '');
+          const anchorName = String(process.env.FUGUE_AUTHORITY_ANCHOR ?? '');
+          const runId = Number(process.env.GITHUB_RUN_ID);
+          const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
+          if (!/^int-[0-9a-f]{16}-[0-9a-f]{16}$/.test(requestId) || !Number.isSafeInteger(prNumber) || prNumber <= 0 ||
+              !/^[0-9a-f]{40}$/i.test(baseSha) || !/^FUGUE_INT_A_\d{10}_[0-9A-F]{16}$/.test(anchorName) ||
+              !Number.isSafeInteger(runId) || runId <= 0 || runAttempt !== 1) {
+            throw new Error('Invalid cleanup-aware Integration run-start context.');
+          }
+
+          // FUGUE_CLEANUP_D3_CANONICAL_BEGIN
+          function recoveryCursor(body) {
+            const match = String(body).match(/<!-- fugue-durable-recovery\nversion: 1\npayload: ([A-Za-z0-9_-]+)\n-->/);
+            if (!match?.[1]) return null;
+            try { return JSON.parse(Buffer.from(match[1], 'base64url').toString('utf8')); }
+            catch { return null; }
+          }
+
+          function recoveryBodies(variables) {
+            const bodies = [];
+            for (const variable of variables) {
+              if (variable.name.startsWith('FUGUE_D3_')) {
+                bodies.push(String(variable.value ?? ''));
+                continue;
+              }
+              if (!variable.name.startsWith('FUGUE_D3P_')) continue;
+              try {
+                const pack = JSON.parse(String(variable.value ?? ''));
+                if (pack?.version !== 1 || pack?.kind !== 'durable_recovery_pack' || !Array.isArray(pack.entries)) continue;
+                for (const entry of pack.entries) if (typeof entry === 'string') bodies.push(entry);
+              } catch {
+                // Opaque/malformed transport is never authority. No matching canonical proof below means fail closed.
+              }
+            }
+            return bodies;
+          }
+
+          async function requireCanonicalCleanupBinding(deps) {
+            const { github, variables, recoverDurableProtocolRecord, parseIntegrationRecord, sameEvaluationIdentity,
+              matchesCleanupAwareDurableRunStartBinding, requestId, prNumber, baseSha, anchorName, runId, runAttempt } = deps;
+            const scope = `integration/${prNumber}`;
+            const candidates = new Set();
+            for (const body of recoveryBodies(variables)) {
+              const cursor = recoveryCursor(body);
+              if (cursor?.version !== 1 || cursor?.kind !== 'durable_recovery' || cursor.scope !== scope ||
+                  String(cursor.publisher_sha ?? '').toLowerCase() !== baseSha.toLowerCase() ||
+                  !/^[0-9a-f]{40}$/i.test(String(cursor.storage_sha ?? ''))) continue;
+              candidates.add(String(cursor.storage_sha).toLowerCase());
+            }
+
+            for (const storageSha of [...candidates].sort()) {
+              // Structural cursors above are discovery hints only. Every candidate must pass the exact
+              // production d3 reader before it can authorize cleanup-aware run-start no-op. Pending,
+              // malformed, corrupt, stale-revision, bad OIDC/manifest proof, or guard-race states throw.
+              const recovered = await recoverDurableProtocolRecord(github, {
+                storageSha,
+                publisherSha: baseSha,
+                scope,
+                issueNumber: prNumber,
+                parse: parseIntegrationRecord,
+                timestamp: (value) => Date.parse(value.created_at),
+                order: (value) => value.created_at,
+                validate: (value) => value.identity.prNumber === prNumber &&
+                  value.identity.baseSha.toLowerCase() === baseSha.toLowerCase() &&
+                  sameEvaluationIdentity(value.identity, value.request.identity),
+              });
+              if (!recovered.record) continue;
+              if (matchesCleanupAwareDurableRunStartBinding(recovered.record.value, {
+                requestId, prNumber, baseSha, anchorName, runId, runAttempt,
+              })) return;
+              if (recovered.record.value.request.request_id === requestId) {
+                throw new Error('Canonical durable Integration authority disagrees with cleanup-aware run-start identity.');
+              }
+            }
+            throw new Error('Missing transient Integration authority is not backed by canonical durable d3 exact-run authority.');
+          }
+          // FUGUE_CLEANUP_D3_CANONICAL_END
+
+          const github = await requireWritableGitHub(await discoverRepository());
+          const variables = await listFugueAuthorityVariables(github, 'FUGUE_D3');
+          await requireCanonicalCleanupBinding({
+            github, variables, recoverDurableProtocolRecord, parseIntegrationRecord, sameEvaluationIdentity,
+            matchesCleanupAwareDurableRunStartBinding, requestId, prNumber, baseSha, anchorName, runId, runAttempt,
+          });
+          NODE
       - id: prepare
         name: Prepare immutable Integration plan
         env:
