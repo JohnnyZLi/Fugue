@@ -64,6 +64,11 @@ export interface IntegrationIdentityLostCandidate {
   createdAt: string;
 }
 
+export interface IntegrationCommitStore {
+  create(value: string): Promise<boolean>;
+  read(): Promise<string | undefined>;
+}
+
 export function integrationCommitVariableName(requestId: string): string {
   if (!/^int-[0-9a-f]{16}-[0-9a-f]{16}$/.test(requestId)) {
     throw new Error("Invalid Integration request ID for request-local commit serialization.");
@@ -80,11 +85,9 @@ function assertCommitIdentity(commit: IntegrationCommit, context: IntegrationCom
     throw new Error(`Protected Integration commit slot for ${context.requestId} belongs to another evaluation identity.`);
   }
   if (commit.kind === "integration_exact_run_commit") {
-    const expectedUrl = `https://github.com/${context.headSha ? "" : ""}`;
     if (!Number.isFinite(Date.parse(commit.run_created_at)) || !commit.html_url) {
       throw new Error(`Protected Integration exact-run commit for ${context.requestId} is malformed.`);
     }
-    void expectedUrl;
   } else if (!Number.isFinite(Date.parse(commit.boundary_created_at)) || !Number.isFinite(Date.parse(commit.created_at))) {
     throw new Error(`Protected Integration identity-lost commit for ${context.requestId} is malformed.`);
   }
@@ -97,6 +100,20 @@ export function parseIntegrationCommit(raw: string, context: IntegrationCommitCo
   const commit = integrationCommitSchema.parse(value);
   assertCommitIdentity(commit, context);
   return commit;
+}
+
+export async function claimIntegrationCommitWithStore(
+  store: IntegrationCommitStore,
+  context: IntegrationCommitContext,
+  candidate: IntegrationCommit,
+): Promise<IntegrationCommit> {
+  const serialized = JSON.stringify(integrationCommitSchema.parse(candidate));
+  const created = await store.create(serialized);
+  const committed = created ? serialized : await store.read();
+  if (!committed) {
+    throw new Error(`Protected Integration commit slot ${integrationCommitVariableName(context.requestId)} disappeared during serialization.`);
+  }
+  return parseIntegrationCommit(committed, context);
 }
 
 export async function readIntegrationCommit(
@@ -113,11 +130,10 @@ async function claimIntegrationCommit(
   candidate: IntegrationCommit,
 ): Promise<IntegrationCommit> {
   const name = integrationCommitVariableName(context.requestId);
-  const serialized = JSON.stringify(integrationCommitSchema.parse(candidate));
-  const created = await createFugueAuthorityVariable(github, name, serialized);
-  const committed = created ? serialized : await getFugueAuthorityVariable(github, name);
-  if (!committed) throw new Error(`Protected Integration commit slot ${name} disappeared during serialization.`);
-  return parseIntegrationCommit(committed, context);
+  return claimIntegrationCommitWithStore({
+    create: (value) => createFugueAuthorityVariable(github, name, value),
+    read: () => getFugueAuthorityVariable(github, name),
+  }, context, candidate);
 }
 
 export async function claimExactIntegrationCommit(
@@ -145,7 +161,7 @@ export async function claimExactIntegrationCommit(
   if (winner.kind === "integration_identity_lost_commit") {
     throw new Error(`Integration request ${context.requestId} already committed terminal identity_lost serialization.`);
   }
-  if (winner.run_id !== candidate.runId) {
+  if (winner.run_id !== candidate.runId || winner.run_created_at !== candidate.createdAt || winner.html_url !== candidate.htmlUrl) {
     throw new Error(`Integration request ${context.requestId} already committed protected run ${winner.run_id}.`);
   }
   return winner;
