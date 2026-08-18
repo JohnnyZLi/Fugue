@@ -66,27 +66,6 @@ interface WorkflowRunRecord {
   html_url: string;
 }
 
-interface DeploymentRecord {
-  id: number;
-  sha: string;
-  ref: string;
-  task: string;
-  environment: string;
-  created_at: string;
-}
-
-interface DeploymentStatusRecord {
-  id: number;
-  state: string;
-  environment?: string | null;
-  environment_url?: string | null;
-  created_at?: string | null;
-}
-
-interface CorrelatedDeploymentSnapshot {
-  fingerprint: string;
-  runs: IntegrationWorkflowRun[];
-}
 
 const INTEGRATION_RECEIPT = "Fugue-Authority-Receipt: integration-d3";
 export const INTEGRATION_REQUEST_RECOVERY_GRACE_MS = 10 * 60 * 1000;
@@ -120,12 +99,6 @@ export class IntegrationAuthorityCapacityPendingError extends Error {
   }
 }
 
-class IntegrationRunDiscoveryPendingError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "IntegrationRunDiscoveryPendingError";
-  }
-}
 
 const integrationDispatchAnchorSchema = z.object({
   version: z.literal(1),
@@ -463,125 +436,7 @@ function integrationRunBindingFromEvidence(github: FugueGitHub, evidence: Integr
 }
 
 
-/**
- * Recover the globally earliest protected attempt-1 run for an unbound request from GitHub's
- * environment-deployment history, not from mutable workflow-run pages. A job that references the
- * protected fugue-authority environment creates a platform deployment/status before its first step;
- * the configured environment URL carries only request/run correlation data and therefore survives
- * Actions-write deletion of the workflow-run record. Two identical complete scans are required so a
- * changing deployment set fails closed instead of producing a page-shifted winner.
- */
-async function findEarliestCorrelatedIntegrationWorkflowRun(
-  github: FugueGitHub,
-  record: IntegrationRecord,
-): Promise<IntegrationWorkflowRun | undefined> {
-  if (!record.dispatch) return undefined;
-  const anchorBody = await getFugueAuthorityVariable(github, record.dispatch.anchor_name);
-  if (!anchorBody) return undefined;
-  const anchor = await verifyIntegrationDispatchAnchor(github, record, anchorBody);
-  if (!anchor) throw new Error(`Protected Integration request anchor ${record.dispatch.anchor_name} is not valid for earliest-run recovery.`);
-  const token = integrationDispatchRunToken(record.request.request_id, anchor.dispatch_secret);
-
-  let previous: CorrelatedDeploymentSnapshot | undefined;
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    const current = await correlatedIntegrationDeploymentSnapshot(github, record, token);
-    if (previous?.fingerprint === current.fingerprint) {
-      return [...current.runs].sort((left, right) => left.id - right.id)[0];
-    }
-    previous = current;
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  }
-  throw new IntegrationRunDiscoveryPendingError(
-    `Protected Integration deployment history for request ${record.request.request_id} changed during recovery; retry before choosing a run.`,
-  );
-}
-
-async function correlatedIntegrationDeploymentSnapshot(
-  github: FugueGitHub,
-  record: IntegrationRecord,
-  token: string,
-): Promise<CorrelatedDeploymentSnapshot> {
-  const { owner, repo, fullName } = github.repository;
-  const minimumCreated = Math.max(Date.parse(record.request.created_at), Date.parse(record.dispatch!.authorized_at));
-  if (!Number.isFinite(minimumCreated)) return { fingerprint: "invalid-time", runs: [] };
-  const matches: Array<{ deploymentId: number; statusId: number; run: IntegrationWorkflowRun }> = [];
-
-  for (let page = 1; page <= 1000; page += 1) {
-    const response = await github.octokit.request("GET /repos/{owner}/{repo}/deployments", {
-      owner,
-      repo,
-      sha: record.identity.baseSha,
-      environment: "fugue-authority",
-      per_page: 100,
-      page,
-      headers: { "X-GitHub-Api-Version": "2026-03-10" },
-    });
-    const deployments = response.data as unknown as DeploymentRecord[];
-    for (const deployment of deployments) {
-      const created = Date.parse(deployment.created_at);
-      if (deployment.sha !== record.identity.baseSha || deployment.ref !== record.identity.baseBranch ||
-          deployment.environment !== "fugue-authority" || deployment.task !== "deploy" ||
-          !Number.isFinite(created) || created < minimumCreated) continue;
-      const statusesResponse = await github.octokit.request(
-        "GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses",
-        {
-          owner,
-          repo,
-          deployment_id: deployment.id,
-          per_page: 100,
-          page: 1,
-          headers: { "X-GitHub-Api-Version": "2026-03-10" },
-        },
-      );
-      const statuses = statusesResponse.data as unknown as DeploymentStatusRecord[];
-      for (const status of statuses) {
-        const run = integrationRunFromDeploymentUrl(github, record.request, token, status.environment_url, deployment.created_at);
-        if (!run || (status.environment && status.environment !== "fugue-authority")) continue;
-        matches.push({ deploymentId: deployment.id, statusId: status.id, run });
-        break;
-      }
-    }
-    if (deployments.length < 100) break;
-    if (page === 1000) {
-      throw new IntegrationRunDiscoveryPendingError("Protected Integration deployment history exceeded the bounded stable-scan window.");
-    }
-  }
-
-  matches.sort((left, right) => left.deploymentId - right.deploymentId || left.statusId - right.statusId);
-  const fingerprint = createHash("sha256")
-    .update(JSON.stringify(matches.map((match) => [match.deploymentId, match.statusId, match.run.id])), "utf8")
-    .digest("hex");
-  return { fingerprint, runs: matches.map((match) => match.run) };
-}
-
-function integrationRunFromDeploymentUrl(
-  github: FugueGitHub,
-  request: IntegrationRequest,
-  token: string,
-  rawUrl: string | null | undefined,
-  createdAt: string,
-): IntegrationWorkflowRun | undefined {
-  if (!rawUrl) return undefined;
-  let url: URL;
-  try { url = new URL(rawUrl); } catch { return undefined; }
-  const prefix = `/${github.repository.fullName}/actions/runs/`;
-  if (url.origin !== "https://github.com" || !url.pathname.startsWith(prefix) ||
-      url.searchParams.get("fugue_request") !== request.request_id ||
-      url.searchParams.get("fugue_run_token") !== token) return undefined;
-  const suffix = url.pathname.slice(prefix.length);
-  if (!/^\d+$/.test(suffix)) return undefined;
-  const runId = Number(suffix);
-  if (!Number.isSafeInteger(runId) || runId <= 0) return undefined;
-  return {
-    id: runId,
-    status: null,
-    conclusion: null,
-    htmlUrl: `${url.origin}${url.pathname}`,
-    createdAt,
-    attempt: 1,
-  };
-}
-
+/** Deployment, Deployment Status, workflow-run list pagination, and public correlation fields are presentation only. */
 export async function currentIntegrationState(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
@@ -678,17 +533,9 @@ export async function sealIntegrationWorkflowRunEvent(
   }
   const evidence = record.run ? undefined : await getIntegrationRunStartEvidence(github, record);
   let binding = record.run ?? (evidence ? integrationRunBindingFromEvidence(github, evidence) : undefined);
-  if (!binding) {
-    // A token in a run title is public presentation after the first run exists. Never bind from the
-    // completion event itself. Reconstruct the entire matching protected-workflow set and accept this
-    // event only if GitHub's globally earliest matching attempt-1 run is this exact run ID.
-    if (!match[3] || !record.dispatch) return false;
-    let earliest: IntegrationWorkflowRun | undefined;
-    try { earliest = await findEarliestCorrelatedIntegrationWorkflowRun(github, record); }
-    catch (error) { if (error instanceof IntegrationRunDiscoveryPendingError) return false; throw error; }
-    if (!earliest || earliest.id !== event.runId) return false;
-    binding = { id: earliest.id, attempt: 1, created_at: earliest.createdAt, html_url: earliest.htmlUrl };
-  }
+  // Completion events may seal only an already protected exact run binding/run-start. Public
+  // request/token/title and any mutable history are correlation only and cannot elect a run.
+  if (!binding) return false;
   if (binding.id !== event.runId) return false;
   const createdAt = new Date().toISOString();
   if (event.conclusion === "cancelled") {
@@ -865,22 +712,6 @@ export async function ensureIntegrationDispatch(
         run: integrationRunBindingFromEvidence(github, evidence),
         created_at: new Date(now).toISOString(),
       });
-    }
-    if (!current.run) {
-      let earliest: IntegrationWorkflowRun | undefined;
-      try { earliest = await findEarliestCorrelatedIntegrationWorkflowRun(github, current); }
-      catch (error) {
-        if (error instanceof IntegrationRunDiscoveryPendingError) return { request: current.request, dispatch: false };
-        throw error;
-      }
-      if (earliest) {
-        current = await publishIntegrationRecord(github, {
-          ...current,
-          dispatch_started_at: current.dispatch_started_at ?? earliest.createdAt,
-          run: { id: earliest.id, attempt: 1, created_at: earliest.createdAt, html_url: earliest.htmlUrl },
-          created_at: new Date(now).toISOString(),
-        });
-      }
     }
     if (current.run) {
       const bound = await getBoundIntegrationWorkflowRun(github, current);

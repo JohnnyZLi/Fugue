@@ -14,6 +14,9 @@ import {
   compareCoordinatorSnapshots,
   coordinatorSnapshotSchema,
   createCanonicalWorkState,
+  createFugueAuthorityVariable,
+  deleteFugueAuthorityVariable,
+  getFugueAuthorityVariable,
   publishCoordinatorSnapshot,
   reconstructState,
   recoverCoordinatorSnapshots,
@@ -27,7 +30,18 @@ import { upsertStateComment } from "./state-comment.js";
 import { actionLabel, observeWork, planWork, type WorkflowAction } from "./workflow.js";
 import { claimWorker } from "./worker.js";
 import type { FugueGitHub } from "./github.js";
-import { bindDispatchedIntegrationRun, ensureIntegrationDispatch, integrationDispatchRunToken, reclaimOrphanIntegrationAuthorityVariables, sealIntegrationWorkflowRunEvent } from "./integration-status.js";
+import {
+  bindDispatchedIntegrationRun,
+  bindIntegrationRun,
+  ensureIntegrationDispatch,
+  getCurrentIntegrationRecord,
+  getIntegrationRunStartEvidence,
+  INTEGRATION_REQUEST_RECOVERY_GRACE_MS,
+  integrationDispatchRunToken,
+  markIntegrationDispatchStarted,
+  reclaimOrphanIntegrationAuthorityVariables,
+  sealIntegrationWorkflowRunEvent,
+} from "./integration-status.js";
 import { FUGUE_PROTOCOL_ACTOR } from "./provenance.js";
 import { captureEvaluation } from "./evaluation.js";
 import { loadCurrentCanonicalWorkState, publishCanonicalWorkState } from "./state.js";
@@ -59,6 +73,75 @@ export interface CoordinatorIssueEvent {
 const MAX_TRANSITIONS_PER_WORK = 12;
 const STATE_LABELS = new Set(["state:ready", "state:working", "state:blocked"] as const);
 const COORDINATOR_ACTIONS = new Set(["opened", "edited", "labeled", "unlabeled"]);
+const INTEGRATION_DISPATCH_FENCE_PREFIX = "FUGUE_INT_F_";
+const INTEGRATION_BINDING_WITNESS_PREFIX = "FUGUE_INT_B_";
+
+interface ProtectedIntegrationDispatchFence {
+  version: 1;
+  kind: "integration_dispatch_fence";
+  request_id: string;
+  pr_number: number;
+  head_sha: string;
+  base_sha: string;
+  anchor_name: string;
+  secret_digest: string;
+  run_token: string;
+  authority_actor_id: number;
+  created_at: string;
+}
+
+interface ProtectedIntegrationBindingWitness {
+  version: 1;
+  kind: "integration_binding_witness";
+  request_id: string;
+  pr_number: number;
+  head_sha: string;
+  base_sha: string;
+  anchor_name: string;
+  run_token: string;
+  authority_actor_id: number;
+  run_id: number;
+  run_attempt: 1;
+  run_created_at: string;
+  html_url: string;
+}
+
+export type ProtectedIntegrationRecoveryDecision =
+  | { kind: "bind"; runId: number; createdAt: string; htmlUrl: string }
+  | { kind: "pending" }
+  | { kind: "unresolved" };
+
+export class IntegrationExactRunIdentityUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IntegrationExactRunIdentityUnavailableError";
+  }
+}
+
+/**
+ * The hosted lost-bind state machine has no history cursor. Its complete authoritative input is the
+ * request-local Authority fence plus, if GitHub created attempt 1, the create-only exact-run witness.
+ * Repeated invocations therefore do constant work and can only move fence -> exact witness -> d3 binding,
+ * remain pending, or become explicitly unresolved. An unresolved fence is never converted into retry or a
+ * terminal record missing the exact run ID; later workflow/deployment/history records cannot replace it.
+ */
+export function protectedIntegrationRecoveryDecision(input: {
+  requestCreatedAt: string;
+  dispatchStartedAt?: string | null | undefined;
+  fenceCreatedAt?: string | null | undefined;
+  witness?: { runId: number; createdAt: string; htmlUrl: string } | undefined;
+  now: number;
+}): ProtectedIntegrationRecoveryDecision {
+  if (input.witness) {
+    return { kind: "bind", runId: input.witness.runId, createdAt: input.witness.createdAt, htmlUrl: input.witness.htmlUrl };
+  }
+  const boundary = input.fenceCreatedAt ?? input.dispatchStartedAt ?? input.requestCreatedAt;
+  const started = Date.parse(boundary);
+  if (!Number.isFinite(started) || input.now - started >= INTEGRATION_REQUEST_RECOVERY_GRACE_MS) {
+    return { kind: "unresolved" };
+  }
+  return { kind: "pending" };
+}
 
 export async function reconcileRepository(
   github: FugueGitHub,
@@ -72,7 +155,15 @@ export async function reconcileRepository(
   await repairCanonicalWorkStateComments(github, policy);
   await reclaimOrphanIntegrationAuthorityVariables(github);
 
-  await sealIntegrationWorkflowRunEvent(github, integrationWorkflowRunEventFromEnvironment());
+  const integrationEvent = integrationWorkflowRunEventFromEnvironment();
+  if (integrationAuthorityActorId() === undefined) {
+    // Non-hosted compatibility only. The protected control plane always supplies the Authority App
+    // identity and never lets legacy Deployment/Deployment Status presentation choose a run.
+    await sealIntegrationWorkflowRunEvent(github, integrationEvent);
+  } else if (integrationEvent) {
+    const bound = await bindProtectedIntegrationWorkflowRunEvent(github, integrationEvent);
+    if (bound) await sealIntegrationWorkflowRunEvent(github, { ...integrationEvent, actor: "github-actions[bot]" });
+  }
   const event = coordinatorIssueEventFromEnvironment();
   await preserveCoordinatorIssueEvent(github, policy, event);
   await replayCoordinatorSnapshots(github, policy);
@@ -474,6 +565,307 @@ async function updatePrBranch(github: FugueGitHub, work: WorkState): Promise<voi
   await github.octokit.rest.pulls.updateBranch({ owner, repo, pull_number: prNumber, expected_head_sha: headSha });
 }
 
+function integrationAuthorityActorId(): number | undefined {
+  // Protected request-local recovery records: FUGUE_INT_F_* fence and FUGUE_INT_B_* exact-run witness.
+  const token = process.env.FUGUE_AUTHORITY_TOKEN?.trim();
+  const raw = process.env.FUGUE_AUTHORITY_ACTOR_ID?.trim();
+  // Integration finalize also has a Variables-only Authority token; only the control-plane actor ID
+  // opts a process into hosted F/B dispatch recovery.
+  if (!raw) return undefined;
+  if (!token) throw new Error("Protected Fugue Authority actor ID requires FUGUE_AUTHORITY_TOKEN.");
+  const id = Number(raw);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Protected Fugue Authority actor ID is malformed.");
+  return id;
+}
+
+function integrationRecoverySuffix(requestId: string): string {
+  return createHash("sha256").update(requestId, "utf8").digest("hex").slice(0, 32).toUpperCase();
+}
+
+function integrationDispatchFenceName(requestId: string): string {
+  return `${INTEGRATION_DISPATCH_FENCE_PREFIX}${integrationRecoverySuffix(requestId)}`;
+}
+
+function integrationBindingWitnessName(requestId: string): string {
+  return `${INTEGRATION_BINDING_WITNESS_PREFIX}${integrationRecoverySuffix(requestId)}`;
+}
+
+function parseProtectedIntegrationDispatchFence(raw: string): ProtectedIntegrationDispatchFence {
+  let value: unknown;
+  try { value = JSON.parse(raw) as unknown; }
+  catch { throw new Error("Protected Integration dispatch fence is malformed."); }
+  if (!value || typeof value !== "object") throw new Error("Protected Integration dispatch fence is malformed.");
+  const fence = value as Partial<ProtectedIntegrationDispatchFence>;
+  if (fence.version !== 1 || fence.kind !== "integration_dispatch_fence" ||
+      typeof fence.request_id !== "string" || typeof fence.pr_number !== "number" ||
+      typeof fence.head_sha !== "string" || typeof fence.base_sha !== "string" ||
+      typeof fence.anchor_name !== "string" || typeof fence.secret_digest !== "string" ||
+      typeof fence.run_token !== "string" || typeof fence.authority_actor_id !== "number" ||
+      typeof fence.created_at !== "string") {
+    throw new Error("Protected Integration dispatch fence is malformed.");
+  }
+  return fence as ProtectedIntegrationDispatchFence;
+}
+
+function parseProtectedIntegrationBindingWitness(raw: string): ProtectedIntegrationBindingWitness {
+  let value: unknown;
+  try { value = JSON.parse(raw) as unknown; }
+  catch { throw new Error("Protected Integration binding witness is malformed."); }
+  if (!value || typeof value !== "object") throw new Error("Protected Integration binding witness is malformed.");
+  const witness = value as Partial<ProtectedIntegrationBindingWitness>;
+  if (witness.version !== 1 || witness.kind !== "integration_binding_witness" ||
+      typeof witness.request_id !== "string" || typeof witness.pr_number !== "number" ||
+      typeof witness.head_sha !== "string" || typeof witness.base_sha !== "string" ||
+      typeof witness.anchor_name !== "string" || typeof witness.run_token !== "string" ||
+      typeof witness.authority_actor_id !== "number" || typeof witness.run_id !== "number" ||
+      witness.run_attempt !== 1 || typeof witness.run_created_at !== "string" || typeof witness.html_url !== "string") {
+    throw new Error("Protected Integration binding witness is malformed.");
+  }
+  return witness as ProtectedIntegrationBindingWitness;
+}
+
+async function readProtectedIntegrationDispatchFence(
+  github: FugueGitHub,
+  requestId: string,
+): Promise<ProtectedIntegrationDispatchFence | undefined> {
+  const raw = await getFugueAuthorityVariable(github, integrationDispatchFenceName(requestId));
+  return raw === undefined ? undefined : parseProtectedIntegrationDispatchFence(raw);
+}
+
+async function readProtectedIntegrationBindingWitness(
+  github: FugueGitHub,
+  requestId: string,
+): Promise<ProtectedIntegrationBindingWitness | undefined> {
+  const raw = await getFugueAuthorityVariable(github, integrationBindingWitnessName(requestId));
+  return raw === undefined ? undefined : parseProtectedIntegrationBindingWitness(raw);
+}
+
+async function cleanupProtectedIntegrationRecovery(github: FugueGitHub, requestId: string): Promise<void> {
+  await deleteFugueAuthorityVariable(github, integrationBindingWitnessName(requestId));
+  await deleteFugueAuthorityVariable(github, integrationDispatchFenceName(requestId));
+}
+
+function assertProtectedFenceMatchesRecord(
+  fence: ProtectedIntegrationDispatchFence,
+  current: Awaited<ReturnType<typeof getCurrentIntegrationRecord>>,
+  actorId: number,
+): void {
+  if (!current || !current.dispatch || current.request.request_id !== fence.request_id ||
+      current.identity.prNumber !== fence.pr_number || current.identity.headSha.toLowerCase() !== fence.head_sha.toLowerCase() ||
+      current.identity.baseSha.toLowerCase() !== fence.base_sha.toLowerCase() ||
+      current.dispatch.anchor_name !== fence.anchor_name || current.dispatch.secret_digest.toLowerCase() !== fence.secret_digest.toLowerCase() ||
+      fence.authority_actor_id !== actorId || !/^[0-9a-f]{24}$/.test(fence.run_token) || !Number.isFinite(Date.parse(fence.created_at))) {
+    throw new Error(`Protected Integration dispatch fence does not match active request ${fence.request_id}.`);
+  }
+}
+
+function assertProtectedWitnessMatchesFence(
+  witness: ProtectedIntegrationBindingWitness,
+  fence: ProtectedIntegrationDispatchFence,
+  github: FugueGitHub,
+): void {
+  const expectedUrl = `https://github.com/${github.repository.fullName}/actions/runs/${witness.run_id}`;
+  if (witness.request_id !== fence.request_id || witness.pr_number !== fence.pr_number ||
+      witness.head_sha.toLowerCase() !== fence.head_sha.toLowerCase() || witness.base_sha.toLowerCase() !== fence.base_sha.toLowerCase() ||
+      witness.anchor_name !== fence.anchor_name || witness.run_token !== fence.run_token ||
+      witness.authority_actor_id !== fence.authority_actor_id || !Number.isSafeInteger(witness.run_id) || witness.run_id <= 0 ||
+      witness.run_attempt !== 1 || !Number.isFinite(Date.parse(witness.run_created_at)) || witness.html_url !== expectedUrl) {
+    throw new Error(`Protected Integration binding witness conflicts with immutable request ${fence.request_id}.`);
+  }
+}
+
+async function recoverExistingProtectedIntegration(
+  github: FugueGitHub,
+  snapshot: Awaited<ReturnType<typeof captureEvaluation>>,
+  now: number,
+): Promise<boolean> {
+  const actorId = integrationAuthorityActorId();
+  if (actorId === undefined) return false;
+  const current = await getCurrentIntegrationRecord(github, snapshot.identity);
+  if (!current || current.terminal) return false;
+  if (current.run) {
+    await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
+    return true;
+  }
+
+  const start = await getIntegrationRunStartEvidence(github, current);
+  if (start) {
+    await bindIntegrationRun(github, snapshot, current.request.request_id, start.run_id);
+    await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
+    return true;
+  }
+
+  const fence = await readProtectedIntegrationDispatchFence(github, current.request.request_id);
+  // No F means the protected caller never crossed the pre-POST may-have-dispatched boundary. Let the
+  // canonical request state machine retain its existing pre-POST abort/retry recovery.
+  if (!fence) return false;
+  assertProtectedFenceMatchesRecord(fence, current, actorId);
+  const witness = await readProtectedIntegrationBindingWitness(github, current.request.request_id);
+  if (witness && fence) assertProtectedWitnessMatchesFence(witness, fence, github);
+
+  const decision = protectedIntegrationRecoveryDecision({
+    requestCreatedAt: current.request.created_at,
+    dispatchStartedAt: current.dispatch_started_at,
+    fenceCreatedAt: fence?.created_at,
+    witness: witness ? { runId: witness.run_id, createdAt: witness.run_created_at, htmlUrl: witness.html_url } : undefined,
+    now,
+  });
+  if (decision.kind === "bind") {
+    await bindDispatchedIntegrationRun(
+      github, snapshot, current.request.request_id, decision.runId, decision.htmlUrl, decision.createdAt,
+    );
+    await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
+    return true;
+  }
+  if (decision.kind === "pending") {
+    if (fence && !current.dispatch_started_at) {
+      await markIntegrationDispatchStarted(github, snapshot, current.request.request_id, fence.created_at);
+    }
+    return true;
+  }
+
+  if (!current.dispatch_started_at) {
+    await markIntegrationDispatchStarted(github, snapshot, current.request.request_id, fence.created_at);
+  }
+  // GitHub created-attempt identity is information that cannot be reconstructed from F alone. If the
+  // synchronous response and every protected exact-run witness were both lost/prevented, fabricating a
+  // terminal result would violate the record schema's exact request/run/attempt authority. Retain F and
+  // block indefinitely: no retry/replay is allowed, and a late authentic B/run-start may still recover L.
+  throw new IntegrationExactRunIdentityUnavailableError(
+    `Integration request ${current.request.request_id} may have created attempt 1, but no attacker-resistant exact run-ID witness survived. ` +
+    "Fugue will not consult Deployment/Status/history, fabricate a run ID, or retry this request.",
+  );
+}
+
+async function createProtectedIntegrationDispatchFence(
+  github: FugueGitHub,
+  snapshot: Awaited<ReturnType<typeof captureEvaluation>>,
+  requestId: string,
+  dispatchSecret: string,
+  authorityAnchor: string,
+  now: number,
+): Promise<{ created: boolean; fence: ProtectedIntegrationDispatchFence }> {
+  const actorId = integrationAuthorityActorId();
+  if (actorId === undefined) throw new Error("Protected Integration dispatch requires the Fugue Authority App identity.");
+  const current = await getCurrentIntegrationRecord(github, snapshot.identity);
+  if (!current || current.request.request_id !== requestId || !current.dispatch || current.terminal || current.run) {
+    throw new Error(`Integration request ${requestId} is not an active unbound dispatch authorization.`);
+  }
+  const runToken = integrationDispatchRunToken(requestId, dispatchSecret);
+  const createdAt = new Date(now).toISOString();
+  const fence: ProtectedIntegrationDispatchFence = {
+    version: 1,
+    kind: "integration_dispatch_fence",
+    request_id: requestId,
+    pr_number: snapshot.identity.prNumber,
+    head_sha: snapshot.identity.headSha,
+    base_sha: snapshot.identity.baseSha,
+    anchor_name: authorityAnchor,
+    secret_digest: current.dispatch.secret_digest,
+    run_token: runToken,
+    authority_actor_id: actorId,
+    created_at: createdAt,
+  };
+  const serialized = JSON.stringify(fence);
+  const name = integrationDispatchFenceName(requestId);
+  const created = await createFugueAuthorityVariable(github, name, serialized);
+  const committed = await getFugueAuthorityVariable(github, name);
+  if (committed !== serialized) {
+    throw new Error(`Protected Integration dispatch fence ${name} was claimed with conflicting authority.`);
+  }
+  return { created, fence };
+}
+
+async function dispatchProtectedIntegrationWithAuthorityApp(
+  github: FugueGitHub,
+  policy: ActivePolicy,
+  snapshot: Awaited<ReturnType<typeof captureEvaluation>>,
+  requestId: string,
+  dispatchSecret: string,
+  authorityAnchor: string,
+  runToken: string,
+): Promise<void> {
+  const token = process.env.FUGUE_AUTHORITY_TOKEN?.trim();
+  if (!token) throw new Error("Protected Integration dispatch requires FUGUE_AUTHORITY_TOKEN.");
+  const { owner, repo } = github.repository;
+  const response = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows/fugue-integration.yml/dispatches`,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2026-03-10",
+      },
+      body: JSON.stringify({
+        ref: policy.identity.baseBranch,
+        return_run_details: true,
+        inputs: {
+          pr: snapshot.identity.prNumber,
+          request_id: requestId,
+          dispatch_secret: dispatchSecret,
+          authority_anchor: authorityAnchor,
+          run_token: runToken,
+        },
+      }),
+    },
+  );
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`Protected Authority-App Integration dispatch failed (${response.status}): ${raw.slice(0, 300)}`);
+  }
+  let data: { workflow_run_id?: unknown; html_url?: unknown; run_url?: unknown } = {};
+  if (raw) {
+    try { data = JSON.parse(raw) as typeof data; }
+    catch { /* requested-event witness remains the recovery authority */ }
+  }
+  const runId = typeof data.workflow_run_id === "number" ? data.workflow_run_id : Number.NaN;
+  const htmlUrl = typeof data.html_url === "string" ? data.html_url : typeof data.run_url === "string" ? data.run_url : "";
+  const expectedHtmlUrl = Number.isSafeInteger(runId) && runId > 0
+    ? `https://github.com/${github.repository.fullName}/actions/runs/${runId}`
+    : "";
+  if (Number.isSafeInteger(runId) && runId > 0 && htmlUrl === expectedHtmlUrl) {
+    await bindDispatchedIntegrationRun(github, snapshot, requestId, runId, htmlUrl, new Date().toISOString());
+    await cleanupProtectedIntegrationRecovery(github, requestId);
+    return;
+  }
+  // The POST succeeded but the exact synchronous identity did not survive. F remains create-only and
+  // prevents redispatch; requested/completed B or the OIDC run-start may still recover the exact L.
+  throw new IntegrationExactRunIdentityUnavailableError(
+    `Protected Integration dispatch for ${requestId} succeeded without a valid exact returned run identity; the dispatch fence is retained.`,
+  );
+}
+
+async function bindProtectedIntegrationWorkflowRunEvent(
+  github: FugueGitHub,
+  event: IntegrationWorkflowRunEvent,
+): Promise<boolean> {
+  const actorId = integrationAuthorityActorId();
+  if (actorId === undefined || event.workflowName !== "Fugue Integration" || event.runAttempt !== 1) return false;
+  const match = event.displayTitle.match(/^Fugue Integration PR #(\d+) (int-[0-9a-f]{16}-[0-9a-f]{16}) ([0-9a-f]{24})$/);
+  if (!match?.[1] || !match[2] || !match[3]) return false;
+  const prNumber = Number(match[1]);
+  if (!Number.isSafeInteger(prNumber) || prNumber <= 0) return false;
+  const snapshot = await captureEvaluation(github, prNumber);
+  const current = await getCurrentIntegrationRecord(github, snapshot.identity);
+  if (!current || current.request.request_id !== match[2] || current.terminal) return false;
+  if (current.run) return current.run.id === event.runId;
+
+  const fence = await readProtectedIntegrationDispatchFence(github, current.request.request_id);
+  const witness = await readProtectedIntegrationBindingWitness(github, current.request.request_id);
+  if (!fence || !witness) return false;
+  assertProtectedFenceMatchesRecord(fence, current, actorId);
+  assertProtectedWitnessMatchesFence(witness, fence, github);
+  if (fence.run_token !== match[3] || witness.run_id !== event.runId ||
+      witness.run_created_at !== event.createdAt || witness.html_url !== event.htmlUrl) return false;
+  await bindDispatchedIntegrationRun(
+    github, snapshot, current.request.request_id, witness.run_id, witness.html_url, witness.run_created_at,
+  );
+  await cleanupProtectedIntegrationRecovery(github, current.request.request_id);
+  return true;
+}
+
 export async function dispatchIntegration(github: FugueGitHub, policy: ActivePolicy, work: WorkState, now = Date.now()): Promise<void> {
   const { owner, repo } = github.repository;
   const prNumber = requirePr(work);
@@ -481,9 +873,32 @@ export async function dispatchIntegration(github: FugueGitHub, policy: ActivePol
   if (snapshot.identity.baseSha !== policy.identity.baseSha) {
     throw new Error(`Integration dispatch base changed while reconciling PR #${prNumber}.`);
   }
+
+  const actorId = integrationAuthorityActorId();
+  if (actorId !== undefined) {
+    const existing = await getCurrentIntegrationRecord(github, snapshot.identity);
+    if (existing && !existing.terminal) {
+      if (await recoverExistingProtectedIntegration(github, snapshot, now)) return;
+      // No F/B/start/run exists: this remains the canonical pre-POST recovery path.
+    }
+  }
+
   const next = await ensureIntegrationDispatch(github, snapshot, now);
   if (!next.dispatch || !next.request || !next.dispatchSecret || !next.authorityAnchor) return;
   const runToken = integrationDispatchRunToken(next.request.request_id, next.dispatchSecret);
+
+  if (actorId !== undefined) {
+    const { created, fence } = await createProtectedIntegrationDispatchFence(
+      github, snapshot, next.request.request_id, next.dispatchSecret, next.authorityAnchor, now,
+    );
+    if (!created) return;
+    await markIntegrationDispatchStarted(github, snapshot, next.request.request_id, fence.created_at);
+    await dispatchProtectedIntegrationWithAuthorityApp(
+      github, policy, snapshot, next.request.request_id, next.dispatchSecret, next.authorityAnchor, runToken,
+    );
+    return;
+  }
+
   const dispatched = await github.octokit.request("POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches", {
     owner,
     repo,

@@ -159,11 +159,12 @@ REQUEST
     one-use 256-bit dispatch capability; only its digest is durable in d3
     and a signed dispatch anchor is stored in the bounded request-specific Authority anchor
 
-RUN START
-    GitHub's protected fugue-authority environment first persists a deployment/status
-    whose environment URL correlates request + exact GITHUB_RUN_ID before any in-job audit
-    or Authority App token mint; the run then proves the one-use capability and creates the
-    request-specific OIDC-signed run-start record; after d3 binds that run, transient request records are reclaimed
+DISPATCH / RUN START
+    protected Authority first commits a request-specific create-only dispatch fence, then
+    dispatches with return_run_details=true; an exact returned run ID/URL is bound to d3
+    immediately. A protected Authority-App workflow_run witness and the later OIDC-signed
+    run-start are independent exact-run recovery proofs; transient request records are
+    reclaimed only after exact binding makes them redundant
 
 VALIDATE
     candidate checkout is read-only and credential-separated
@@ -174,9 +175,9 @@ TERMINAL
     then writes presentation attestation comment / fugue/integration status
 ```
 
-Workflow-run search, public run titles/tokens, and custom Git refs are not binding authority. GitHub's environment deployment/status is the crash bridge between workflow-dispatch creation and d3 binding: it is created by the protected `fugue-authority` environment before failure-prone job steps, carries only request/run correlation in `environment_url`, and remains after an Actions-write principal deletes the workflow-run record. Recovery requires a stable repeated deployment scan and selects the globally lowest matching run ID, so later same-request replays or >100 mutable workflow-run records cannot replace the first created attempt. Concurrent protected reconcilers still converge through one deterministic create-only election and immutable request-specific anchor/run-start names; no live Authority variable is PATCHed or reused.
+Deployment, Deployment Status, workflow-run/history pagination, public run titles/tokens, actor/login presentation, and custom Git refs are not binding authority. Protected reconciliation creates one request-specific `FUGUE_INT_F_*` fence before POST, keeps the API `2026-03-10` `return_run_details: true` response as the primary exact binding, and can independently recover from a create-only Authority-App-authenticated `FUGUE_INT_B_*` exact-run witness or the OIDC-signed run-start. F/B lookup is request-local constant work, so later history volume, deletion, or page shifting cannot lower or replace L. Concurrent protected reconcilers still converge through first-create-wins request authority; no live Authority name is PATCHed or reused.
 
-If a stable deployment scan proves no matching attempt was ever created after the recovery grace period, protected recovery may abort that unused request and create a fresh one. Once a protected deployment, run-start, or returned dispatch binding proves attempt 1 existed, deletion of the Actions run cannot become a retry: Fugue retains that exact run identity and fails closed to terminal failure unless it already has durable PASS/failure/error or an actually observed cancellation/abortion. A `workflow_run` consumer can seal outcomes promptly, but its event no longer depends on the deleted run remaining listable.
+If no pre-dispatch fence exists, the existing pre-POST no-run recovery may safely abort/retry after grace. Once F exists, the request can never be redispatched or replaced. A returned binding, B witness, or OIDC run-start establishes exact L; deletion of that Actions run then fails closed to terminal failure while preserving its run ID. There is one explicit information-loss boundary: if GitHub creates L, the synchronous response is lost, and `actions:write` prevents every protected exact-run witness before deleting L, only the may-have-dispatched fence survives. No GitHub-only trusted record then contains L's numeric run ID, so Fugue remains unresolved rather than inventing a terminal run or consulting attacker-writable history. Full liveness for that literal sequence requires an atomic create-and-durable-bind primitive or an attacker-independent durable observer.
 
 Terminal PASS/failure is stored in the durable record and therefore survives deletion of the workflow run, request comment, Integration result/attestation comment, or UI status. A terminal PASS embeds the full Integration attestation plus exact request ID, run ID, and attempt 1. `fugue/integration` remains the branch-protection/UI signal; it is not durable authority by itself.
 
@@ -235,7 +236,7 @@ fugue status
 
 Normal work after bootstrap is coordinated through the Leader/GitHub control plane.
 
-The hosted control plane additionally requires a dedicated **Fugue Authority** GitHub App installed only on the governed repository with repository **Variables: write** (and metadata read) permission. **Before the App private key is installed**, repository administrators must create `fugue-authority`, configure its deployment policy to allow exactly the protected default branch, and verify that restriction externally. Only then is the private key installed as an environment secret. A workflow's in-job environment-policy audit is drift detection only: it runs after GitHub has already gated that job and cannot make a broadly configured environment safe from a candidate workflow that references the environment directly. `FUGUE_AUTHORITY_APP_CLIENT_ID` is provided through the environment/repository `vars` context and `FUGUE_AUTHORITY_APP_PRIVATE_KEY` through the environment `secrets` context. The protected workflows mint short-lived installation tokens and pass them only to authority-variable operations; candidate jobs never receive that credential.
+The hosted control plane additionally requires a dedicated **Fugue Authority** GitHub App installed only on the governed repository with repository **Variables: write** and **Actions: write** (and metadata read) permissions. **Before the App private key is installed**, repository administrators must create `fugue-authority`, configure its deployment policy to allow exactly the protected default branch, and verify that restriction externally. Only then is the private key installed as an environment secret. A workflow's in-job environment-policy audit is drift detection only: it runs after GitHub has already gated that job and cannot make a broadly configured environment safe from a candidate workflow that references the environment directly. `FUGUE_AUTHORITY_APP_CLIENT_ID` is provided through the environment/repository `vars` context and `FUGUE_AUTHORITY_APP_PRIVATE_KEY` through the environment `secrets` context. The protected workflows mint short-lived installation tokens and pass them only to authority-variable operations; candidate jobs never receive that credential.
 
 ## First proving grounds
 

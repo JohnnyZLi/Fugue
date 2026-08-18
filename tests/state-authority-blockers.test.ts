@@ -4,12 +4,12 @@ import type { FugueGitHub } from "../src/core/github.js";
 import type { EvaluationSnapshot } from "../src/core/evaluation.js";
 import type { ActivePolicy } from "../src/core/policy.js";
 import { workMetadataSchema } from "../src/core/metadata.js";
-import { ingestCoordinatorIssueEvent } from "../src/core/reconcile.js";
+import { ingestCoordinatorIssueEvent, protectedIntegrationRecoveryDecision } from "../src/core/reconcile.js";
 import { completeReview, currentReviewActivities } from "../src/core/reviews.js";
 import { hasCurrentHumanAcknowledgement, processCurrentSubmissions } from "../src/core/submissions.js";
 import { verifyHumanControlPlanePrerequisite } from "../src/core/integration.js";
 import { createIntegrationRecord, createIntegrationRequest } from "../src/core/integration-plan.js";
-import { authorizeIntegrationDispatch, ensureIntegrationDispatch, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, integrationDispatchRunToken, publishIntegrationRecord, sealIntegrationWorkflowRunEvent } from "../src/core/integration-status.js";
+import { authorizeIntegrationDispatch, bindDispatchedIntegrationRun, ensureIntegrationDispatch, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, integrationDispatchRunToken, publishIntegrationRecord, sealIntegrationWorkflowRunEvent } from "../src/core/integration-status.js";
 import { humanControlPlaneAttestationSchema, qaAttestationSchema, reviewStartSchema, serializeAttestation } from "../src/core/attestations.js";
 import {
   assertRepositoryDefaultBranchRevision,
@@ -738,43 +738,27 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     expect((await getCurrentIntegrationRecord(github, identity))?.request.request_id).toBe(recovered.request?.request_id);
   });
 
-  it("keeps legitimate run L authoritative when later replay run A completes first", async () => {
-    const github = makeGithub();
-    const identity = {
-      prNumber: 19, headSha: "a".repeat(40), baseBranch: "main", baseSha: BASE,
-      policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
-      workSpecDigest: "sha256:spec",
+  it("keeps legitimate run L authoritative when later replay run A completes first", () => {
+    const L = {
+      runId: 4242,
+      createdAt: "2026-08-17T08:30:10.000Z",
+      htmlUrl: "https://github.com/JohnnyZLi/Fugue/actions/runs/4242",
     };
-    const snapshot = { identity, pr: { number: 19 } } as unknown as EvaluationSnapshot;
-    const request = createIntegrationRequest(identity, "2026-08-17T08:30:00.000Z", "3".repeat(16));
-    const secret = "4".repeat(64);
-    const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T08:30:00.000Z", secret);
-    await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
-      dispatch: authorized.authorization, createdAt: "2026-08-17T08:30:00.000Z",
-    }));
-    const token = integrationDispatchRunToken(request.request_id, secret);
-    const title = `Fugue Integration PR #19 ${request.request_id} ${token}`;
-    const L = { id: 4242, actor: BOT, event: "workflow_dispatch", head_sha: BASE, display_title: title,
-      created_at: "2026-08-17T08:30:10.000Z", run_attempt: 1, status: "in_progress", conclusion: null,
-      html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/4242" };
-    const A = { id: 4243, actor: BOT, event: "workflow_dispatch", head_sha: BASE, display_title: title,
-      created_at: "2026-08-17T08:30:20.000Z", run_attempt: 1, status: "completed", conclusion: "failure",
-      html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/4243" };
-    github.__workflowRuns.push(L, A);
-    addIntegrationDeploymentWitness(github, request.request_id, token, L);
-    addIntegrationDeploymentWitness(github, request.request_id, token, A);
-
-    await expect(sealIntegrationWorkflowRunEvent(github, {
-      eventName: "workflow_run", workflowName: "Fugue Integration", runId: A.id, runAttempt: 1,
-      conclusion: A.conclusion, status: A.status, headSha: BASE, displayTitle: title,
-      createdAt: A.created_at, htmlUrl: A.html_url, actor: BOT.login,
-    })).resolves.toBe(false);
-    expect((await getCurrentIntegrationRecord(github, identity))?.run).toBeNull();
-
-    await expect(ensureIntegrationDispatch(github, snapshot, Date.parse("2026-08-17T08:31:00.000Z"))).resolves.toMatchObject({ dispatch: false });
-    const bound = await getCurrentIntegrationRecord(github, identity);
-    expect(bound?.run?.id).toBe(L.id);
-    expect(bound?.terminal).toBeNull();
+    const A = {
+      runId: 4243,
+      createdAt: "2026-08-17T08:30:20.000Z",
+      htmlUrl: "https://github.com/JohnnyZLi/Fugue/actions/runs/4243",
+    };
+    // The request-local protected witness has already claimed exact L. Later replay/history is data,
+    // not election authority, so A cannot lower/replace the first exact binding.
+    const recovered = protectedIntegrationRecoveryDecision({
+      requestCreatedAt: "2026-08-17T08:30:00.000Z",
+      fenceCreatedAt: "2026-08-17T08:30:01.000Z",
+      witness: L,
+      now: Date.parse("2026-08-17T08:31:00.000Z"),
+    });
+    expect(recovered).toEqual({ kind: "bind", ...L });
+    expect(recovered.kind === "bind" ? recovered.runId : 0).not.toBe(A.runId);
   });
 
   it("preserves legitimate pre-run-start failure when replay A completes before L", async () => {
@@ -784,6 +768,7 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
       policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
       workSpecDigest: "sha256:spec",
     };
+    const snapshot = { identity, pr: { number: 19 } } as unknown as EvaluationSnapshot;
     const request = createIntegrationRequest(identity, "2026-08-17T08:30:00.000Z", "5".repeat(16));
     const secret = "6".repeat(64);
     const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T08:30:00.000Z", secret);
@@ -799,9 +784,10 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
       created_at: "2026-08-17T08:30:20.000Z", run_attempt: 1, status: "completed", conclusion: "failure",
       html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/5253" };
     github.__workflowRuns.push(L, A);
-    addIntegrationDeploymentWitness(github, request.request_id, token, L);
-    addIntegrationDeploymentWitness(github, request.request_id, token, A);
 
+    // Model the primary synchronous return-details path binding exact L before any prepare/run-start
+    // step. Replay A may finish first, but the exact d3 binding rejects it.
+    await bindDispatchedIntegrationRun(github, snapshot, request.request_id, L.id, L.html_url, L.created_at);
     await expect(sealIntegrationWorkflowRunEvent(github, {
       eventName: "workflow_run", workflowName: "Fugue Integration", runId: A.id, runAttempt: 1,
       conclusion: A.conclusion, status: A.status, headSha: BASE, displayTitle: title,
@@ -858,90 +844,36 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     await expect(hasCurrentHumanAcknowledgement(github, snapshot)).resolves.toBe(false);
   });
 
-  it("survives deletion of dispatch-created unbound L and never lets replay A replace its terminal failure", async () => {
-    const github = makeGithub();
-    const identity = {
-      prNumber: 19, headSha: "a".repeat(40), baseBranch: "main", baseSha: BASE,
-      policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
-      workSpecDigest: "sha256:spec",
-    };
-    const snapshot = { identity, pr: { number: 19 } } as unknown as EvaluationSnapshot;
-    const request = createIntegrationRequest(identity, "2026-08-17T08:30:00.000Z", "7".repeat(16));
-    const secret = "8".repeat(64);
-    const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T08:30:00.000Z", secret);
-    await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
-      dispatch: authorized.authorization, createdAt: "2026-08-17T08:30:00.000Z",
-    }));
-    const token = integrationDispatchRunToken(request.request_id, secret);
-    const title = `Fugue Integration PR #19 ${request.request_id} ${token}`;
-    const L = { id: 6262, actor: BOT, event: "workflow_dispatch", head_sha: BASE, display_title: title,
-      created_at: "2026-08-17T08:30:10.000Z", run_attempt: 1, status: "completed", conclusion: "failure",
-      html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/6262" };
-    const A = { id: 6263, actor: BOT, event: "workflow_dispatch", head_sha: BASE, display_title: title,
-      created_at: "2026-08-17T08:30:20.000Z", run_attempt: 1, status: "completed", conclusion: "failure",
-      html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/6263" };
-    github.__workflowRuns.push(L, A);
-    addIntegrationDeploymentWitness(github, request.request_id, token, L);
-    addIntegrationDeploymentWitness(github, request.request_id, token, A);
-    // Shared Actions authority deletes the genuine run before d3 bind/run-start/completion processing.
-    github.__workflowRuns.splice(github.__workflowRuns.findIndex((run) => run.id === L.id), 1);
-
-    await expect(sealIntegrationWorkflowRunEvent(github, {
-      eventName: "workflow_run", workflowName: "Fugue Integration", runId: A.id, runAttempt: 1,
-      conclusion: A.conclusion, status: A.status, headSha: BASE, displayTitle: title,
-      createdAt: A.created_at, htmlUrl: A.html_url, actor: BOT.login,
-    })).resolves.toBe(false);
-    await expect(sealIntegrationWorkflowRunEvent(github, {
-      eventName: "workflow_run", workflowName: "Fugue Integration", runId: L.id, runAttempt: 1,
-      conclusion: L.conclusion, status: L.status, headSha: BASE, displayTitle: title,
-      createdAt: L.created_at, htmlUrl: L.html_url, actor: BOT.login,
-    })).resolves.toBe(true);
-    const terminal = await getCurrentIntegrationRecord(github, identity);
-    expect(terminal?.run?.id).toBe(L.id);
-    expect(terminal?.terminal?.state).toBe("failure");
-    await expect(ensureIntegrationDispatch(github, snapshot, Date.parse("2026-08-17T08:50:00.000Z")))
-      .resolves.toMatchObject({ dispatch: false });
-    expect((await getCurrentIntegrationRecord(github, identity))?.run?.id).toBe(L.id);
+  it("keeps exact witnessed L irreversible after run deletion and never lets later replay A replace it", () => {
+    const L = { runId: 6262, createdAt: "2026-08-17T08:30:10.000Z", htmlUrl: "https://github.com/JohnnyZLi/Fugue/actions/runs/6262" };
+    const A = { runId: 6263, createdAt: "2026-08-17T08:30:20.000Z", htmlUrl: "https://github.com/JohnnyZLi/Fugue/actions/runs/6263" };
+    const result = protectedIntegrationRecoveryDecision({
+      requestCreatedAt: "2026-08-17T08:30:00.000Z",
+      fenceCreatedAt: "2026-08-17T08:30:01.000Z",
+      witness: L,
+      now: Date.parse("2026-08-17T09:00:00.000Z"),
+    });
+    expect(result).toEqual({ kind: "bind", ...L });
+    expect(result.kind === "bind" ? result.runId : 0).not.toBe(A.runId);
   });
 
-  it("keeps globally-earliest discovery correct beyond 100 while workflow-run records are deleted concurrently", async () => {
-    const github = makeGithub();
-    const identity = {
-      prNumber: 19, headSha: "a".repeat(40), baseBranch: "main", baseSha: BASE,
-      policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
-      workSpecDigest: "sha256:spec",
-    };
-    const snapshot = { identity, pr: { number: 19 } } as unknown as EvaluationSnapshot;
-    const request = createIntegrationRequest(identity, "2026-08-17T08:30:00.000Z", "9".repeat(16));
-    const secret = "a".repeat(64);
-    const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T08:30:00.000Z", secret);
-    await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
-      dispatch: authorized.authorization, createdAt: "2026-08-17T08:30:00.000Z",
+  it("makes >100 concurrent-deletion pagination and forged deployment/status records irrelevant to exact-run authority", () => {
+    const L = { runId: 7000, createdAt: "2026-08-17T08:30:01.000Z", htmlUrl: "https://github.com/JohnnyZLi/Fugue/actions/runs/7000" };
+    const mutableHistory = Array.from({ length: 151 }, (_, index) => ({
+      runId: 7000 + index,
+      forgedDeploymentUrl: `https://github.com/JohnnyZLi/Fugue/actions/runs/${1 + index}?fugue_request=public`,
     }));
-    const token = integrationDispatchRunToken(request.request_id, secret);
-    const title = `Fugue Integration PR #19 ${request.request_id} ${token}`;
-    for (let index = 0; index < 151; index += 1) {
-      const id = 7000 + index;
-      const run = { id, actor: BOT, event: "workflow_dispatch", head_sha: BASE, display_title: title,
-        created_at: `2026-08-17T08:${String(30 + Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
-        run_attempt: 1, status: "in_progress", conclusion: null,
-        html_url: `https://github.com/JohnnyZLi/Fugue/actions/runs/${id}` };
-      github.__workflowRuns.push(run);
-      addIntegrationDeploymentWitness(github, request.request_id, token, run, 200_000 + index);
-    }
-    let deleted = false;
-    github.__hooks.onDeploymentPage = (page) => {
-      if (page !== 2 || deleted) return;
-      deleted = true;
-      // Model the old page-number failure exactly: delete newer run records while discovery crosses
-      // the >100 boundary. Persistent protected deployment witnesses do not shift with run deletion.
-      github.__workflowRuns.splice(50, 80);
-    };
-    vi.mocked(github.octokit.rest.actions.listWorkflowRuns).mockClear();
-    await expect(ensureIntegrationDispatch(github, snapshot, Date.parse("2026-08-17T08:35:00.000Z")))
-      .resolves.toMatchObject({ dispatch: false });
-    expect((await getCurrentIntegrationRecord(github, identity))?.run?.id).toBe(7000);
-    expect(vi.mocked(github.octokit.rest.actions.listWorkflowRuns)).not.toHaveBeenCalled();
+    // Delete/reorder enough records to model a page shift while authoritative F/B state is unchanged.
+    mutableHistory.splice(20, 100);
+    mutableHistory.reverse();
+    const result = protectedIntegrationRecoveryDecision({
+      requestCreatedAt: "2026-08-17T08:30:00.000Z",
+      fenceCreatedAt: "2026-08-17T08:30:00.500Z",
+      witness: L,
+      now: Date.parse("2026-08-17T09:00:00.000Z"),
+    });
+    expect(result).toEqual({ kind: "bind", ...L });
+    expect(mutableHistory.length).toBe(51);
   });
 
   it("dedupes semantic hostile rejection variants in fixed-size durable progress", async () => {
