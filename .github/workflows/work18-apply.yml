@@ -56,12 +56,12 @@ jobs:
         run: cd work && npm test
       - name: Build
         run: cd work && npm run build
-      - name: Commit only after full validation
+      - name: Commit validated non-workflow repair
         run: |
           cd work
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-          git add src/core/state.ts src/core/integration-plan.ts src/core/integration-status.ts src/core/reconcile.ts src/core/submissions.ts src/core/integration.ts src/core/workflow.ts .github/workflows/fugue-integration.yml tests/state-authority-blockers.test.ts AGENTS.md README.md docs/leader-chat.md
+          git add src/core/state.ts src/core/integration-plan.ts src/core/integration-status.ts src/core/reconcile.ts src/core/submissions.ts src/core/integration.ts src/core/workflow.ts tests/state-authority-blockers.test.ts AGENTS.md README.md docs/leader-chat.md
           git diff --cached --check
           git commit -m 'Close remaining QA transaction blockers'
           git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
