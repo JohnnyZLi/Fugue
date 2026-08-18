@@ -6,7 +6,7 @@ on:
 
 jobs:
   repair:
-    if: contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v3]')
+    if: contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v4]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -16,15 +16,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
-          fetch-depth: 1
-      - name: Finish historical cleanup current-set semantics
+          fetch-depth: 8
+      - name: Finish historical cleanup safety and late-writer reclamation
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "6cfec15202464a5b8d0a0e0ad1a589f62675aae2"
+          start=e8ebca4f528c7e8657e6418448f551004e77fbaa
+          base=6cfec15202464a5b8d0a0e0ad1a589f62675aae2
+          git merge-base --is-ancestor "$base" HEAD
+          unexpected="$(git diff --name-only "$base" HEAD | grep -v '^src/core/integration-status.ts$' || true)"
+          test -z "$unexpected"
           python <<'PY'
           from pathlib import Path
+
           path = Path('src/core/integration-status.ts')
           text = path.read_text()
+
           old = '''async function reclaimHistoricalIntegrationAuthorityVariables(
             github: FugueGitHub,
             variables: Array<{ name: string; value: string }>,
@@ -40,9 +46,11 @@ jobs:
             currentIdentities: IntegrationRequest["identity"][],
           ): Promise<void> {
 '''
-          if old not in text:
-              raise SystemExit('historical helper guard anchor missing')
-          text = text.replace(old, new, 1)
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit('historical helper signature is not recognized')
+
           old = '''  const currentRequests = new Map<string, string>();
           for (const identity of currentIdentities) {
             try {
@@ -54,9 +62,9 @@ jobs:
           }
 
 '''
-          if old not in text:
-              raise SystemExit('current request recovery block missing')
-          text = text.replace(old, '', 1)
+          if old in text:
+              text = text.replace(old, '', 1)
+
           old = '''    const currentIdentity = currentIdentities.find((candidate) => sameEvaluationIdentity(candidate, record.identity));
     const currentRequestId = currentIdentity
       ? currentRequests.get(JSON.stringify([currentIdentity.prNumber, currentIdentity.headSha.toLowerCase(), currentIdentity.baseBranch, currentIdentity.baseSha.toLowerCase(), currentIdentity.policyDigest, currentIdentity.protocolVersion, currentIdentity.issueNumber, currentIdentity.workId, currentIdentity.workSpecDigest]))
@@ -68,9 +76,11 @@ jobs:
     // request lifecycle/retry cleanup remains request-local; head/base/spec drift is what makes H1 historical.
     if (currentIdentity) continue;
 '''
-          if old not in text:
-              raise SystemExit('current identity skip block missing')
-          text = text.replace(old, new, 1)
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit('current evaluation skip is not recognized')
+
           old = '''export async function reclaimOrphanIntegrationAuthorityVariables(
             github: FugueGitHub,
             now = Date.now(),
@@ -81,17 +91,152 @@ jobs:
             now = Date.now(),
             currentIdentities?: IntegrationRequest["identity"][],
           ): Promise<void> {'''
-          if old not in text:
-              raise SystemExit('reclaim signature anchor missing')
-          text = text.replace(old, new, 1)
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit('reclaim current identity argument is not recognized')
+
           old = '  await reclaimHistoricalIntegrationAuthorityVariables(github, variables, now, currentIdentities);\n'
           new = '  if (currentIdentities !== undefined) await reclaimHistoricalIntegrationAuthorityVariables(github, variables, now, currentIdentities);\n'
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit('historical cleanup invocation is not recognized')
+
+          old = '''function historicalBindingMatchesRecord(witness: HistoricalIntegrationBindingWitness, record: IntegrationRecord): boolean {
+  if (!record.dispatch || !record.run) return false;
+  return witness.request_id === record.request.request_id && witness.pr_number === record.identity.prNumber &&
+    witness.head_sha.toLowerCase() === record.identity.headSha.toLowerCase() &&
+    witness.base_sha.toLowerCase() === record.identity.baseSha.toLowerCase() && witness.anchor_name === record.dispatch.anchor_name &&
+    witness.run_id === record.run.id && witness.run_attempt === 1 && Number.isFinite(Date.parse(witness.run_created_at));
+}
+'''
+          new = '''function historicalBindingMatchesRequest(
+  github: FugueGitHub,
+  witness: HistoricalIntegrationBindingWitness,
+  record: IntegrationRecord,
+): boolean {
+  if (!record.dispatch) return false;
+  return witness.request_id === record.request.request_id && witness.pr_number === record.identity.prNumber &&
+    witness.head_sha.toLowerCase() === record.identity.headSha.toLowerCase() &&
+    witness.base_sha.toLowerCase() === record.identity.baseSha.toLowerCase() && witness.anchor_name === record.dispatch.anchor_name &&
+    witness.run_attempt === 1 && Number.isFinite(Date.parse(witness.run_created_at)) &&
+    witness.html_url === `https://github.com/${github.repository.fullName}/actions/runs/${witness.run_id}`;
+}
+'''
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit('historical binding matcher is not recognized')
+
+          old = '''  if (name === integrationBindingWitnessName(record.request.request_id)) {
+    const witness = parseHistoricalJson(value, historicalIntegrationBindingWitnessSchema);
+    if (!witness || !historicalBindingMatchesRecord(witness, record)) return false;
+    return witness.html_url === `https://github.com/${github.repository.fullName}/actions/runs/${record.run!.id}`;
+  }
+  if (name === integrationRunStartVariableName(record.request)) {
+    if (!record.run) return false;
+    let start: IntegrationRunStartEvidence | null;
+    try { start = parseIntegrationRunStart(value); } catch { start = null; }
+    if (!start || start.request_id !== record.request.request_id || start.pr_number !== record.identity.prNumber ||
+        start.head_sha.toLowerCase() !== record.identity.headSha.toLowerCase() ||
+        start.base_sha.toLowerCase() !== record.identity.baseSha.toLowerCase() ||
+        start.secret_digest.toLowerCase() !== record.dispatch.secret_digest.toLowerCase() ||
+        start.anchor_name !== record.dispatch.anchor_name || start.run_id !== record.run.id || start.run_attempt !== 1) return false;
+    const timestamp = Date.parse(start.created_at);
+    if (!Number.isFinite(timestamp)) return false;
+    try { return await verifyProtocolPublicationBodyAtRevision(github, value, record.identity.baseSha, timestamp); }
+    catch { return false; }
+  }
+'''
+          new = '''  if (name === integrationBindingWitnessName(record.request.request_id)) {
+    const witness = parseHistoricalJson(value, historicalIntegrationBindingWitnessSchema);
+    if (!witness || !historicalBindingMatchesRequest(github, witness, record)) return false;
+    // Once identity_lost is durable, any later exact B for this protected request is permanently stale.
+    return record.terminal?.state === "identity_lost" || Boolean(record.run && witness.run_id === record.run.id);
+  }
+  if (name === integrationRunStartVariableName(record.request)) {
+    let start: IntegrationRunStartEvidence | null;
+    try { start = parseIntegrationRunStart(value); } catch { start = null; }
+    if (!start || start.request_id !== record.request.request_id || start.pr_number !== record.identity.prNumber ||
+        start.head_sha.toLowerCase() !== record.identity.headSha.toLowerCase() ||
+        start.base_sha.toLowerCase() !== record.identity.baseSha.toLowerCase() ||
+        start.secret_digest.toLowerCase() !== record.dispatch.secret_digest.toLowerCase() ||
+        start.anchor_name !== record.dispatch.anchor_name || start.run_attempt !== 1) return false;
+    const timestamp = Date.parse(start.created_at);
+    if (!Number.isFinite(timestamp)) return false;
+    try {
+      if (!(await verifyProtocolPublicationBodyAtRevision(github, value, record.identity.baseSha, timestamp))) return false;
+    } catch { return false; }
+    // Durable identity_lost makes a delayed protected S inert regardless of the run ID it observed.
+    return record.terminal?.state === "identity_lost" || Boolean(record.run && start.run_id === record.run.id);
+  }
+'''
           if old not in text:
-              raise SystemExit('historical call anchor missing')
-          path.write_text(text.replace(old, new, 1))
+              if new not in text: raise SystemExit('historical B/S cleanup block is not recognized')
+          else:
+              text = text.replace(old, new, 1)
+
+          old = '''    if (commit.kind === "integration_exact_run_commit") return Boolean(record.run && commit.run_id === record.run.id);
+'''
+          new = '''    if (commit.kind === "integration_exact_run_commit") {
+      return record.terminal?.state === "identity_lost" || Boolean(record.run && commit.run_id === record.run.id);
+    }
+'''
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit('historical C cleanup block is not recognized')
+
+          path.write_text(text)
+
+          test = Path('tests/state-authority-blockers.test.ts')
+          t = test.read_text()
+          anchor = '''      github.__authorityVariables.set(integrationCommitVariableName(request.request_id), JSON.stringify({
+        version: 1, kind: "integration_identity_lost_commit", request_id: request.request_id,
+        pr_number: identity.prNumber, head_sha: identity.headSha, base_sha: identity.baseSha,
+        anchor_name: authorized.authorization.anchor_name, attempt: 1,
+        boundary_created_at: terminal.terminal!.state === "identity_lost" ? terminal.terminal.boundary_created_at : "",
+        fence_digest: terminal.terminal!.state === "identity_lost" ? terminal.terminal.fence_digest : "",
+        created_at: terminal.terminal!.created_at,
+      }));
+      const names = [fence.names.fence, authorized.authorization.anchor_name, integrationCommitVariableName(request.request_id)];
+'''
+          replacement = '''      github.__authorityVariables.set(integrationCommitVariableName(request.request_id), JSON.stringify({
+        version: 1, kind: "integration_identity_lost_commit", request_id: request.request_id,
+        pr_number: identity.prNumber, head_sha: identity.headSha, base_sha: identity.baseSha,
+        anchor_name: authorized.authorization.anchor_name, attempt: 1,
+        boundary_created_at: terminal.terminal!.state === "identity_lost" ? terminal.terminal.boundary_created_at : "",
+        fence_digest: terminal.terminal!.state === "identity_lost" ? terminal.terminal.fence_digest : "",
+        created_at: terminal.terminal!.created_at,
+      }));
+      // Model protected B/S writers that were already in flight and reappeared after identity_lost cleanup.
+      installProtectedBinding(github, terminal, fence.fence, 120520, "2026-08-18T18:12:00.000Z");
+      const lateStart = await signProtocolBody(github, serializeIntegrationRunStartEvidence({
+        version: 1, kind: "integration_run_start", request_id: request.request_id,
+        pr_number: identity.prNumber, head_sha: identity.headSha, base_sha: identity.baseSha,
+        secret_digest: terminal.dispatch!.secret_digest, anchor_name: terminal.dispatch!.anchor_name,
+        run_id: 120521, run_attempt: 1, created_at: "2026-08-18T18:12:01.000Z",
+      }));
+      github.__authorityVariables.set(integrationRunStartVariableName(request), lateStart);
+      const names = [
+        fence.names.fence,
+        authorized.authorization.anchor_name,
+        fence.names.binding,
+        integrationRunStartVariableName(request),
+        integrationCommitVariableName(request.request_id),
+      ];
+'''
+          if anchor in t:
+              t = t.replace(anchor, replacement, 1)
+          elif replacement not in t:
+              raise SystemExit('identity_lost late-writer regression anchor missing')
+          test.write_text(t)
           PY
-          test "$(git diff --name-only)" = "src/core/integration-status.ts"
-          ! git diff --name-only | grep -Fx package-lock.json
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' 'src/core/integration-status.ts' 'tests/state-authority-blockers.test.ts' | sort)"
+          test "$changed" = "$expected"
+          ! git diff --name-only "$start" HEAD | grep -Fx package-lock.json
           git diff --check
           npm ci
           npm run check
@@ -99,9 +244,9 @@ jobs:
           npm run build
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-          git add src/core/integration-status.ts
+          git add src/core/integration-status.ts tests/state-authority-blockers.test.ts
           git diff --cached --check
-          git commit -m 'Protect current evaluation during historical Integration cleanup'
+          git commit -m 'Finish historical Integration cleanup hardening'
           git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
       - id: head
         name: Resolve final exact head
@@ -144,7 +289,7 @@ jobs:
 
   record:
     needs: [repair, test]
-    if: always() && contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v3]')
+    if: always() && contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v4]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -159,5 +304,5 @@ jobs:
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
           git add .github/work18-cleanup-lifecycle-final-result.txt
-          git commit -m 'Record cleanup lifecycle final validation v3' || exit 0
+          git commit -m 'Record cleanup lifecycle final validation v4' || exit 0
           git push origin HEAD:bootstrap/work18-identity-lost-20260818
