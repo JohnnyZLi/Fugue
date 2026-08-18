@@ -6,7 +6,7 @@ on:
 
 jobs:
   repair:
-    if: contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v2]')
+    if: contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v3]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -43,6 +43,34 @@ jobs:
           if old not in text:
               raise SystemExit('historical helper guard anchor missing')
           text = text.replace(old, new, 1)
+          old = '''  const currentRequests = new Map<string, string>();
+          for (const identity of currentIdentities) {
+            try {
+              const current = await getCurrentIntegrationRecord(github, identity);
+              if (current) currentRequests.set(JSON.stringify([identity.prNumber, identity.headSha.toLowerCase(), identity.baseBranch, identity.baseSha.toLowerCase(), identity.policyDigest, identity.protocolVersion, identity.issueNumber, identity.workId, identity.workSpecDigest]), current.request.request_id);
+            } catch (error) {
+              if (!(error instanceof DurableProtocolRecoveryPendingError)) throw error;
+            }
+          }
+
+'''
+          if old not in text:
+              raise SystemExit('current request recovery block missing')
+          text = text.replace(old, '', 1)
+          old = '''    const currentIdentity = currentIdentities.find((candidate) => sameEvaluationIdentity(candidate, record.identity));
+    const currentRequestId = currentIdentity
+      ? currentRequests.get(JSON.stringify([currentIdentity.prNumber, currentIdentity.headSha.toLowerCase(), currentIdentity.baseBranch, currentIdentity.baseSha.toLowerCase(), currentIdentity.policyDigest, currentIdentity.protocolVersion, currentIdentity.issueNumber, currentIdentity.workId, currentIdentity.workSpecDigest]))
+      : undefined;
+    if (currentIdentity && currentRequestId === record.request.request_id) continue;
+'''
+          new = '''    const currentIdentity = currentIdentities.find((candidate) => sameEvaluationIdentity(candidate, record.identity));
+    // Never treat any request under the current exact evaluation as historical. Current-evaluation
+    // request lifecycle/retry cleanup remains request-local; head/base/spec drift is what makes H1 historical.
+    if (currentIdentity) continue;
+'''
+          if old not in text:
+              raise SystemExit('current identity skip block missing')
+          text = text.replace(old, new, 1)
           old = '''export async function reclaimOrphanIntegrationAuthorityVariables(
             github: FugueGitHub,
             now = Date.now(),
@@ -73,7 +101,7 @@ jobs:
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
           git add src/core/integration-status.ts
           git diff --cached --check
-          git commit -m 'Finish historical Integration cleanup with empty current set'
+          git commit -m 'Protect current evaluation during historical Integration cleanup'
           git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
       - id: head
         name: Resolve final exact head
@@ -116,7 +144,7 @@ jobs:
 
   record:
     needs: [repair, test]
-    if: always() && contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v2]')
+    if: always() && contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v3]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -131,5 +159,5 @@ jobs:
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
           git add .github/work18-cleanup-lifecycle-final-result.txt
-          git commit -m 'Record cleanup lifecycle final validation v2' || exit 0
+          git commit -m 'Record cleanup lifecycle final validation v3' || exit 0
           git push origin HEAD:bootstrap/work18-identity-lost-20260818
