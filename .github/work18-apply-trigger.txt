@@ -1,1 +1,1 @@
-apply structural convergence work-18 repairs
+publish validated non-workflow work-18 repair
