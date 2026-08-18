@@ -17,11 +17,10 @@ jobs:
         with:
           ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fetch-depth: 1
-      - name: Apply focused terminal-state repair if needed
+      - name: Apply source/test terminal-state repair if needed
         run: |
           set -euo pipefail
-          current="$(git rev-parse HEAD)"
-          if [[ "$current" == "9f056f6eb977bfa5f45f10250c0570fc6d021d03" ]]; then
+          if ! grep -q 'keeps known attempt cancellation terminal and refuses replacement after deletion' tests/reconcile.test.ts; then
             python <<'PY'
           from pathlib import Path
           import re
@@ -60,14 +59,6 @@ jobs:
           )
           status_path.write_text(status)
 
-          control_path = Path('.github/workflows/fugue-control-plane.yml')
-          control = control_path.read_text()
-          old = '              committed.run_created_at !== runCreatedAt || committed.html_url !== htmlUrl) {'
-          new = "              !Number.isFinite(Date.parse(String(committed.run_created_at ?? ''))) || committed.html_url !== htmlUrl) {"
-          if old not in control:
-              raise SystemExit('control exact-winner check not found')
-          control_path.write_text(control.replace(old, new, 1))
-
           tests_path = Path('tests/reconcile.test.ts')
           tests = tests_path.read_text()
           cancellation = '''  it("keeps known attempt cancellation terminal and refuses replacement after deletion", async () => {\n    const github = makeGithub();\n    const record = await publishAuthorizedRecord(github, 700, "2026-08-17T03:36:00.000Z");\n    await installRunStartEvidence(github, record, 700, "2026-08-17T03:36:01.000Z");\n    await expect(sealIntegrationWorkflowRunEvent(github, completionEvent(record.request, 700, "cancelled", "2026-08-17T03:36:05.000Z"))).resolves.toBe(true);\n    let current = await getCurrentIntegrationRecord(github, snapshot().identity);\n    expect(current?.run?.id).toBe(700);\n    expect(current?.terminal?.state).toBe("error");\n    expect((await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:00:00Z"))).dispatch).toBe(false);\n\n    github.__runs.splice(0); github.__attempts.clear(); github.__comments.splice(0);\n    current = await getCurrentIntegrationRecord(github, snapshot().identity);\n    expect(current?.run?.id).toBe(700);\n    expect(current?.terminal?.state).toBe("error");\n    expect((await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T05:00:00Z"))).dispatch).toBe(false);\n  });\n'''
@@ -94,14 +85,13 @@ jobs:
           PY
             git config user.name Johnny
             git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-            git add src/core/integration-status.ts .github/workflows/fugue-control-plane.yml tests/reconcile.test.ts
+            git add src/core/integration-status.ts tests/reconcile.test.ts
             git diff --cached --check
             git commit -m 'Linearize terminal cleanup and known cancellation'
             git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
-          else
-            grep -q 'keeps known attempt cancellation terminal and refuses replacement after deletion' tests/reconcile.test.ts
-            grep -q 'Keep C as the request-local tombstone' src/core/integration-status.ts
           fi
+          grep -q 'keeps known attempt cancellation terminal and refuses replacement after deletion' tests/reconcile.test.ts
+          grep -q 'Keep C as the request-local tombstone' src/core/integration-status.ts
       - id: head
         name: Resolve final exact head
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
