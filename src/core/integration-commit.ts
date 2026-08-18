@@ -161,7 +161,9 @@ export async function claimExactIntegrationCommit(
   if (winner.kind === "integration_identity_lost_commit") {
     throw new Error(`Integration request ${context.requestId} already committed terminal identity_lost serialization.`);
   }
-  if (winner.run_id !== candidate.runId || winner.run_created_at !== candidate.createdAt || winner.html_url !== candidate.htmlUrl) {
+  // B, S, and the synchronous return-details path can observe the same run at different clocks.
+  // Once one of them wins C, every other exact writer converges on that winner's canonical timestamp.
+  if (winner.run_id !== candidate.runId || winner.html_url !== candidate.htmlUrl) {
     throw new Error(`Integration request ${context.requestId} already committed protected run ${winner.run_id}.`);
   }
   return winner;
