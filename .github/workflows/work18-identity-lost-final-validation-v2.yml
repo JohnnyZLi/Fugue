@@ -17,39 +17,28 @@ jobs:
         with:
           ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fetch-depth: 1
-      - name: Update crash-interrupted cleanup regression if needed
+      - name: Fix monotonic crash-simulation authority order if needed
         run: |
           set -euo pipefail
-          if grep -q 'Simulate a crash immediately after durable terminal commit, before F/B cleanup.' tests/state-authority-blockers.test.ts; then
+          if grep -q 'const terminalAt = "2026-08-17T14:11:00.000Z";' tests/state-authority-blockers.test.ts; then
             python <<'PY'
           from pathlib import Path
-
           path = Path('tests/state-authority-blockers.test.ts')
           text = path.read_text()
-          old_import = 'import { createIntegrationRecord, createIntegrationRequest, type IntegrationRecord } from "../src/core/integration-plan.js";'
-          new_import = 'import { createIntegrationRecord, createIntegrationRequest, serializeIntegrationRecord, type IntegrationRecord } from "../src/core/integration-plan.js";'
-          if old_import not in text:
-              raise SystemExit('integration-plan import not found')
-          text = text.replace(old_import, new_import, 1)
-          status_import = 'import { authorizeIntegrationDispatch, bindDispatchedIntegrationRun, ensureIntegrationDispatch, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, integrationDispatchRunToken, publishIntegrationRecord, sealIntegrationWorkflowRunEvent } from "../src/core/integration-status.js";'
-          commit_import = status_import + '\nimport { claimIdentityLostIntegrationCommit } from "../src/core/integration-commit.js";'
-          if status_import not in text:
-              raise SystemExit('integration-status import not found')
-          text = text.replace(status_import, commit_import, 1)
-          old = '''      // Simulate a crash immediately after durable terminal commit, before F/B cleanup.\n      const terminalAt = "2026-08-17T14:11:00.000Z";\n      record = await publishIntegrationRecord(github, {\n        ...record,\n        dispatch_started_at: protectedFence.fence.created_at as string,\n        run: null,\n        terminal: {\n          state: "identity_lost", attempt: 1,\n          boundary_created_at: protectedFence.fence.created_at as string,\n          fence_digest: `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`,\n          detail: "simulated post-commit cleanup crash", created_at: terminalAt,\n        },\n        created_at: terminalAt,\n      });\n      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(true);\n      const durableBefore = await getCurrentIntegrationRecord(github, identity);\n'''
-          new = '''      // Simulate the exact crash boundary: request-local identity_lost serialization and d3\n      // terminal authority have committed, but none of the transient F/A/B/S/C cleanup has run.\n      const terminalAt = "2026-08-17T14:11:00.000Z";\n      const fenceDigest = `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`;\n      const terminalRecord: IntegrationRecord = {\n        ...record,\n        dispatch_started_at: protectedFence.fence.created_at as string,\n        run: null,\n        terminal: {\n          state: "identity_lost", attempt: 1,\n          boundary_created_at: protectedFence.fence.created_at as string,\n          fence_digest: fenceDigest,\n          detail: "simulated post-commit cleanup crash", created_at: terminalAt,\n        },\n        created_at: terminalAt,\n      };\n      await claimIdentityLostIntegrationCommit(github, {\n        requestId: record.request.request_id,\n        prNumber: identity.prNumber,\n        headSha: identity.headSha,\n        baseSha: identity.baseSha,\n        anchorName: authorized.authorization.anchor_name,\n      }, {\n        boundaryCreatedAt: protectedFence.fence.created_at as string,\n        fenceDigest,\n        createdAt: terminalAt,\n      });\n      await publishDurableProtocolRecord(github, {\n        storageSha: identity.headSha,\n        publisherSha: identity.baseSha,\n        scope: `integration/${identity.prNumber}`,\n        unsignedBody: `${serializeIntegrationRecord(terminalRecord)}\\n\\nINTEGRATION RECORD — CANONICAL`,\n        publicationTimestamp: Date.parse(terminalAt),\n        authorityOrder: terminalAt,\n      });\n      record = terminalRecord;\n      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(true);\n      const durableBefore = await getCurrentIntegrationRecord(github, identity);\n'''
+          old = '      const terminalAt = "2026-08-17T14:11:00.000Z";'
+          new = '      const terminalAt = new Date(Date.parse(record.created_at) + 11 * 60 * 1000).toISOString();'
           if old not in text:
-              raise SystemExit('old crash simulation block not found')
+              raise SystemExit('terminal timestamp line not found')
           path.write_text(text.replace(old, new, 1))
           PY
             git config user.name Johnny
             git config user.email 92900710+JohnnyZLi@users.noreply.github.com
             git add tests/state-authority-blockers.test.ts
             git diff --cached --check
-            git commit -m 'Model crash after terminal authority before cleanup'
+            git commit -m 'Keep terminal cleanup crash simulation monotonic'
             git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fi
-          grep -q 'request-local identity_lost serialization and d3' tests/state-authority-blockers.test.ts
+          grep -q 'Date.parse(record.created_at) + 11 \* 60 \* 1000' tests/state-authority-blockers.test.ts
       - id: head
         name: Resolve final exact head
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
