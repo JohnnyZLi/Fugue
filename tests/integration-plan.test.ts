@@ -205,12 +205,17 @@ describe("GitHub-hosted Integration plan", () => {
     }
   });
 
-  it("uses only unfiltered workflow-run enumeration for lost Integration binding recovery", async () => {
+  it("uses persistent environment deployments rather than mutable workflow-run pages for lost binding recovery", async () => {
     const source = await readFile("src/core/integration-status.ts", "utf8");
-    expect(source).toContain("listWorkflowRuns");
-    expect(source).toContain('workflow_id: "fugue-integration.yml"');
-    expect(source).toContain("per_page: 100");
-    expect(source).not.toMatch(/listWorkflowRuns\(\{[\s\S]{0,500}?(?:actor|branch|created|event|head_sha|status):/);
+    const workflow = await readFile(".github/workflows/fugue-integration.yml", "utf8");
+    const control = await readFile(".github/workflows/fugue-control-plane.yml", "utf8");
+    expect(source).not.toContain("listWorkflowRuns");
+    expect(source).toContain('GET /repos/{owner}/{repo}/deployments');
+    expect(source).toContain('GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses');
+    expect(source).toContain("previous?.fingerprint === current.fingerprint");
+    expect(workflow).toContain("fugue_request=${{ inputs.request_id }}");
+    expect(workflow).toContain("fugue_run_token=${{ inputs.run_token }}");
+    expect(control).toContain("deployments: read");
     expect(source).toContain("getIntegrationRunStartEvidence");
   });
 

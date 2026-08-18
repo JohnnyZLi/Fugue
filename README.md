@@ -133,7 +133,7 @@ Do not implement fixes. Submit the result directly to GitHub; do not ask
 the Human to use a terminal or relay the verdict.
 ```
 
-QA submissions are requests, not canonical evidence. Protected Fugue verifies the actor, current session, and exact evaluation identity, then writes canonical QA evidence. A changed head/base/policy/spec makes old QA historical.
+QA submissions are requests, not canonical evidence. Protected Fugue verifies immutable comment creation provenance (edited comments are non-authoritative), actor permission, current session, and exact evaluation identity, then writes canonical QA evidence. Rejected requests are deduplicated by bounded semantic d3 progress rather than raw comment IDs/bodies. A changed head/base/policy/spec makes old QA historical.
 
 ## Human control-plane acknowledgement
 
@@ -160,10 +160,10 @@ REQUEST
     and a signed dispatch anchor is stored in the bounded request-specific Authority anchor
 
 RUN START
-    before checkout/setup/build, attempt 1 proves the one-use capability
-    from its request-specific immutable anchor and creates a request-specific
-    OIDC-signed run-start record with create-only first-wins semantics carrying
-    GITHUB_RUN_ID + attempt 1; after d3 binds that run, transient request records are reclaimed
+    GitHub's protected fugue-authority environment first persists a deployment/status
+    whose environment URL correlates request + exact GITHUB_RUN_ID before any in-job audit
+    or Authority App token mint; the run then proves the one-use capability and creates the
+    request-specific OIDC-signed run-start record; after d3 binds that run, transient request records are reclaimed
 
 VALIDATE
     candidate checkout is read-only and credential-separated
@@ -174,9 +174,9 @@ TERMINAL
     then writes presentation attestation comment / fugue/integration status
 ```
 
-Filtered workflow-run search and custom Git refs are not binding authority. Concurrent protected reconcilers converge through one deterministic create-only election, then use immutable request-specific anchor/run-start names; no live Authority variable is PATCHed or reused. Same-request flood runs do not know the one-use capability and cannot replace the first create-only run-start, while reruns are rejected because only attempt 1 may consume it. Fugue caps active request anchors, safely scavenges aged pre-d3 orphans repository-wide, and reclaims each request's transient records as soon as d3 contains the protected run binding or terminal abort, so cancellation/retry or abandoned-PR residue cannot consume the finite Variables namespace. The exact run ID comes from the signed run-start value, so GitHub list caps and hostile ref movement do not affect first-run identity.
+Workflow-run search, public run titles/tokens, and custom Git refs are not binding authority. GitHub's environment deployment/status is the crash bridge between workflow-dispatch creation and d3 binding: it is created by the protected `fugue-authority` environment before failure-prone job steps, carries only request/run correlation in `environment_url`, and remains after an Actions-write principal deletes the workflow-run record. Recovery requires a stable repeated deployment scan and selects the globally lowest matching run ID, so later same-request replays or >100 mutable workflow-run records cannot replace the first created attempt. Concurrent protected reconcilers still converge through one deterministic create-only election and immutable request-specific anchor/run-start names; no live Authority variable is PATCHed or reused.
 
-If transport never crosses the run-start boundary, protected recovery may abort that unused request and create a fresh one. Once run-start is durable, however, deletion of the exact Actions run cannot become a retry: after the recovery grace period Fugue seals terminal failure unless it already has durable PASS/failure/error or an actually observed cancellation/abortion. A `workflow_run` consumer can seal outcomes promptly, but cancelling or deleting that consumer cannot erase the run-start evidence or turn a possible genuine failure into retryable transport.
+If a stable deployment scan proves no matching attempt was ever created after the recovery grace period, protected recovery may abort that unused request and create a fresh one. Once a protected deployment, run-start, or returned dispatch binding proves attempt 1 existed, deletion of the Actions run cannot become a retry: Fugue retains that exact run identity and fails closed to terminal failure unless it already has durable PASS/failure/error or an actually observed cancellation/abortion. A `workflow_run` consumer can seal outcomes promptly, but its event no longer depends on the deleted run remaining listable.
 
 Terminal PASS/failure is stored in the durable record and therefore survives deletion of the workflow run, request comment, Integration result/attestation comment, or UI status. A terminal PASS embeds the full Integration attestation plus exact request ID, run ID, and attempt 1. `fugue/integration` remains the branch-protection/UI signal; it is not durable authority by itself.
 

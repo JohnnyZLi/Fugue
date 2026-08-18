@@ -5,7 +5,7 @@ import type { EvaluationSnapshot } from "../src/core/evaluation.js";
 import type { ActivePolicy } from "../src/core/policy.js";
 import { workMetadataSchema } from "../src/core/metadata.js";
 import { ingestCoordinatorIssueEvent } from "../src/core/reconcile.js";
-import { currentReviewActivities } from "../src/core/reviews.js";
+import { completeReview, currentReviewActivities } from "../src/core/reviews.js";
 import { hasCurrentHumanAcknowledgement, processCurrentSubmissions } from "../src/core/submissions.js";
 import { verifyHumanControlPlanePrerequisite } from "../src/core/integration.js";
 import { createIntegrationRecord, createIntegrationRequest } from "../src/core/integration-plan.js";
@@ -63,6 +63,11 @@ vi.mock("../src/core/provenance.js", async (importOriginal) => {
   };
 });
 
+vi.mock("../src/core/reviews.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/core/reviews.js")>();
+  return { ...actual, completeReview: vi.fn(async () => undefined) };
+});
+
 const BASE = "b".repeat(40);
 const NEXT_BASE = "c".repeat(40);
 const BOT = { login: FUGUE_PROTOCOL_ACTOR, type: "Bot" } as const;
@@ -99,11 +104,31 @@ function metadata(execution = false) {
 
 interface TestComment {
   id: number;
+  node_id?: string;
   issueNumber: number;
   body: string;
   user?: { login: string; type: string };
   created_at?: string;
   updated_at?: string;
+  editedBy?: string;
+}
+
+interface TestDeploymentStatus {
+  id: number;
+  state: string;
+  environment: string;
+  environment_url: string;
+  created_at: string;
+}
+
+interface TestDeployment {
+  id: number;
+  sha: string;
+  ref: string;
+  task: string;
+  environment: string;
+  created_at: string;
+  statuses: TestDeploymentStatus[];
 }
 
 interface TestStatus {
@@ -122,6 +147,8 @@ interface TestGithub extends FugueGitHub {
   __comments: TestComment[];
   __statuses: TestStatus[];
   __workflowRuns: Array<{ id: number; actor: typeof BOT; event: string; head_sha: string; display_title: string; created_at: string; run_attempt: number; status: string; conclusion: string | null; html_url: string }>;
+  __deployments: TestDeployment[];
+  __hooks: { onDeploymentPage?: (page: number) => Promise<void> | void };
   __beforeRecoverySign?: (body: string) => Promise<void> | void;
   __beforeRevisionCheck?: () => Promise<void> | void;
 }
@@ -131,6 +158,8 @@ function makeGithub(): TestGithub {
   const comments: TestComment[] = [];
   const statuses: TestStatus[] = [];
   const workflowRuns: TestGithub["__workflowRuns"] = [];
+  const deployments: TestDeployment[] = [];
+  const hooks: TestGithub["__hooks"] = {};
   let nextCommentId = 0;
   let nextStatusId = 0;
 
@@ -141,7 +170,34 @@ function makeGithub(): TestGithub {
     __comments: comments,
     __statuses: statuses,
     __workflowRuns: workflowRuns,
+    __deployments: deployments,
+    __hooks: hooks,
     octokit: {
+      graphql: vi.fn(async (_query: string, variables: { id?: string }) => {
+        const comment = comments.find((candidate) => candidate.node_id === variables.id);
+        if (!comment) return { node: null };
+        return {
+          node: {
+            author: comment.user ? { login: comment.user.login } : null,
+            editor: comment.editedBy ? { login: comment.editedBy } : null,
+            lastEditedAt: comment.editedBy ? (comment.updated_at ?? new Date().toISOString()) : null,
+          },
+        };
+      }),
+      request: vi.fn(async (route: string, args: { page?: number; per_page?: number; deployment_id?: number }) => {
+        if (route === "GET /repos/{owner}/{repo}/deployments") {
+          const page = args.page ?? 1;
+          const perPage = args.per_page ?? 100;
+          await hooks.onDeploymentPage?.(page);
+          const ordered = [...deployments].sort((a, b) => b.id - a.id);
+          return { data: ordered.slice((page - 1) * perPage, page * perPage) };
+        }
+        if (route === "GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses") {
+          const deployment = deployments.find((candidate) => candidate.id === args.deployment_id);
+          return { data: deployment ? [...deployment.statuses].sort((a, b) => b.id - a.id) : [] };
+        }
+        throw new Error(`unexpected test route ${route}`);
+      }),
       paginate: vi.fn(async (method: (args: Record<string, unknown>) => Promise<{ data: unknown }>, args: Record<string, unknown>) => (await method(args)).data),
       rest: {
         issues: {
@@ -160,6 +216,7 @@ function makeGithub(): TestGithub {
             const created = new Date().toISOString();
             const comment: TestComment = {
               id: ++nextCommentId,
+              node_id: `IC_${nextCommentId}`,
               issueNumber: args.issue_number,
               body: args.body,
               user: BOT,
@@ -192,6 +249,9 @@ function makeGithub(): TestGithub {
           }),
         },
         repos: {
+          getCollaboratorPermissionLevel: vi.fn(async (args: { username: string }) => ({
+            data: { permission: args.username === "human" ? "write" : "read" },
+          })),
           createCommitStatus: vi.fn(async (args: {
             sha: string;
             context: string;
@@ -299,6 +359,43 @@ function fillAuthorityCapacity(github: TestGithub, prefix: string): void {
   while (github.__authorityVariables.size < 500) {
     github.__authorityVariables.set(`${prefix}${String(index++).padStart(4, "0")}`, "unrelated");
   }
+}
+
+function addIntegrationDeploymentWitness(
+  github: TestGithub,
+  requestId: string,
+  token: string,
+  run: TestGithub["__workflowRuns"][number],
+  deploymentId = 100_000 + run.id,
+): void {
+  github.__deployments.push({
+    id: deploymentId,
+    sha: run.head_sha,
+    ref: "main",
+    task: "deploy",
+    environment: "fugue-authority",
+    created_at: run.created_at,
+    statuses: [{
+      id: deploymentId * 10,
+      state: run.conclusion === "failure" ? "failure" : run.status === "completed" ? "success" : "in_progress",
+      environment: "fugue-authority",
+      environment_url: `https://github.com/JohnnyZLi/Fugue/actions/runs/${run.id}?fugue_request=${requestId}&fugue_run_token=${token}`,
+      created_at: run.created_at,
+    }],
+  });
+}
+
+function immutableUserComment(id: number, body: string, login = "attacker"): TestComment {
+  const timestamp = `2026-08-17T08:${String(id % 60).padStart(2, "0")}:00.000Z`;
+  return {
+    id,
+    node_id: `IC_${id}`,
+    issueNumber: 19,
+    body,
+    user: { login, type: "User" },
+    created_at: timestamp,
+    updated_at: timestamp,
+  };
 }
 
 describe("absorbed Code QA / Security QA authority blockers", () => {
@@ -664,6 +761,8 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
       created_at: "2026-08-17T08:30:20.000Z", run_attempt: 1, status: "completed", conclusion: "failure",
       html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/4243" };
     github.__workflowRuns.push(L, A);
+    addIntegrationDeploymentWitness(github, request.request_id, token, L);
+    addIntegrationDeploymentWitness(github, request.request_id, token, A);
 
     await expect(sealIntegrationWorkflowRunEvent(github, {
       eventName: "workflow_run", workflowName: "Fugue Integration", runId: A.id, runAttempt: 1,
@@ -700,6 +799,8 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
       created_at: "2026-08-17T08:30:20.000Z", run_attempt: 1, status: "completed", conclusion: "failure",
       html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/5253" };
     github.__workflowRuns.push(L, A);
+    addIntegrationDeploymentWitness(github, request.request_id, token, L);
+    addIntegrationDeploymentWitness(github, request.request_id, token, A);
 
     await expect(sealIntegrationWorkflowRunEvent(github, {
       eventName: "workflow_run", workflowName: "Fugue Integration", runId: A.id, runAttempt: 1,
@@ -716,7 +817,134 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     expect(terminal?.terminal?.state).toBe("failure");
   });
 
-  it("keeps rejected hostile submission progress durable across receipt deletion and equivalent replay", async () => {
+  it("rejects attacker-edited privileged QA and Human comments instead of inheriting the original author", async () => {
+    const github = makeGithub();
+    vi.mocked(completeReview).mockClear();
+    const identity = {
+      prNumber: 19, headSha: "a".repeat(40), baseBranch: "main", baseSha: BASE,
+      policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
+      workSpecDigest: "sha256:spec",
+    };
+    const snapshot = {
+      identity,
+      pr: { number: 19 },
+      qa: { required: [{ role: "code" }], controlPlaneChanged: true, validationControlChanged: false },
+    } as unknown as EvaluationSnapshot;
+    const session = reviewStartSchema.parse({
+      version: 1, kind: "review_start", session_id: "rev-code-editproof1", role: "code", identity,
+      fugue_version: "test", created_at: "2026-08-17T08:20:00.000Z",
+    });
+    github.__comments.push({
+      id: 8800, node_id: "IC_8800", issueNumber: 19, body: serializeAttestation(session), user: BOT,
+      created_at: "2026-08-17T08:20:00.000Z", updated_at: "2026-08-17T08:20:00.000Z",
+    });
+    const qaBody = `<!-- fugue-review-submit\nversion: 1\nsession_id: ${session.session_id}\nrole: code\nverdict: approved\nagents_update: not-required\nvalidation_control: acceptable\n-->`;
+    github.__comments.push({
+      ...immutableUserComment(8801, qaBody, "human"),
+      updated_at: "2026-08-17T08:21:10.000Z",
+      editedBy: "attacker-app",
+    });
+    const humanBody = `<!-- fugue-human-submit\nversion: 1\nkind: control_plane_ack\nidentity:\n  prNumber: 19\n  headSha: ${identity.headSha}\n  baseBranch: main\n  baseSha: ${BASE}\n  policyDigest: sha256:policy\n  protocolVersion: 1\n  issueNumber: 18\n  workId: work-18\n  workSpecDigest: sha256:spec\n-->`;
+    github.__comments.push({
+      ...immutableUserComment(8802, humanBody, "human"),
+      updated_at: "2026-08-17T08:22:10.000Z",
+      editedBy: "attacker-app",
+    });
+
+    await expect(processCurrentSubmissions(github, snapshot)).resolves.toEqual({ accepted: 1 });
+    await expect(processCurrentSubmissions(github, snapshot)).resolves.toEqual({ accepted: 1 });
+    await expect(processCurrentSubmissions(github, snapshot)).resolves.toEqual({ accepted: 0 });
+    expect(vi.mocked(completeReview)).not.toHaveBeenCalled();
+    await expect(hasCurrentHumanAcknowledgement(github, snapshot)).resolves.toBe(false);
+  });
+
+  it("survives deletion of dispatch-created unbound L and never lets replay A replace its terminal failure", async () => {
+    const github = makeGithub();
+    const identity = {
+      prNumber: 19, headSha: "a".repeat(40), baseBranch: "main", baseSha: BASE,
+      policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
+      workSpecDigest: "sha256:spec",
+    };
+    const snapshot = { identity, pr: { number: 19 } } as unknown as EvaluationSnapshot;
+    const request = createIntegrationRequest(identity, "2026-08-17T08:30:00.000Z", "7".repeat(16));
+    const secret = "8".repeat(64);
+    const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T08:30:00.000Z", secret);
+    await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+      dispatch: authorized.authorization, createdAt: "2026-08-17T08:30:00.000Z",
+    }));
+    const token = integrationDispatchRunToken(request.request_id, secret);
+    const title = `Fugue Integration PR #19 ${request.request_id} ${token}`;
+    const L = { id: 6262, actor: BOT, event: "workflow_dispatch", head_sha: BASE, display_title: title,
+      created_at: "2026-08-17T08:30:10.000Z", run_attempt: 1, status: "completed", conclusion: "failure",
+      html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/6262" };
+    const A = { id: 6263, actor: BOT, event: "workflow_dispatch", head_sha: BASE, display_title: title,
+      created_at: "2026-08-17T08:30:20.000Z", run_attempt: 1, status: "completed", conclusion: "failure",
+      html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/6263" };
+    github.__workflowRuns.push(L, A);
+    addIntegrationDeploymentWitness(github, request.request_id, token, L);
+    addIntegrationDeploymentWitness(github, request.request_id, token, A);
+    // Shared Actions authority deletes the genuine run before d3 bind/run-start/completion processing.
+    github.__workflowRuns.splice(github.__workflowRuns.findIndex((run) => run.id === L.id), 1);
+
+    await expect(sealIntegrationWorkflowRunEvent(github, {
+      eventName: "workflow_run", workflowName: "Fugue Integration", runId: A.id, runAttempt: 1,
+      conclusion: A.conclusion, status: A.status, headSha: BASE, displayTitle: title,
+      createdAt: A.created_at, htmlUrl: A.html_url, actor: BOT.login,
+    })).resolves.toBe(false);
+    await expect(sealIntegrationWorkflowRunEvent(github, {
+      eventName: "workflow_run", workflowName: "Fugue Integration", runId: L.id, runAttempt: 1,
+      conclusion: L.conclusion, status: L.status, headSha: BASE, displayTitle: title,
+      createdAt: L.created_at, htmlUrl: L.html_url, actor: BOT.login,
+    })).resolves.toBe(true);
+    const terminal = await getCurrentIntegrationRecord(github, identity);
+    expect(terminal?.run?.id).toBe(L.id);
+    expect(terminal?.terminal?.state).toBe("failure");
+    await expect(ensureIntegrationDispatch(github, snapshot, Date.parse("2026-08-17T08:50:00.000Z")))
+      .resolves.toMatchObject({ dispatch: false });
+    expect((await getCurrentIntegrationRecord(github, identity))?.run?.id).toBe(L.id);
+  });
+
+  it("keeps globally-earliest discovery correct beyond 100 while workflow-run records are deleted concurrently", async () => {
+    const github = makeGithub();
+    const identity = {
+      prNumber: 19, headSha: "a".repeat(40), baseBranch: "main", baseSha: BASE,
+      policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
+      workSpecDigest: "sha256:spec",
+    };
+    const snapshot = { identity, pr: { number: 19 } } as unknown as EvaluationSnapshot;
+    const request = createIntegrationRequest(identity, "2026-08-17T08:30:00.000Z", "9".repeat(16));
+    const secret = "a".repeat(64);
+    const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T08:30:00.000Z", secret);
+    await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+      dispatch: authorized.authorization, createdAt: "2026-08-17T08:30:00.000Z",
+    }));
+    const token = integrationDispatchRunToken(request.request_id, secret);
+    const title = `Fugue Integration PR #19 ${request.request_id} ${token}`;
+    for (let index = 0; index < 151; index += 1) {
+      const id = 7000 + index;
+      const run = { id, actor: BOT, event: "workflow_dispatch", head_sha: BASE, display_title: title,
+        created_at: `2026-08-17T08:${String(30 + Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
+        run_attempt: 1, status: "in_progress", conclusion: null,
+        html_url: `https://github.com/JohnnyZLi/Fugue/actions/runs/${id}` };
+      github.__workflowRuns.push(run);
+      addIntegrationDeploymentWitness(github, request.request_id, token, run, 200_000 + index);
+    }
+    let deleted = false;
+    github.__hooks.onDeploymentPage = (page) => {
+      if (page !== 2 || deleted) return;
+      deleted = true;
+      // Model the old page-number failure exactly: delete newer run records while discovery crosses
+      // the >100 boundary. Persistent protected deployment witnesses do not shift with run deletion.
+      github.__workflowRuns.splice(50, 80);
+    };
+    vi.mocked(github.octokit.rest.actions.listWorkflowRuns).mockClear();
+    await expect(ensureIntegrationDispatch(github, snapshot, Date.parse("2026-08-17T08:35:00.000Z")))
+      .resolves.toMatchObject({ dispatch: false });
+    expect((await getCurrentIntegrationRecord(github, identity))?.run?.id).toBe(7000);
+    expect(vi.mocked(github.octokit.rest.actions.listWorkflowRuns)).not.toHaveBeenCalled();
+  });
+
+  it("dedupes semantic hostile rejection variants in fixed-size durable progress", async () => {
     const github = makeGithub();
     const identity = {
       prNumber: 19, headSha: "a".repeat(40), baseBranch: "main", baseSha: BASE,
@@ -724,23 +952,63 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
       workSpecDigest: "sha256:spec",
     };
     const snapshot = { identity, pr: { number: 19 }, qa: { required: [], controlPlaneChanged: false } } as unknown as EvaluationSnapshot;
-    const hostileBody = `<!-- fugue-review-submit\nversion: 1\nsession_id: rev-code-deadbeef\nrole: code\nverdict: approved\n-->`;
-    github.__comments.push({ id: 9001, issueNumber: 19, body: hostileBody, user: { login: "attacker", type: "User" } });
+    for (let index = 0; index < 80; index += 1) {
+      const body = index % 2 === 0
+        ? `presentation ${index}\n<!-- fugue-review-submit\nversion: 1\nsession_id: rev-code-dead${String(index).padStart(4, "0")}\nrole: code\nverdict: changes_requested\nsummary: hostile variant ${index}\n-->`
+        : `<!-- fugue-review-submit\n\nversion: 1\nsession_id: rev-code-beef${String(index).padStart(4, "0")}\nrole: code\nverdict: approved\nsummary: another presentation ${index}\n-->`;
+      github.__comments.push(immutableUserComment(9000 + index, body));
+    }
+    await expect(processCurrentSubmissions(github, snapshot)).resolves.toEqual({ accepted: 1 });
+    const scope = `submission-rejection/19/${createHash("sha256").update(JSON.stringify(identity), "utf8").digest("hex").slice(0, 20)}`;
+    const beforeOrders = recoveryOrders(github, scope);
+    await expect(processCurrentSubmissions(github, snapshot)).resolves.toEqual({ accepted: 0 });
+    expect(recoveryOrders(github, scope)).toEqual(beforeOrders);
+    for (let index = 80; index < 100; index += 1) {
+      github.__comments.push(immutableUserComment(9000 + index,
+        `<!-- fugue-review-submit\nversion: 1\nsession_id: rev-code-cafe${String(index).padStart(4, "0")}\nrole: code\nverdict: error\nsummary: fresh text ${index}\n-->`));
+    }
+    await expect(processCurrentSubmissions(github, snapshot)).resolves.toEqual({ accepted: 0 });
+    expect(recoveryOrders(github, scope)).toEqual(beforeOrders);
+    const progressBodies = vi.mocked(signProtocolBody).mock.calls
+      .map(([, body]) => body)
+      .filter((body) => body.includes("fugue-submission-rejection-progress"));
+    expect(progressBodies.some((body) => body.includes("version: 2") && body.includes("bloom_b64:"))).toBe(true);
+    expect(progressBodies.filter((body) => body.includes("version: 2")).every((body) => body.length < 6000)).toBe(true);
+  });
+
+  it("never lets a legacy ID-only rejection receipt suppress a distinct legitimate current submission", async () => {
+    const github = makeGithub();
+    vi.mocked(completeReview).mockClear();
+    const identity = {
+      prNumber: 19, headSha: "a".repeat(40), baseBranch: "main", baseSha: BASE,
+      policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
+      workSpecDigest: "sha256:spec",
+    };
+    const snapshot = {
+      identity, pr: { number: 19 },
+      qa: { required: [{ role: "code" }], controlPlaneChanged: false, validationControlChanged: false },
+    } as unknown as EvaluationSnapshot;
+    const session = reviewStartSchema.parse({
+      version: 1, kind: "review_start", session_id: "rev-code-legacyproof1", role: "code", identity,
+      fugue_version: "test", created_at: "2026-08-17T08:20:00.000Z",
+    });
+    github.__comments.push({
+      id: 9300, node_id: "IC_9300", issueNumber: 19, body: serializeAttestation(session), user: BOT,
+      created_at: "2026-08-17T08:20:00.000Z", updated_at: "2026-08-17T08:20:00.000Z",
+    });
+    github.__comments.push({
+      id: 9301, node_id: "IC_9301", issueNumber: 19,
+      body: `FUGUE SUBMISSION — REJECTED\n\nlegacy presentation\n\n<!-- fugue-submission-rejection\nversion: 1\ncomment_ids:\n  - 9400\n-->`,
+      user: BOT, created_at: "2026-08-17T08:21:00.000Z", updated_at: "2026-08-17T08:21:00.000Z",
+    });
+    github.__comments.push(immutableUserComment(9400,
+      `<!-- fugue-review-submit\nversion: 1\nsession_id: ${session.session_id}\nrole: code\nverdict: approved\nagents_update: not-required\nvalidation_control: acceptable\n-->`, "human"));
 
     await expect(processCurrentSubmissions(github, snapshot)).resolves.toEqual({ accepted: 1 });
-    expect(recoveryScopes(github)).toContain(`submission-rejection/19/${createHash("sha256").update(JSON.stringify(identity), "utf8").digest("hex").slice(0, 20)}`);
-    for (let index = github.__comments.length - 1; index >= 0; index -= 1) {
-      if (github.__comments[index]?.user?.login === BOT.login && github.__comments[index]?.body.includes("fugue-submission-rejection")) {
-        github.__comments.splice(index, 1);
-      }
-    }
-    const afterDeletion = github.__comments.length;
-    await expect(processCurrentSubmissions(github, snapshot)).resolves.toEqual({ accepted: 0 });
-    expect(github.__comments).toHaveLength(afterDeletion);
-
-    github.__comments.push({ id: 9002, issueNumber: 19, body: hostileBody, user: { login: "attacker", type: "User" } });
-    await expect(processCurrentSubmissions(github, snapshot)).resolves.toEqual({ accepted: 0 });
-    expect(github.__comments.filter((comment) => comment.user?.login === BOT.login && comment.body.includes("fugue-submission-rejection"))).toHaveLength(0);
+    expect(vi.mocked(completeReview)).toHaveBeenCalledWith(
+      github, 19, "code", expect.objectContaining({ verdict: "approved" }),
+    );
   });
+
 
 });
