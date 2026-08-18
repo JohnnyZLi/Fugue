@@ -18,6 +18,7 @@ const TRUSTED_WORKFLOWS = new Map<string, ReadonlySet<string>>([
 ]);
 
 export interface GitHubActorLike {
+  id?: number | null;
   login?: string | null;
   type?: string | null;
 }
@@ -75,8 +76,21 @@ export function isTrustedProtocolActor(actor: GitHubActorLike | null | undefined
   return actor.type == null || actor.type === "Bot";
 }
 
-/** Actor identity is only a cheap workflow-run prefilter; exact protected identity is bound elsewhere. */
+/**
+ * Workflow-run actor identity is only a cheap prefilter; exact protected identity is bound elsewhere.
+ * Hosted Integration attempts dispatched by the Authority App are accepted only by the numeric bot ID
+ * resolved with that App's installation token inside the protected environment. Login presentation is
+ * deliberately irrelevant to this additional path.
+ */
 export function isTrustedProtocolWorkflowRun(run: GitHubWorkflowRunLike): boolean {
+  const rawAuthorityActorId = process.env.FUGUE_AUTHORITY_ACTOR_ID?.trim();
+  if (rawAuthorityActorId) {
+    const authorityActorId = Number(rawAuthorityActorId);
+    if (Number.isSafeInteger(authorityActorId) && authorityActorId > 0 &&
+        run.actor?.id === authorityActorId && run.actor?.type === "Bot") {
+      return true;
+    }
+  }
   return isTrustedProtocolActor(run.actor);
 }
 

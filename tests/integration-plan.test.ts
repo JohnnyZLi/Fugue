@@ -10,6 +10,7 @@ import {
   integrationPlanSchema,
   integrationValidationSchema,
 } from "../src/core/integration-plan.js";
+import { protectedIntegrationRecoveryDecision } from "../src/core/reconcile.js";
 
 const CURRENT_WORK_SPEC_DIGEST = "sha256:a808b8ae2dbf920771f978dfb3c747d7372b24bf516e3d4d92b0d26afa55a15a";
 
@@ -156,8 +157,10 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).toContain("deployment-branch-policies?per_page=100");
     expect(workflow).toContain("names.length !== 1 || names[0] !== branch");
     expect(workflow).toContain("actions/create-github-app-token@v3");
+    expect(workflow).toContain("permission-actions: write");
     expect(workflow).toContain("permission-variables: write");
     expect(workflow).toContain("FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}");
+    expect(workflow).toContain("FUGUE_AUTHORITY_ACTOR_ID: ${{ steps.fugue-authority-actor.outputs.id }}");
     expect(workflow).toContain("github.event_name == 'issues'");
     expect(workflow).toContain("github.run_id");
     expect(workflow).not.toContain("group: fugue-control-plane-${{ github.repository }}\n");
@@ -205,18 +208,67 @@ describe("GitHub-hosted Integration plan", () => {
     }
   });
 
-  it("uses persistent environment deployments rather than mutable workflow-run pages for lost binding recovery", async () => {
-    const source = await readFile("src/core/integration-status.ts", "utf8");
-    const workflow = await readFile(".github/workflows/fugue-integration.yml", "utf8");
+  it("removes mutable live history from hosted lost-bind authority", async () => {
+    const reconcile = await readFile("src/core/reconcile.ts", "utf8");
     const control = await readFile(".github/workflows/fugue-control-plane.yml", "utf8");
-    expect(source).not.toContain("listWorkflowRuns");
-    expect(source).toContain('GET /repos/{owner}/{repo}/deployments');
-    expect(source).toContain('GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses');
-    expect(source).toContain("previous?.fingerprint === current.fingerprint");
-    expect(workflow).toContain("fugue_request=${{ inputs.request_id }}");
-    expect(workflow).toContain("fugue_run_token=${{ inputs.run_token }}");
-    expect(control).toContain("deployments: read");
-    expect(source).toContain("getIntegrationRunStartEvidence");
+    const protectedStart = reconcile.indexOf("function integrationAuthorityActorId");
+    const protectedEnd = reconcile.indexOf("async function syncPrDraft");
+    const hostedRecovery = reconcile.slice(protectedStart, protectedEnd);
+    expect(hostedRecovery).toContain("FUGUE_INT_F_");
+    expect(hostedRecovery).toContain("FUGUE_INT_B_");
+    expect(hostedRecovery).toContain("protectedIntegrationRecoveryDecision");
+    expect(hostedRecovery).not.toContain('GET /repos/{owner}/{repo}/deployments');
+    expect(hostedRecovery).not.toContain("correlatedIntegrationDeploymentSnapshot");
+    expect(control).toContain("types: [requested, completed]");
+    expect(control).toContain("Persist protected Integration binding witness");
+    expect(control).toContain("actorId !== expectedActorId");
+    expect(control).toContain("run.actor?.type !== 'Bot'");
+    expect(control.indexOf("Persist protected Integration binding witness")).toBeLessThan(control.indexOf("uses: actions/checkout@v4"));
+  });
+
+  it("makes bounded monotonic progress across arbitrarily deep later history and page shifts", () => {
+    const requestCreatedAt = "2026-08-18T07:00:00.000Z";
+    const fenceCreatedAt = "2026-08-18T07:00:01.000Z";
+    // Adversarial history is intentionally not an input to the authoritative transition. A million
+    // later records can be inserted/deleted/reordered without changing the request-local decision.
+    const laterHistory = Array.from({ length: 1_000_000 }, (_, index) => 9_000_000 + index);
+    const first = protectedIntegrationRecoveryDecision({
+      requestCreatedAt, fenceCreatedAt, now: Date.parse("2026-08-18T07:00:02.000Z"),
+    });
+    laterHistory.splice(0, 500_000);
+    laterHistory.reverse();
+    const resumed = protectedIntegrationRecoveryDecision({
+      requestCreatedAt, fenceCreatedAt, now: Date.parse("2026-08-18T07:05:00.000Z"),
+    });
+    expect(first).toEqual({ kind: "pending" });
+    expect(resumed).toEqual({ kind: "pending" });
+  });
+
+  it("binds deleted legitimate L from the protected witness and never elects later replay A", () => {
+    const L = { runId: 4242, createdAt: "2026-08-18T07:00:02.000Z", htmlUrl: "https://github.com/JohnnyZLi/Fugue/actions/runs/4242" };
+    const laterReplayA = { runId: 4243, createdAt: "2026-08-18T07:00:03.000Z", htmlUrl: "https://github.com/JohnnyZLi/Fugue/actions/runs/4243" };
+    const result = protectedIntegrationRecoveryDecision({
+      requestCreatedAt: "2026-08-18T07:00:00.000Z",
+      fenceCreatedAt: "2026-08-18T07:00:01.000Z",
+      witness: L,
+      now: Date.parse("2026-08-18T07:20:00.000Z"),
+    });
+    expect(result).toEqual({ kind: "bind", ...L });
+    expect(result.kind === "bind" ? result.runId : 0).not.toBe(laterReplayA.runId);
+  });
+
+  it("fails closed after a stranded fence across repeated bounded invocations instead of aborting or retrying", () => {
+    const input = {
+      requestCreatedAt: "2026-08-18T07:00:00.000Z",
+      fenceCreatedAt: "2026-08-18T07:00:01.000Z",
+    };
+    for (let invocation = 0; invocation < 50; invocation += 1) {
+      const result = protectedIntegrationRecoveryDecision({
+        ...input,
+        now: Date.parse("2026-08-18T07:11:00.000Z") + invocation * 15 * 60 * 1000,
+      });
+      expect(result).toEqual({ kind: "failure" });
+    }
   });
 
   it("documents the external Authority bootstrap invariant and safe local read path", async () => {
