@@ -35,6 +35,7 @@ jobs:
           src = src.replace('''currentRequests.set(`${identity.prNumber}:${identity.headSha}:${identity.baseSha}:${identity.workSpecDigest}`, current.request.request_id);''', '''currentRequests.set(JSON.stringify([identity.prNumber, identity.headSha.toLowerCase(), identity.baseBranch, identity.baseSha.toLowerCase(), identity.policyDigest, identity.protocolVersion, identity.issueNumber, identity.workId, identity.workSpecDigest]), current.request.request_id);''')
           src = src.replace('''currentRequests.get(`${currentIdentity.prNumber}:${currentIdentity.headSha}:${currentIdentity.baseSha}:${currentIdentity.workSpecDigest}`)''', '''currentRequests.get(JSON.stringify([currentIdentity.prNumber, currentIdentity.headSha.toLowerCase(), currentIdentity.baseBranch, currentIdentity.baseSha.toLowerCase(), currentIdentity.policyDigest, currentIdentity.protocolVersion, currentIdentity.issueNumber, currentIdentity.workId, currentIdentity.workSpecDigest]))''')
           src = src.replace('''s = replace_once(s, old, new, "work historical reclaim")''', '''\nif old not in s:\n    raise SystemExit("missing anchor: work historical reclaim")\ns = s.replace(old, new, 1)''')
+          src = src.replace('''s = replace_once(s, old, new, "authorize current identity")''', '''\nif old not in s:\n    raise SystemExit("missing anchor: authorize current identity")\ns = s.replace(old, new)''')
           Path('/tmp/work18-cleanup-lifecycle-v1.py').write_text(src)
           PY
           python /tmp/work18-cleanup-lifecycle-v1.py
