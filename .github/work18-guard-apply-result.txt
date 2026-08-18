@@ -1,2 +1,3 @@
-run_id=32089525936
-job_status=failure
+run_id=32089641296
+job_status=success
+worker_head=2c83b6c61167ac8714067fcbe6860fe3183dbb17
