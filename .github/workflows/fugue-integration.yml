@@ -34,9 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     # SECURITY INVARIANT (external): configure the restrictive default-branch-only deployment
     # policy before installing the Authority App key. The in-job audit is drift detection only.
-    environment:
-      name: fugue-authority
-      url: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}?fugue_request=${{ inputs.request_id }}&fugue_run_token=${{ inputs.run_token }}"
+    environment: fugue-authority
     permissions:
       actions: read
       checks: read

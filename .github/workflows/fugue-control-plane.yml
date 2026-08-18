@@ -9,7 +9,7 @@ on:
     types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft, closed]
   workflow_run:
     workflows: [CI, Fugue Integration]
-    types: [completed]
+    types: [requested, completed]
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
@@ -18,13 +18,12 @@ permissions:
   actions: write
   checks: read
   contents: write
-  deployments: read
   id-token: write
   issues: write
   pull-requests: write
   statuses: write
 
-# Human issue snapshots and Integration completion events each get a run-specific group so GitHub's
+# Human issue snapshots and Integration lifecycle events each get a run-specific group so GitHub's
 # single-pending replacement cannot discard their immutable event payloads. Other events stay serialized.
 concurrency:
   group: ${{ (github.event_name == 'issues' || (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'Fugue Integration')) && format('fugue-control-plane-event-{0}', github.run_id) || format('fugue-control-plane-{0}', github.repository) }}
@@ -32,6 +31,9 @@ concurrency:
 
 jobs:
   reconcile:
+    # CI requested events are not protocol authority. Fugue Integration requested events are the
+    # protected early binding signal; all completed events retain their existing reconciliation path.
+    if: github.event_name != 'workflow_run' || github.event.action == 'completed' || github.event.workflow_run.name == 'Fugue Integration'
     runs-on: ubuntu-latest
     # SECURITY INVARIANT (external): before the App private key is installed, repository admins
     # must configure fugue-authority to allow only the protected default branch. The audit below is
@@ -79,7 +81,125 @@ jobs:
           private-key: ${{ secrets.FUGUE_AUTHORITY_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
+          permission-actions: write
           permission-variables: write
+      - name: Resolve Fugue Authority bot identity
+        id: fugue-authority-actor
+        env:
+          GH_TOKEN: ${{ steps.fugue-authority.outputs.token }}
+          APP_SLUG: ${{ steps.fugue-authority.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          actor_json="$(gh api "/users/${APP_SLUG}[bot]")"
+          actor_id="$(jq -er '.id | select(type == "number" and . > 0)' <<<"$actor_json")"
+          actor_type="$(jq -er '.type' <<<"$actor_json")"
+          if [[ "$actor_type" != "Bot" ]]; then
+            echo "Fugue Authority App identity is not a GitHub Bot." >&2
+            exit 1
+          fi
+          echo "id=$actor_id" >> "$GITHUB_OUTPUT"
+      - name: Persist protected Integration binding witness
+        if: github.event_name == 'workflow_run' && github.event.workflow_run.name == 'Fugue Integration'
+        env:
+          FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}
+          FUGUE_AUTHORITY_ACTOR_ID: ${{ steps.fugue-authority-actor.outputs.id }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+
+          const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          const run = event.workflow_run ?? {};
+          if (run.name !== 'Fugue Integration' || run.event !== 'workflow_dispatch' || Number(run.run_attempt) !== 1) process.exit(0);
+
+          const match = String(run.display_title ?? '').match(
+            /^Fugue Integration PR #(\d+) (int-[0-9a-f]{16}-[0-9a-f]{16}) ([0-9a-f]{24})$/,
+          );
+          if (!match?.[1] || !match[2] || !match[3]) throw new Error('Protected Integration workflow_run title is malformed.');
+          const prNumber = Number(match[1]);
+          const requestId = match[2];
+          const runToken = match[3];
+          const runId = Number(run.id);
+          const actorId = Number(run.actor?.id);
+          const expectedActorId = Number(process.env.FUGUE_AUTHORITY_ACTOR_ID);
+          const runAttempt = Number(run.run_attempt);
+          const headSha = String(run.head_sha ?? '');
+          const runCreatedAt = String(run.created_at ?? '');
+          const htmlUrl = String(run.html_url ?? '');
+          const expectedHtmlUrl = `https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${runId}`;
+          if (!Number.isSafeInteger(prNumber) || prNumber <= 0 || !Number.isSafeInteger(runId) || runId <= 0 ||
+              !Number.isSafeInteger(actorId) || actorId <= 0 || !Number.isSafeInteger(expectedActorId) || expectedActorId <= 0 ||
+              actorId !== expectedActorId || run.actor?.type !== 'Bot' || runAttempt !== 1 ||
+              !/^[0-9a-f]{40}$/i.test(headSha) || !Number.isFinite(Date.parse(runCreatedAt)) || htmlUrl !== expectedHtmlUrl) {
+            throw new Error('Protected Integration workflow_run does not match the Fugue Authority App dispatch identity.');
+          }
+
+          const suffix = createHash('sha256').update(requestId, 'utf8').digest('hex').slice(0, 32).toUpperCase();
+          const fenceName = `FUGUE_INT_F_${suffix}`;
+          const bindingName = `FUGUE_INT_B_${suffix}`;
+          const apiBase = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}`;
+          const headers = {
+            Authorization: `Bearer ${process.env.FUGUE_AUTHORITY_TOKEN}`,
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+          };
+          async function request(path, init = {}) {
+            return fetch(`${apiBase}${path}`, { ...init, headers: { ...headers, ...(init.headers ?? {}) } });
+          }
+          async function readVariable(name, allow404 = false) {
+            const response = await request(`/actions/variables/${encodeURIComponent(name)}`);
+            if (allow404 && response.status === 404) return null;
+            const body = await response.text();
+            if (!response.ok) throw new Error(`Fugue Authority API ${response.status} reading ${name}: ${body.slice(0, 300)}`);
+            const value = body ? JSON.parse(body).value : undefined;
+            if (typeof value !== 'string') throw new Error(`Protected Fugue Authority variable ${name} has no string value.`);
+            return value;
+          }
+
+          const fenceRaw = await readVariable(fenceName, true);
+          // The synchronous workflow-dispatch response may already have bound d3 and reclaimed the
+          // transient fence before this requested event is delivered. In that case there is nothing
+          // left for this recovery path to authorize.
+          if (fenceRaw === null) process.exit(0);
+          let fence;
+          try { fence = JSON.parse(fenceRaw); }
+          catch { throw new Error('Protected Integration dispatch fence is malformed.'); }
+          if (fence?.version !== 1 || fence?.kind !== 'integration_dispatch_fence' || fence.request_id !== requestId ||
+              fence.pr_number !== prNumber || fence.base_sha?.toLowerCase() !== headSha.toLowerCase() ||
+              fence.run_token !== runToken || fence.authority_actor_id !== expectedActorId ||
+              typeof fence.head_sha !== 'string' || typeof fence.anchor_name !== 'string' || typeof fence.created_at !== 'string') {
+            throw new Error('Protected Integration workflow_run conflicts with its immutable dispatch fence.');
+          }
+
+          const witness = {
+            version: 1,
+            kind: 'integration_binding_witness',
+            request_id: requestId,
+            pr_number: prNumber,
+            head_sha: fence.head_sha,
+            base_sha: fence.base_sha,
+            anchor_name: fence.anchor_name,
+            run_token: fence.run_token,
+            authority_actor_id: fence.authority_actor_id,
+            run_id: runId,
+            run_attempt: 1,
+            run_created_at: runCreatedAt,
+            html_url: htmlUrl,
+          };
+          const serialized = JSON.stringify(witness);
+          const createResponse = await request('/actions/variables', {
+            method: 'POST',
+            body: JSON.stringify({ name: bindingName, value: serialized }),
+          });
+          if (createResponse.status !== 201 && createResponse.status !== 409 && createResponse.status !== 422) {
+            throw new Error(`Unable to persist protected Integration binding witness (${createResponse.status}).`);
+          }
+          const committed = await readVariable(bindingName);
+          if (committed !== serialized) {
+            throw new Error('Protected Integration binding witness was already claimed by a different run.');
+          }
+          NODE
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.workflow_sha }}
@@ -94,5 +214,6 @@ jobs:
         env:
           FUGUE_WORKFLOW_SHA: ${{ github.workflow_sha }}
           FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}
+          FUGUE_AUTHORITY_ACTOR_ID: ${{ steps.fugue-authority-actor.outputs.id }}
           GITHUB_TOKEN: ${{ github.token }}
         run: node dist/cli.js reconcile
