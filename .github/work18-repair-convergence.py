@@ -18,40 +18,33 @@ s=once(s,
 p.write_text(s)
 
 p=root/'src/core/integration-status.ts'; s=p.read_text()
-old='''export async function getCurrentIntegrationRecord(
-  github: FugueGitHub,
-  identity: EvaluationIdentity,
-): Promise<IntegrationRecord | undefined> {
-  const recovered = await recoverDurableProtocolRecord(github, {
-    storageSha: identity.baseSha,
-    publisherSha: identity.baseSha,
-    scope: integrationScope(identity.prNumber),
-    issueNumber: identity.prNumber,
-    parse: parseIntegrationRecord,
-    timestamp: (record) => Date.parse(record.created_at),
-    order: integrationAuthorityOrder,
-    validate: (record) => sameEvaluationIdentity(record.identity, identity),
-  });
-  return recovered.record?.value;
-}'''
+start=s.index('export async function getCurrentIntegrationRecord(')
+end=s.index('\nexport async function publishIntegrationRecord(', start)
 new='''export async function getCurrentIntegrationRecord(
   github: FugueGitHub,
-  identity: EvaluationIdentity,
+  identity: IntegrationRequest["identity"],
 ): Promise<IntegrationRecord | undefined> {
   let lastPending: DurableProtocolRecoveryPendingError | undefined;
   for (let attempt = 0; attempt < 16; attempt += 1) {
     try {
       const recovered = await recoverDurableProtocolRecord(github, {
-        storageSha: identity.baseSha,
+        storageSha: identity.headSha,
         publisherSha: identity.baseSha,
         scope: integrationScope(identity.prNumber),
         issueNumber: identity.prNumber,
         parse: parseIntegrationRecord,
-        timestamp: (record) => Date.parse(record.created_at),
-        order: integrationAuthorityOrder,
-        validate: (record) => sameEvaluationIdentity(record.identity, identity),
+        timestamp: (value) => Date.parse(value.created_at),
+        order: (value) => value.created_at,
+        validate: (value) => sameEvaluationIdentity(value.identity, identity),
       });
-      return recovered.record?.value;
+      if (recovered.record) {
+        await replaceIntegrationLocator(github, recovered.record.value);
+        return recovered.record.value;
+      }
+      if (recovered.exhausted) return undefined;
+      throw new DurableProtocolRecoveryPendingError(
+        `PR #${identity.prNumber} Integration authority recovery is progressing through bounded status history.`,
+      );
     } catch (error) {
       if (!(error instanceof DurableProtocolRecoveryPendingError)) throw error;
       lastPending = error;
@@ -59,17 +52,8 @@ new='''export async function getCurrentIntegrationRecord(
     }
   }
   throw lastPending ?? new DurableProtocolRecoveryPendingError("Protected Integration authority remained busy.");
-}'''
-s=once(s,old,new,'stable integration durable read')
-# ensure the error class is imported from state in this file's existing state import.
-if 'DurableProtocolRecoveryPendingError' not in s.split('\n',40)[0:40]:
-    pass
-# Direct string injection into the state import list.
-s=once(s,
-'''  deleteFugueAuthorityVariable,
-  getFugueAuthorityVariable,''',
-'''  deleteFugueAuthorityVariable,
-  DurableProtocolRecoveryPendingError,
-  getFugueAuthorityVariable,''','pending import')
+}
+'''
+s=s[:start]+new+s[end:]
 p.write_text(s)
-print('added contention convergence without weakening read epochs')
+print('added contention convergence without weakening raw d3 read epochs')
