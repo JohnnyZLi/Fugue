@@ -658,9 +658,9 @@ describe("d3 protected durable authority", () => {
     expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_D3_"))).toHaveLength(0);
     const packedBefore = [...github.__authorityVariables.entries()]
       .filter(([name]) => name.startsWith(`FUGUE_D3P_${bucket}_`));
-    expect(packedBefore).toHaveLength(10);
+    expect(packedBefore).toHaveLength(9);
     expect(packedBefore.length).toBeGreaterThan(8);
-    expect(packedBefore.some(([, value]) => (JSON.parse(value) as { entries: unknown[] }).entries.length < 16)).toBe(true);
+    expect(packedBefore.some(([, value]) => (JSON.parse(value) as { entries: unknown[] }).entries.length < 17)).toBe(true);
     expect(recoveryScopes(github)).toEqual(new Set(scopes.slice(0, 145)));
 
     const unrelated = new Set<string>();

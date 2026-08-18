@@ -43,13 +43,14 @@ const REPOSITORY_AUTHORITY_VARIABLE_CAPACITY = 500;
 const RECOVERY_AUTHORITY_PREFIX = "FUGUE_D3_";
 const RECOVERY_PACK_PREFIX = "FUGUE_D3P_";
 const RECOVERY_RESERVE_PREFIX = "FUGUE_D3R_";
-const RECOVERY_MUTATION_GUARD_PREFIX = "FUGUE_D3G_";
-const RECOVERY_MUTATION_GUARD_RESERVE = "FUGUE_D3R_00";
+const RECOVERY_MUTATION_GUARD_PREFIX = "FUGUE_D3GT_";
+const RECOVERY_MUTATION_GUARD_IDLE = "FUGUE_D3GI_00";
+const RECOVERY_MUTATION_GUARD_IDLE_VALUE = "reserved-for-fugue-recovery-mutation-guard";
 const RECOVERY_MUTATION_GUARD_GRACE_MS = 10 * 60 * 1000;
 const RECOVERY_RESERVE_COUNT = 8;
 const RECOVERY_RESERVE_VALUE = "reserved-for-fugue-recovery-compaction";
 const RECOVERY_COMPACTION_RETRY_LIMIT = 16;
-const RECOVERY_PACK_MAX_ENTRIES = 16;
+const RECOVERY_PACK_MAX_ENTRIES = 17;
 // GitHub configuration variables are limited to 48 KB. Keep immutable recovery packs below
 // that ceiling so the signed cursor bodies and JSON framing always have safety margin.
 const RECOVERY_PACK_VALUE_LIMIT = 44 * 1024;
@@ -835,6 +836,7 @@ async function createFugueAuthorityVariableAtRevision(
   expectedPublisherSha: string,
 ): Promise<boolean> {
   const guard = await acquireRecoveryMutationGuard(github, expectedPublisherSha, name, value);
+  if (!guard) return false;
   try {
     await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
     const created = await createFugueAuthorityVariable(github, name, value);
@@ -919,16 +921,30 @@ async function activeRecoveryMutationGuards(github: FugueGitHub): Promise<Array<
   return result;
 }
 
-async function restoreRecoveryMutationGuardReserve(github: FugueGitHub, guardName: string, guardValue: string): Promise<void> {
+async function ensureRecoveryMutationGuardIdle(github: FugueGitHub): Promise<boolean> {
+  if ((await activeRecoveryMutationGuards(github)).length) return false;
+  const current = await getFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_IDLE);
+  if (current === RECOVERY_MUTATION_GUARD_IDLE_VALUE) return true;
+  if (current !== undefined) {
+    throw new CanonicalWorkStateIntegrityError("Protected recovery mutation guard idle slot has conflicting state.");
+  }
+  return createFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_IDLE, RECOVERY_MUTATION_GUARD_IDLE_VALUE);
+}
+
+async function restoreRecoveryMutationGuardIdle(github: FugueGitHub, guardName: string, guardValue: string): Promise<void> {
   if (await getFugueAuthorityVariable(github, guardName) !== guardValue) return;
-  if (await getFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_RESERVE) === RECOVERY_RESERVE_VALUE) {
+  const idle = await getFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_IDLE);
+  if (idle === RECOVERY_MUTATION_GUARD_IDLE_VALUE) {
     await deleteFugueAuthorityVariable(github, guardName);
     return;
   }
+  if (idle !== undefined) {
+    throw new CanonicalWorkStateIntegrityError("Protected recovery mutation guard idle slot has conflicting state.");
+  }
   if (await replaceFugueAuthorityVariable(
-    github, guardName, guardValue, RECOVERY_MUTATION_GUARD_RESERVE, RECOVERY_RESERVE_VALUE,
+    github, guardName, guardValue, RECOVERY_MUTATION_GUARD_IDLE, RECOVERY_MUTATION_GUARD_IDLE_VALUE,
   )) return;
-  throw new CanonicalWorkStateIntegrityError("Unable to restore the protected recovery mutation guard reserve.");
+  throw new CanonicalWorkStateIntegrityError("Unable to restore the protected recovery mutation guard idle slot.");
 }
 
 async function rollbackGuardedRecoveryMutation(
@@ -956,7 +972,7 @@ async function rollbackGuardedRecoveryMutation(
   } else {
     await deleteAuthorityVariableIfExact(github, guard.target_name, guard.target_value);
   }
-  await restoreRecoveryMutationGuardReserve(github, guardName, guardValue);
+  await restoreRecoveryMutationGuardIdle(github, guardName, guardValue);
 }
 
 async function recoverInterruptedRecoveryMutation(github: FugueGitHub): Promise<boolean> {
@@ -992,17 +1008,15 @@ async function acquireRecoveryMutationGuard(
   };
   const value = JSON.stringify(guard);
   const name = recoveryMutationGuardName(guard);
-  const reserve = await getFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_RESERVE);
-  if (reserve === RECOVERY_RESERVE_VALUE && await replaceFugueAuthorityVariable(
-    github, RECOVERY_MUTATION_GUARD_RESERVE, RECOVERY_RESERVE_VALUE, name, value,
+  if (!(await ensureRecoveryMutationGuardIdle(github))) return undefined;
+  if (await replaceFugueAuthorityVariable(
+    github, RECOVERY_MUTATION_GUARD_IDLE, RECOVERY_MUTATION_GUARD_IDLE_VALUE, name, value,
   )) return { name, value };
-  // Below the hard cap a missing guard reserve can be materialized without consuming recovery data.
-  if (reserve === undefined && await createFugueAuthorityVariable(github, name, value)) return { name, value };
   return undefined;
 }
 
 async function releaseRecoveryMutationGuard(github: FugueGitHub, token: { name: string; value: string }): Promise<void> {
-  await restoreRecoveryMutationGuardReserve(github, token.name, token.value);
+  await restoreRecoveryMutationGuardIdle(github, token.name, token.value);
 }
 
 async function rollbackFugueAuthorityVariableReplacement(
@@ -1052,6 +1066,7 @@ async function replaceFugueAuthorityVariable(
   const guard = expectedPublisherSha
     ? await acquireRecoveryMutationGuard(github, expectedPublisherSha, targetName, targetValue, sourceName, expectedSourceValue)
     : undefined;
+  if (expectedPublisherSha && !guard) return false;
   if (expectedPublisherSha) await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
   if (sourceName === targetName) {
     if (guard) await releaseRecoveryMutationGuard(github, guard);
@@ -1561,6 +1576,7 @@ async function compactRecoveryBucket(
         Buffer.byteLength(serializeRecoveryPack(bodies), "utf8") > RECOVERY_PACK_VALUE_LIMIT) continue;
     units.push({ sourceName, expectedValue, entries: sourceEntries });
   }
+  units.sort((left, right) => right.entries.length - left.entries.length || left.sourceName.localeCompare(right.sourceName));
 
   const sourceGroups: SourceUnit[][] = [];
   let current: SourceUnit[] = [];
@@ -1628,7 +1644,7 @@ async function consumeRecoveryReserveForAllocation(
 ): Promise<boolean> {
   if (await getFugueAuthorityVariable(github, allocation.name) === allocation.value) return true;
   const reserves = (await listFugueAuthorityVariables(github, RECOVERY_RESERVE_PREFIX))
-    .filter((reserve) => reserve.value === RECOVERY_RESERVE_VALUE && reserve.name !== RECOVERY_MUTATION_GUARD_RESERVE)
+    .filter((reserve) => reserve.value === RECOVERY_RESERVE_VALUE)
     .sort((left, right) => left.name.localeCompare(right.name));
   for (const reserve of reserves) {
     if (await replaceFugueAuthorityVariable(
@@ -1698,6 +1714,10 @@ export async function compactFugueRecoveryAuthorityVariables(
   _reserveSlots = 0,
 ): Promise<void> {
   if (await recoverInterruptedRecoveryMutation(github)) return;
+  // The mutation guard is protocol overhead, not an optional compaction reserve. Create it before
+  // optional reserves whenever capacity exists; a legacy full namespace is compacted below and
+  // gets the guard before any reserve recreation consumes newly freed headroom.
+  await ensureRecoveryMutationGuardIdle(github);
   await ensureRecoveryReserveVariables(github);
   for (let attempt = 0; attempt < RECOVERY_COMPACTION_RETRY_LIMIT; attempt += 1) {
     const variables = await listFugueAuthorityVariables(github, "FUGUE_D3");
@@ -1715,6 +1735,7 @@ export async function compactFugueRecoveryAuthorityVariables(
     }
     if (!progress) break;
   }
+  await ensureRecoveryMutationGuardIdle(github);
   await ensureRecoveryReserveVariables(github);
 }
 

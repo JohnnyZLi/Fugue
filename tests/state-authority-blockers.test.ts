@@ -381,6 +381,7 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     for (let index = 0; index < 8; index += 1) {
       renameVariables.set(`FUGUE_D3R_${String(index).padStart(2, "0")}`, "reserved-for-fugue-recovery-compaction");
     }
+    renameVariables.set("FUGUE_D3GI_00", "reserved-for-fugue-recovery-mutation-guard");
     fillAuthorityCapacity(renameRace, "UNRELATED_FINAL_RACE_");
     const unrelatedBefore = [...renameVariables.keys()].filter((name) => name.startsWith("UNRELATED_FINAL_RACE_")).length;
     renameVariables.onLeaf = () => { renameRace.__baseSha = NEXT_BASE; };
@@ -497,7 +498,7 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     const github = makeGithub();
     let raced = false;
     github.__beforeRevisionCheck = async () => {
-      if (raced || ![...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3G_"))) return;
+      if (raced || ![...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3GT_"))) return;
       const target = [...github.__authorityVariables.keys()].find((name) => /^FUGUE_D3_[0-9A-F]{16}_[0-9A-F]{16}$/i.test(name));
       if (!target) return;
       raced = true;
@@ -511,7 +512,8 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     })).rejects.toThrow(/stale protected revision/);
     github.__beforeRevisionCheck = undefined;
     expect(recoveryScopes(github).has("guarded-create-race")).toBe(false);
-    expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3G_"))).toBe(false);
+    expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3GT_"))).toBe(false);
+    expect(github.__authorityVariables.get("FUGUE_D3GI_00")).toBe("reserved-for-fugue-recovery-mutation-guard");
     expect(github.__authorityVariables.get("FUGUE_D3R_00")).toBe("reserved-for-fugue-recovery-compaction");
   });
 
