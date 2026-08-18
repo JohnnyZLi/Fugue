@@ -66,5 +66,91 @@ The protected base branch supplies the active policy used to evaluate candidate 
 27. Canonical work state carries the last accepted immutable Coordinator issue revision identity (`issue_updated_at`, protected sequence, event ID). Human event replay compares that causal identity, never publication `created_at`, so a slow older protected write cannot suppress newer Human intent.
 28. Review-start/QA verdicts and explicit Human control-plane acknowledgement are committed to protected d3 durable authority before their PR comments/statuses are treated as presentation mirrors; deleting every current evidence comment cannot erase accepted exact-identity evidence.
 29. Revision-bound recovery-witness mutation is fenced by a dedicated protected Authority-plane transaction-guard slot that is protocol overhead, not an optional compaction reserve. Guard release rotates an idle epoch; every d3 reader pins and revalidates that epoch before returning, while destructive compaction/reserve maintenance holds the same slot exclusively. Thus a reader/compactor that began immediately before a writer acquires the guard cannot accept, rename, pack, or delete provisional authority; stale/crashed transactions restore their exact source/target before a new epoch is exposed.
-30. Protected Integration never records attempt existence before the workflow-dispatch POST creates a run. The protected `prepare` job references `fugue-authority` with a request/run-correlation environment URL, causing GitHub itself to persist a deployment/status carrying the exact run ID before any in-job environment audit or Authority App token-mint step. Recovery derives the expected correlation token from the one-use Authority-anchor secret, requires two identical complete scans of that protected environment-deployment history, and chooses the globally lowest matching run ID; mutable workflow-run pages and the public token/title are never binding authority. The deployment witness survives shared `actions:write` deletion of the Actions run, so a created-but-unbound attempt cannot become a pre-POST abort/retry and a later replay cannot replace it. If no matching deployment exists after a stable recovery grace window, only then may never-created transport abort/retry; once a deployment/run-start/returned binding exists, disappearance fails closed to terminal failure unless cancellation was actually observed.
-31. Every Human control-plane acknowledgement consumer—including hosted Integration prepare/finalize and final merge-readiness planning—resolves the exact current acknowledgement from protected d3 authority. A PR comment is only a repairable mirror and deleting it cannot change a gate result. QA/Human request comments are authoritative only when GraphQL creation provenance shows no editor/`lastEditedAt`; edited bodies are rejected rather than attributed to their original author. Rejected/stale/conflicting/untrusted submissions are reduced to finite semantic rejection classes and recorded before any optional receipt in a fixed-size d3 Bloom filter scoped to the exact evaluation identity. Legacy ID-only/raw-fingerprint receipts remain presentation/migration history and cannot suppress a distinct valid submission; hostile IDs, whitespace, summaries, or presentation variants cannot grow durable rejection authority without bound.
+30. Protected Integration never records attempt existence before the workflow-dispatch POST creates a run. The one-use Authority-anchor secret derives a public correlation token, but that token is presentation/correlation only: after a dispatch-response bind loss, protected recovery enumerates the unfiltered protected Integration workflow history and selects the globally lowest causally valid attempt-1 run ID carrying that previously unpredictable token. A later replay cannot bind or seal over the first run; if no correlated run exists after the recovery grace period, a pre-POST crash is safely aborted/retried, while a discovered/run-start/returned binding makes disappearance fail closed to terminal failure.
+31. Every Human control-plane acknowledgement consumer—including hosted Integration prepare/finalize and final merge-readiness planning—resolves the exact current acknowledgement from protected d3 authority. A PR comment is only a repairable mirror and deleting it cannot change a gate result. Rejected/stale/conflicting/untrusted QA/Human submission progress is likewise fingerprinted and committed to exact-identity d3 authority before an optional rejection receipt is written, so receipt deletion or equivalent hostile-comment replay cannot consume reconciliation repeatedly.
+
+## Repository Map
+
+```text
+src/cli.ts                     command surface / protected dispatch boundary
+src/commands/                  local recovery/bootstrap + hosted runtime entrypoints
+src/core/state.ts              bounded d3 durable-record + Variables-permission recovery/work/Coordinator authority
+src/core/workflow.ts           next-action planning
+src/core/reconcile.ts          durable event-snapshot replay + idempotent reconciliation
+src/core/state-comment.ts      mutable Human-facing next-action dashboard
+src/core/submissions.ts        GitHub-native QA/Human submission ingestion
+src/core/ownership.ts          central changed-file ownership gate
+src/core/reviews.ts            review-session lifecycle/canonical attestations
+src/core/provenance.ts         exact-revision OIDC publication proof
+src/core/validation.ts         protected validation execution boundary
+src/core/ci.ts                 protected-base exact-head required-CI verification
+src/core/integration.ts        terminal Integration prepare/finalize publication
+src/core/integration-plan.ts   request/run-bound validation plan and durable record schema
+src/core/integration-status.ts one-use dispatch/run-start + terminal Integration authority
+src/core/policy.ts             protected-base trust-root resolution
+src/core/protocol.ts           protocol/CLI compatibility
+src/core/git.ts                repository discovery boundary
+src/core/github.ts             GitHub authentication/client boundary
+src/core/repository-init.ts    repository labels / branch enforcement bootstrap
+
+.github/workflows/ci.yml
+                                protected-base read-only candidate CI
+.github/workflows/fugue-control-plane.yml
+                                workflow-SHA-pinned protected reconciliation + durable issue capture
+.github/workflows/fugue-integration.yml
+                                credential-separated Integration runtime
+
+tests/                         protocol/state/QA/workflow/adversarial reconciliation coverage
+.fugue/                        protected-base Fugue protocol/workflow policy
+```
+
+Update this file in the same PR when repository truth or a listed invariant changes materially.
+
+## Development
+
+```bash
+npm ci
+npm run dev -- --help
+```
+
+## Validation
+
+```bash
+npm run check
+npm test
+npm run build
+```
+
+## Chat Role Rules
+
+### Leader
+
+- Maintain the Human-facing coordination conversation.
+- Reconstruct current work, PR, QA, and Integration state from protected durable GitHub evidence whenever the Human checks in; issue/PR metadata and ordinary state/result comments are mirrors, not authority.
+- Use GitHub for issue/spec/merge coordination; do not make the Human ferry SHAs, Worker IDs, review verdicts, or terminal output.
+- Ask the Human to open a disposable chat only when independent Worker/QA execution is actually required, and provide one short reconstruction prompt.
+- Never merge without an explicit Human merge decision.
+
+### Worker
+
+- Work only from the assigned Fugue issue, Worker claim, branch, and ownership contract.
+- Use the assigned branch and open/update the implementation PR.
+- Do not merge or self-approve.
+- Treat CI as authoritative remote validation where local runtime execution is unavailable.
+
+### QA
+
+- Reconstruct the current pending review session from GitHub and review the exact committed identity independently.
+- Do not implement fixes.
+- Submit a `fugue-review-submit` PR comment for the current session; do not ask the Human to relay the verdict or run `fugue review`.
+
+## Compatibility
+
+Current target:
+
+```text
+Node.js 20+
+GitHub repositories
+GitHub Actions for CI, protected reconciliation, and Integration
+ChatGPT sessions with GitHub access for Leader / Worker / QA execution
+```
