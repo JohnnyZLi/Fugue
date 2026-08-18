@@ -1,4 +1,4 @@
-name: Work 18 Ownership Fold Exact Head Validation
+name: Work 18 Cleanup Lifecycle Final Validation
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
 
 jobs:
   repair:
-    if: contains(github.event.head_commit.message, '[ownership-fold-v2]')
+    if: contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v2]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,32 +17,63 @@ jobs:
         with:
           ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fetch-depth: 1
-      - name: Restore folded Integration plan import
+      - name: Finish historical cleanup current-set semantics
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "10043105b164237baac9c81c18ca6476b9f60e6c"
+          test "$(git rev-parse HEAD)" = "6cfec15202464a5b8d0a0e0ad1a589f62675aae2"
           python <<'PY'
           from pathlib import Path
           path = Path('src/core/integration-status.ts')
           text = path.read_text()
-          if 'from "./integration-plan.js";' not in text:
-              anchor = 'import type { FugueGitHub } from "./github.js";\n'
-              block = '''import type { FugueGitHub } from "./github.js";\nimport {\n  createIntegrationRecord,\n  createIntegrationRequest,\n  integrationDispatchAuthorizationSchema,\n  integrationRunTitle,\n  integrationRequestSchema,\n  parseIntegrationRecord,\n  serializeIntegrationRecord,\n  type IntegrationDispatchAuthorization,\n  type IntegrationRecord,\n  type IntegrationRequest,\n  type IntegrationRunBinding,\n} from "./integration-plan.js";\n'''
-              if anchor not in text:
-                  raise SystemExit('github import anchor missing')
-              path.write_text(text.replace(anchor, block, 1))
+          old = '''async function reclaimHistoricalIntegrationAuthorityVariables(
+            github: FugueGitHub,
+            variables: Array<{ name: string; value: string }>,
+            now: number,
+            currentIdentities: IntegrationRequest["identity"][],
+          ): Promise<void> {
+            if (!currentIdentities.length) return;
+'''
+          new = '''async function reclaimHistoricalIntegrationAuthorityVariables(
+            github: FugueGitHub,
+            variables: Array<{ name: string; value: string }>,
+            now: number,
+            currentIdentities: IntegrationRequest["identity"][],
+          ): Promise<void> {
+'''
+          if old not in text:
+              raise SystemExit('historical helper guard anchor missing')
+          text = text.replace(old, new, 1)
+          old = '''export async function reclaimOrphanIntegrationAuthorityVariables(
+            github: FugueGitHub,
+            now = Date.now(),
+            currentIdentities: IntegrationRequest["identity"][] = [],
+          ): Promise<void> {'''
+          new = '''export async function reclaimOrphanIntegrationAuthorityVariables(
+            github: FugueGitHub,
+            now = Date.now(),
+            currentIdentities?: IntegrationRequest["identity"][],
+          ): Promise<void> {'''
+          if old not in text:
+              raise SystemExit('reclaim signature anchor missing')
+          text = text.replace(old, new, 1)
+          old = '  await reclaimHistoricalIntegrationAuthorityVariables(github, variables, now, currentIdentities);\n'
+          new = '  if (currentIdentities !== undefined) await reclaimHistoricalIntegrationAuthorityVariables(github, variables, now, currentIdentities);\n'
+          if old not in text:
+              raise SystemExit('historical call anchor missing')
+          path.write_text(text.replace(old, new, 1))
           PY
-          grep -q 'from "./integration-plan.js";' src/core/integration-status.ts
-          test ! -e src/core/integration-commit.ts
-          test ! -e tests/integration-terminal-serialization.test.ts
-          ! grep -R --line-number --fixed-strings 'integration-commit.js' src tests
+          test "$(git diff --name-only)" = "src/core/integration-status.ts"
           ! git diff --name-only | grep -Fx package-lock.json
           git diff --check
+          npm ci
+          npm run check
+          npm test
+          npm run build
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
           git add src/core/integration-status.ts
           git diff --cached --check
-          git commit -m 'Restore Integration plan import after ownership fold'
+          git commit -m 'Finish historical Integration cleanup with empty current set'
           git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
       - id: head
         name: Resolve final exact head
@@ -71,6 +102,7 @@ jobs:
           test -z "$(git config --local --get-regexp 'http.*extraheader' || true)"
           test -z "$GITHUB_TOKEN"
           test -z "$GH_TOKEN"
+          ! git diff --name-only e8ebca4f528c7e8657e6418448f551004e77fbaa HEAD | grep -Fx package-lock.json
           test ! -e src/core/integration-commit.ts
           test ! -e tests/integration-terminal-serialization.test.ts
       - uses: actions/setup-node@v4
@@ -84,7 +116,7 @@ jobs:
 
   record:
     needs: [repair, test]
-    if: always() && contains(github.event.head_commit.message, '[ownership-fold-v2]')
+    if: always() && contains(github.event.head_commit.message, '[cleanup-lifecycle-final-v2]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -95,9 +127,9 @@ jobs:
       - name: Record result
         run: |
           set -euo pipefail
-          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '${{ needs.repair.outputs.sha }}' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-ownership-fold-result.txt
+          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '${{ needs.repair.outputs.sha }}' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-cleanup-lifecycle-final-result.txt
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-          git add .github/work18-ownership-fold-result.txt
-          git commit -m 'Record work18 ownership fold validation' || exit 0
+          git add .github/work18-cleanup-lifecycle-final-result.txt
+          git commit -m 'Record cleanup lifecycle final validation v2' || exit 0
           git push origin HEAD:bootstrap/work18-identity-lost-20260818
