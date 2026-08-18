@@ -30,43 +30,44 @@ jobs:
         run: |
           {
             node <<'NODE'
-            const crypto = require('node:crypto');
-            const YAML = require('yaml');
-            const issue = await fetch('https://api.github.com/repos/JohnnyZLi/Fugue/issues/18', {
-              headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' }
-            }).then(async r => { if (!r.ok) throw new Error(`${r.status} ${await r.text()}`); return r.json(); });
-            const body = issue.body ?? '';
-            const START = '<!-- fugue-work\n';
-            const END = '-->';
-            const start = body.lastIndexOf(START);
-            const end = body.indexOf(END, start + START.length);
-            if (start < 0 || end < 0 || body.slice(end + END.length).trim()) throw new Error('bad work metadata block');
-            const metadata = YAML.parse(body.slice(start + START.length, end).trim());
-            const requirements = body.slice(0, start)
-              .replace(/\r\n?/g, '\n').split('\n').map(line => line.replace(/[ \t]+$/g, '')).join('\n').trim();
-            const canonical = { requirements, spec: metadata.spec };
-            const sortValue = value => Array.isArray(value) ? value.map(sortValue) : value && typeof value === 'object'
-              ? Object.fromEntries(Object.entries(value).sort(([a],[b]) => a.localeCompare(b)).map(([k,v]) => [k, sortValue(v)])) : value;
-            const stable = JSON.stringify(sortValue(canonical));
-            const digest = `sha256:${crypto.createHash('sha256').update(stable, 'utf8').digest('hex')}`;
-            console.log(`ISSUE_UPDATED_AT=${issue.updated_at}`);
-            console.log(`CURRENT_WORK_SPEC_DIGEST=${digest}`);
-            console.log(`WORKER_ID=${metadata.execution?.worker_id}`);
-            console.log(`WORKER_BRANCH=${metadata.execution?.branch}`);
-            console.log(`OWNED_HAS_STATE_AUTHORITY_TEST=${metadata.spec?.ownership?.owned?.includes('tests/state-authority-blockers.test.ts')}`);
+            (async () => {
+              const crypto = require('node:crypto');
+              const YAML = require('yaml');
+              const issue = await fetch('https://api.github.com/repos/JohnnyZLi/Fugue/issues/18', {
+                headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' }
+              }).then(async r => { if (!r.ok) throw new Error(`${r.status} ${await r.text()}`); return r.json(); });
+              const body = issue.body ?? '';
+              const START = '<!-- fugue-work\n';
+              const END = '-->';
+              const start = body.lastIndexOf(START);
+              const end = body.indexOf(END, start + START.length);
+              if (start < 0 || end < 0 || body.slice(end + END.length).trim()) throw new Error('bad work metadata block');
+              const metadata = YAML.parse(body.slice(start + START.length, end).trim());
+              const requirements = body.slice(0, start)
+                .replace(/\r\n?/g, '\n').split('\n').map(line => line.replace(/[ \t]+$/g, '')).join('\n').trim();
+              const canonical = { requirements, spec: metadata.spec };
+              const sortValue = value => Array.isArray(value) ? value.map(sortValue) : value && typeof value === 'object'
+                ? Object.fromEntries(Object.entries(value).sort(([a],[b]) => a.localeCompare(b)).map(([k,v]) => [k, sortValue(v)])) : value;
+              const stable = JSON.stringify(sortValue(canonical));
+              const digest = `sha256:${crypto.createHash('sha256').update(stable, 'utf8').digest('hex')}`;
+              console.log(`ISSUE_UPDATED_AT=${issue.updated_at}`);
+              console.log(`CURRENT_WORK_SPEC_DIGEST=${digest}`);
+              console.log(`WORKER_ID=${metadata.execution?.worker_id}`);
+              console.log(`WORKER_BRANCH=${metadata.execution?.branch}`);
+              console.log(`OWNED_HAS_STATE_AUTHORITY_TEST=${metadata.spec?.ownership?.owned?.includes('tests/state-authority-blockers.test.ts')}`);
+            })().catch(error => { console.error(error); process.exit(1); });
             NODE
             python3 <<'PY'
             from pathlib import Path
             targets = {
               'src/core/reconcile.ts': ['ingestCoordinatorIssueEvent'],
               'src/core/state.ts': ['createFugueAuthorityVariableAtRevision','replaceFugueAuthorityVariable','allocateRecoveryVariable','writeRecoveryCursor'],
-              'src/core/reviews.ts': ['beginReview','findCurrentReview','reviewStart'],
-              'src/core/submissions.ts': ['processCurrentSubmissions','processReviewSubmission','processHumanSubmission'],
-              'src/core/gates.ts': ['human','review'],
+              'src/core/reviews.ts': ['beginReview','currentReviewActivities'],
+              'src/core/submissions.ts': ['processCurrentSubmissions','recordHumanControlPlaneAcknowledgement','hasCurrentHumanAcknowledgement'],
               'src/core/integration-status.ts': ['sealIntegrationWorkflowRunEvent','ensureIntegrationDispatch','getIntegrationRunStartEvidence'],
               '.github/workflows/fugue-integration.yml': ['Commit protected Integration run-start evidence','fugue-authority'],
               'tests/state-authority-blockers.test.ts': ['describe','it('],
-              'tests/reconcile.test.ts': ['Coordinator','review-start','acknowledgement'],
+              'tests/reconcile.test.ts': ['Coordinator','acknowledgement'],
             }
             for path, needles in targets.items():
               p=Path(path)
@@ -76,8 +77,8 @@ jobs:
               seen=[]
               for needle in needles:
                 hits=[i for i,l in enumerate(lines) if needle in l]
-                for i in hits[:6]:
-                  lo=max(0,i-30); hi=min(len(lines),i+90)
+                for i in hits[:8]:
+                  lo=max(0,i-30); hi=min(len(lines),i+100)
                   if any(not (hi<=a or lo>=b) for a,b in seen): continue
                   seen.append((lo,hi))
                   print(f'--- around line {i+1}: {needle} ---')
