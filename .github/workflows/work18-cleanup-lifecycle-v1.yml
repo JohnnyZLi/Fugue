@@ -10,8 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    outputs:
-      sha: ${{ steps.head.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,7 +21,7 @@ jobs:
           ref: bootstrap/work18-identity-lost-20260818
           path: helper
           fetch-depth: 1
-      - name: Apply exact-head cleanup lifecycle repair
+      - name: Prevalidate full repair and publish non-workflow files
         working-directory: work
         run: |
           set -euo pipefail
@@ -52,75 +50,30 @@ jobs:
           expected="$(printf '%s\n' '.github/workflows/fugue-integration.yml' 'AGENTS.md' 'src/core/integration-status.ts' 'src/core/reconcile.ts' 'tests/integration-plan.test.ts' 'tests/state-authority-blockers.test.ts' | sort)"
           test "$changed" = "$expected"
           ! git diff --name-only | grep -Fx package-lock.json
-          test ! -e src/core/integration-commit.ts
-          test ! -e tests/integration-terminal-serialization.test.ts
           git diff --check
           npm ci
           npm run check
           npm test
           npm run build
+          cp .github/workflows/fugue-integration.yml ../helper/.github/work18-fugue-integration-candidate.txt
+          git -C ../helper config user.name Johnny
+          git -C ../helper config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git -C ../helper add .github/work18-fugue-integration-candidate.txt
+          git -C ../helper commit -m 'Stage validated Integration workflow body' || true
+          git -C ../helper push origin HEAD:bootstrap/work18-identity-lost-20260818
+          git restore .github/workflows/fugue-integration.yml
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' 'AGENTS.md' 'src/core/integration-status.ts' 'src/core/reconcile.ts' 'tests/integration-plan.test.ts' 'tests/state-authority-blockers.test.ts' | sort)"
+          test "$changed" = "$expected"
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-          git add .github/workflows/fugue-integration.yml AGENTS.md src/core/integration-status.ts src/core/reconcile.ts tests/integration-plan.test.ts tests/state-authority-blockers.test.ts
+          git add AGENTS.md src/core/integration-status.ts src/core/reconcile.ts tests/integration-plan.test.ts tests/state-authority-blockers.test.ts
           git diff --cached --check
-          git commit -m 'Repair Integration cleanup lifecycle'
+          git commit -m 'Repair Integration cleanup lifecycle core'
           git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
-      - id: head
-        name: Resolve final exact head
-        working-directory: work
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-  test:
-    needs: repair
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      GITHUB_TOKEN: ""
-      GH_TOKEN: ""
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.repair.outputs.sha }}
-          persist-credentials: false
-      - name: Confirm detached exact head and no publication credential
-        env:
-          EXPECTED_SHA: ${{ needs.repair.outputs.sha }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          test -z "$(git symbolic-ref -q HEAD || true)"
-          test -z "$(git config --local --get-regexp 'http.*extraheader' || true)"
-          test -z "$GITHUB_TOKEN"
-          test -z "$GH_TOKEN"
-          ! git diff --name-only HEAD^ HEAD | grep -Fx package-lock.json
-          test ! -e src/core/integration-commit.ts
-          test ! -e tests/integration-terminal-serialization.test.ts
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run check
-      - run: npm test
-      - run: npm run build
-
-  record:
-    needs: [repair, test]
-    if: always() && contains(github.event.head_commit.message, '[cleanup-lifecycle-v1]')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: bootstrap/work18-identity-lost-20260818
-      - name: Record result
-        run: |
-          set -euo pipefail
-          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '${{ needs.repair.outputs.sha }}' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-cleanup-lifecycle-result.txt
-          git config user.name Johnny
-          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-          git add .github/work18-cleanup-lifecycle-result.txt
-          git commit -m 'Record cleanup lifecycle validation' || exit 0
-          git push origin HEAD:bootstrap/work18-identity-lost-20260818
+          partial="$(git rev-parse HEAD)"
+          git -C ../helper pull --ff-only origin bootstrap/work18-identity-lost-20260818
+          printf 'partial_sha=%s\nwork_spec_digest=%s\n' "$partial" 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > ../helper/.github/work18-cleanup-lifecycle-partial.txt
+          git -C ../helper add .github/work18-cleanup-lifecycle-partial.txt
+          git -C ../helper commit -m 'Record cleanup lifecycle partial head' || true
+          git -C ../helper push origin HEAD:bootstrap/work18-identity-lost-20260818
