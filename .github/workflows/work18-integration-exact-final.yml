@@ -1,0 +1,57 @@
+name: Work18 Integration Exact Final
+
+on:
+  push:
+    branches: [bootstrap/work18-identity-lost-20260818]
+
+jobs:
+  test:
+    if: contains(github.event.head_commit.message, '[integration-exact-final]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ""
+      GH_TOKEN: ""
+      EXPECTED_SHA: 6df9420df4fca60bb1d25d81cef3a0f943f37041
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6df9420df4fca60bb1d25d81cef3a0f943f37041
+          persist-credentials: false
+      - name: Confirm detached exact head and credential isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git symbolic-ref -q HEAD || true)"
+          test -z "$(git config --local --get-regexp 'http.*extraheader' || true)"
+          test -z "$GITHUB_TOKEN"
+          test -z "$GH_TOKEN"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  record:
+    needs: test
+    if: always() && contains(github.event.head_commit.message, '[integration-exact-final]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-identity-lost-20260818
+      - name: Record exact-head validation
+        run: |
+          set -euo pipefail
+          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '6df9420df4fca60bb1d25d81cef3a0f943f37041' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-integration-exact-final-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-integration-exact-final-result.txt
+          git commit -m 'Record Work18 integration exact final validation' || exit 0
+          git push origin HEAD:bootstrap/work18-identity-lost-20260818
