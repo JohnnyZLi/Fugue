@@ -1570,7 +1570,22 @@ describe("historical Integration transient cleanup across evaluation drift", () 
         fence_digest: terminal.terminal!.state === "identity_lost" ? terminal.terminal.fence_digest : "",
         created_at: terminal.terminal!.created_at,
       }));
-      const names = [fence.names.fence, authorized.authorization.anchor_name, integrationCommitVariableName(request.request_id)];
+      // Protected B/S writers may have passed earlier checks before terminal cleanup and reappear later.
+      installProtectedBinding(github, terminal, fence.fence, 120520, "2026-08-18T18:12:00.000Z");
+      const lateStart = await signProtocolBody(github, serializeIntegrationRunStartEvidence({
+        version: 1, kind: "integration_run_start", request_id: request.request_id,
+        pr_number: identity.prNumber, head_sha: identity.headSha, base_sha: identity.baseSha,
+        secret_digest: terminal.dispatch!.secret_digest, anchor_name: terminal.dispatch!.anchor_name,
+        run_id: 120521, run_attempt: 1, created_at: "2026-08-18T18:12:01.000Z",
+      }));
+      github.__authorityVariables.set(integrationRunStartVariableName(request), lateStart);
+      const names = [
+        fence.names.fence,
+        authorized.authorization.anchor_name,
+        fence.names.binding,
+        integrationRunStartVariableName(request),
+        integrationCommitVariableName(request.request_id),
+      ];
       await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T18:30:00.000Z"), [{ ...identity, headSha: "6".repeat(40), workSpecDigest: "sha256:spec-6" }]);
       expect(names.filter((name) => github.__authorityVariables.has(name))).toEqual([]);
       expect((await getCurrentIntegrationRecord(github, identity))?.terminal?.state).toBe("identity_lost");

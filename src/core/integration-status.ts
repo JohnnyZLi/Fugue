@@ -815,12 +815,17 @@ function historicalFenceMatchesRecord(fence: HistoricalIntegrationFence, record:
     fence.secret_digest.toLowerCase() === record.dispatch!.secret_digest.toLowerCase() && Number.isFinite(Date.parse(fence.created_at));
 }
 
-function historicalBindingMatchesRecord(witness: HistoricalIntegrationBindingWitness, record: IntegrationRecord): boolean {
-  if (!record.dispatch || !record.run) return false;
+function historicalBindingMatchesRequest(
+  github: FugueGitHub,
+  witness: HistoricalIntegrationBindingWitness,
+  record: IntegrationRecord,
+): boolean {
+  if (!record.dispatch) return false;
   return witness.request_id === record.request.request_id && witness.pr_number === record.identity.prNumber &&
     witness.head_sha.toLowerCase() === record.identity.headSha.toLowerCase() &&
     witness.base_sha.toLowerCase() === record.identity.baseSha.toLowerCase() && witness.anchor_name === record.dispatch.anchor_name &&
-    witness.run_id === record.run.id && witness.run_attempt === 1 && Number.isFinite(Date.parse(witness.run_created_at));
+    witness.run_attempt === 1 && Number.isFinite(Date.parse(witness.run_created_at)) &&
+    witness.html_url === `https://github.com/${github.repository.fullName}/actions/runs/${witness.run_id}`;
 }
 
 async function historicalTransientMatchesRecord(
@@ -840,28 +845,33 @@ async function historicalTransientMatchesRecord(
   }
   if (name === integrationBindingWitnessName(record.request.request_id)) {
     const witness = parseHistoricalJson(value, historicalIntegrationBindingWitnessSchema);
-    if (!witness || !historicalBindingMatchesRecord(witness, record)) return false;
-    return witness.html_url === `https://github.com/${github.repository.fullName}/actions/runs/${record.run!.id}`;
+    if (!witness || !historicalBindingMatchesRequest(github, witness, record)) return false;
+    // Durable identity_lost makes any later protected exact B for this request permanently stale.
+    return record.terminal?.state === "identity_lost" || Boolean(record.run && witness.run_id === record.run.id);
   }
   if (name === integrationRunStartVariableName(record.request)) {
-    if (!record.run) return false;
     let start: IntegrationRunStartEvidence | null;
     try { start = parseIntegrationRunStart(value); } catch { start = null; }
     if (!start || start.request_id !== record.request.request_id || start.pr_number !== record.identity.prNumber ||
         start.head_sha.toLowerCase() !== record.identity.headSha.toLowerCase() ||
         start.base_sha.toLowerCase() !== record.identity.baseSha.toLowerCase() ||
         start.secret_digest.toLowerCase() !== record.dispatch.secret_digest.toLowerCase() ||
-        start.anchor_name !== record.dispatch.anchor_name || start.run_id !== record.run.id || start.run_attempt !== 1) return false;
+        start.anchor_name !== record.dispatch.anchor_name || start.run_attempt !== 1) return false;
     const timestamp = Date.parse(start.created_at);
     if (!Number.isFinite(timestamp)) return false;
-    try { return await verifyProtocolPublicationBodyAtRevision(github, value, record.identity.baseSha, timestamp); }
-    catch { return false; }
+    try {
+      if (!(await verifyProtocolPublicationBodyAtRevision(github, value, record.identity.baseSha, timestamp))) return false;
+    } catch { return false; }
+    // Durable identity_lost likewise makes a delayed protected S inert regardless of its numeric run.
+    return record.terminal?.state === "identity_lost" || Boolean(record.run && start.run_id === record.run.id);
   }
   if (name === integrationCommitVariableName(record.request.request_id)) {
     const context = integrationCommitContext(record)!;
     let commit: IntegrationCommit;
     try { commit = parseIntegrationCommit(value, context); } catch { return false; }
-    if (commit.kind === "integration_exact_run_commit") return Boolean(record.run && commit.run_id === record.run.id);
+    if (commit.kind === "integration_exact_run_commit") {
+      return record.terminal?.state === "identity_lost" || Boolean(record.run && commit.run_id === record.run.id);
+    }
     return record.terminal?.state === "identity_lost" &&
       commit.boundary_created_at === record.terminal.boundary_created_at &&
       commit.fence_digest.toLowerCase() === record.terminal.fence_digest.toLowerCase();
@@ -898,7 +908,6 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
   now: number,
   currentIdentities: IntegrationRequest["identity"][],
 ): Promise<void> {
-  if (!currentIdentities.length) return;
   const hints = new Map<string, HistoricalIntegrationAuthorityHint[]>();
   for (const variable of variables) {
     const hint = await historicalIntegrationAuthorityHint(github, variable);
@@ -909,16 +918,6 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
     hints.set(key, group);
   }
 
-  const currentRequests = new Map<string, string>();
-  for (const identity of currentIdentities) {
-    try {
-      const current = await getCurrentIntegrationRecord(github, identity);
-      if (current) currentRequests.set(JSON.stringify([identity.prNumber, identity.headSha.toLowerCase(), identity.baseBranch, identity.baseSha.toLowerCase(), identity.policyDigest, identity.protocolVersion, identity.issueNumber, identity.workId, identity.workSpecDigest]), current.request.request_id);
-    } catch (error) {
-      if (!(error instanceof DurableProtocolRecoveryPendingError)) throw error;
-    }
-  }
-
   let budget = HISTORICAL_INTEGRATION_CLEANUP_BUDGET;
   for (const key of [...hints.keys()].sort()) {
     if (budget <= 0) break;
@@ -927,10 +926,9 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
     const record = await recoverHistoricalIntegrationRecord(github, hint);
     if (!record) continue;
     const currentIdentity = currentIdentities.find((candidate) => sameEvaluationIdentity(candidate, record.identity));
-    const currentRequestId = currentIdentity
-      ? currentRequests.get(JSON.stringify([currentIdentity.prNumber, currentIdentity.headSha.toLowerCase(), currentIdentity.baseBranch, currentIdentity.baseSha.toLowerCase(), currentIdentity.policyDigest, currentIdentity.protocolVersion, currentIdentity.issueNumber, currentIdentity.workId, currentIdentity.workSpecDigest]))
-      : undefined;
-    if (currentIdentity && currentRequestId === record.request.request_id) continue;
+    // Any request under the current exact evaluation remains request-local lifecycle state, even if
+    // its d3 recovery is temporarily pending. Only evaluation drift can make a request historical.
+    if (currentIdentity) continue;
     budget -= 1;
 
     if (record.run || record.terminal) {
@@ -1019,7 +1017,7 @@ function integrationAuthorizationAge(anchor: IntegrationDispatchAnchor, now: num
 export async function reclaimOrphanIntegrationAuthorityVariables(
   github: FugueGitHub,
   now = Date.now(),
-  currentIdentities: IntegrationRequest["identity"][] = [],
+  currentIdentities?: IntegrationRequest["identity"][],
 ): Promise<void> {
   const variables = await listFugueAuthorityVariables(github, "FUGUE_INT_");
   const anchors = new Map<string, IntegrationDispatchAnchor>();
@@ -1064,7 +1062,7 @@ export async function reclaimOrphanIntegrationAuthorityVariables(
     await deleteFugueAuthorityVariable(github, name);
   }
 
-  await reclaimHistoricalIntegrationAuthorityVariables(github, variables, now, currentIdentities);
+  if (currentIdentities !== undefined) await reclaimHistoricalIntegrationAuthorityVariables(github, variables, now, currentIdentities);
 }
 
 function integrationRunBindingFromEvidence(github: FugueGitHub, evidence: IntegrationRunStartEvidence): IntegrationRunBinding {
