@@ -45,7 +45,9 @@ jobs:
           if(digest!=='sha256:d68ce1214ed0aee5e8d1cad0539d535ef2c9d7ce90ea1a74be06359e0c6953e1') throw new Error(`work-spec drift: ${digest}`);
           NODE
       - name: Apply current QA repairs
-        run: python3 control/.github/work18-current-repair.py work
+        run: |
+          python3 control/.github/work18-current-repair.py work
+          python3 control/.github/work18-current-fix.py work
       - name: Verify scope
         run: |
           cd work
