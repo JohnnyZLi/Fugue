@@ -1,0 +1,31 @@
+name: Work 18 Exact Head Validation
+
+on:
+  push:
+    branches:
+      - bootstrap/fugue-work18-validation
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: contains(github.event.head_commit.message, '[exact-validate]')
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ""
+      GH_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: JohnnyZLi/Fugue
+          ref: 5a28968a8463e39cb009e2f9537b3498808fe84a
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
