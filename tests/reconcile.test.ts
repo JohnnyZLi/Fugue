@@ -1023,13 +1023,21 @@ describe("durable Integration one-request/one-run/result authority", () => {
     expect(current?.terminal?.state).toBe("failure");
   });
 
-  it("keeps an observed cancellation retryable but never guesses cancellation after evidence/run deletion", async () => {
+  it("keeps known attempt cancellation terminal and refuses replacement after deletion", async () => {
     const github = makeGithub();
     const record = await publishAuthorizedRecord(github, 700, "2026-08-17T03:36:00.000Z");
     await installRunStartEvidence(github, record, 700, "2026-08-17T03:36:01.000Z");
     await expect(sealIntegrationWorkflowRunEvent(github, completionEvent(record.request, 700, "cancelled", "2026-08-17T03:36:05.000Z"))).resolves.toBe(true);
-    const current = await getCurrentIntegrationRecord(github, snapshot().identity);
-    expect(current?.terminal?.state).toBe("aborted");
+    let current = await getCurrentIntegrationRecord(github, snapshot().identity);
+    expect(current?.run?.id).toBe(700);
+    expect(current?.terminal?.state).toBe("error");
+    expect((await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:00:00Z"))).dispatch).toBe(false);
+
+    github.__runs.splice(0); github.__attempts.clear(); github.__comments.splice(0);
+    current = await getCurrentIntegrationRecord(github, snapshot().identity);
+    expect(current?.run?.id).toBe(700);
+    expect(current?.terminal?.state).toBe("error");
+    expect((await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T05:00:00Z"))).dispatch).toBe(false);
   });
 
   it("reclaims an orphan dispatch anchor after a crash before d3 request publication", async () => {
@@ -1095,21 +1103,19 @@ describe("durable Integration one-request/one-run/result authority", () => {
     expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_A_"))).toHaveLength(1);
   });
 
-  it("reclaims the bounded per-PR Integration authority slot across repeated cancellations", async () => {
+  it("reclaims the bounded per-PR Integration authority slot across repeated proven no-attempt aborts", async () => {
     const github = makeGithub();
     let now = Date.parse("2026-08-17T03:50:00.000Z");
+    let priorRequestId: string | undefined;
     for (let index = 0; index < 12; index += 1) {
       const next = await ensureIntegrationDispatch(github, snapshot(), now);
       expect(next.dispatch).toBe(true);
-      const record = await getCurrentIntegrationRecord(github, snapshot().identity);
-      expect(record?.dispatch).toBeDefined();
-      const runId = 9000 + index;
-      await installRunStartEvidence(github, record!, runId, new Date(now + 1000).toISOString());
-      await expect(sealIntegrationWorkflowRunEvent(
-        github, completionEvent(record!.request, runId, "cancelled", new Date(now + 2000).toISOString()),
-      )).resolves.toBe(true);
-      expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_A_") || name.startsWith("FUGUE_INT_S_"))).toHaveLength(0);
-      now += 10_000;
+      expect(next.request?.request_id).not.toBe(priorRequestId);
+      priorRequestId = next.request?.request_id;
+      expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_A_")).length).toBeLessThanOrEqual(1);
+      // No F, B, S, C or run exists: protected dispatch never crossed its may-have-dispatched
+      // boundary, so this is the sole retryable aborted transport class.
+      now += 11 * 60 * 1000;
     }
   });
 

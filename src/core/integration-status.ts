@@ -82,6 +82,8 @@ const PROTOCOL_END = "-->";
 const INTEGRATION_ELECTION_PREFIX = "FUGUE_INT_E_";
 const INTEGRATION_ANCHOR_PREFIX = "FUGUE_INT_A_";
 const INTEGRATION_RUN_START_PREFIX = "FUGUE_INT_S_";
+const INTEGRATION_DISPATCH_FENCE_PREFIX = "FUGUE_INT_F_";
+const INTEGRATION_BINDING_WITNESS_PREFIX = "FUGUE_INT_B_";
 export const INTEGRATION_AUTHORITY_SLOT_LIMIT = 64;
 
 export function integrationDispatchRunToken(requestId: string, dispatchSecret: string): string {
@@ -178,6 +180,18 @@ export function integrationAnchorVariableName(request: IntegrationRequest): stri
 
 export function integrationRunStartVariableName(request: IntegrationRequest): string {
   return `${INTEGRATION_RUN_START_PREFIX}${String(request.identity.prNumber).padStart(10, "0")}_${integrationRequestToken(request.request_id)}`;
+}
+
+function integrationRecoverySuffix(requestId: string): string {
+  return createHash("sha256").update(requestId, "utf8").digest("hex").slice(0, 32).toUpperCase();
+}
+
+function integrationDispatchFenceName(requestId: string): string {
+  return `${INTEGRATION_DISPATCH_FENCE_PREFIX}${integrationRecoverySuffix(requestId)}`;
+}
+
+function integrationBindingWitnessName(requestId: string): string {
+  return `${INTEGRATION_BINDING_WITNESS_PREFIX}${integrationRecoverySuffix(requestId)}`;
 }
 
 export function serializeIntegrationRunStartEvidence(value: IntegrationRunStartEvidence): string {
@@ -392,8 +406,13 @@ export async function getIntegrationRunStartEvidence(
 
 export async function releaseIntegrationAuthorityVariable(github: FugueGitHub, record: IntegrationRecord): Promise<void> {
   if (!record.dispatch) return;
-  await deleteFugueAuthorityVariable(github, integrationRunStartVariableName(record.request));
+  // Keep C as the request-local tombstone until every producer prerequisite/evidence slot is gone.
+  // A crash during cleanup therefore remains fail-closed; the next reconciliation repeats the same
+  // request-specific deletes and removes C last without reopening or rebinding the request.
+  await deleteFugueAuthorityVariable(github, integrationDispatchFenceName(record.request.request_id));
   await deleteFugueAuthorityVariable(github, record.dispatch.anchor_name);
+  await deleteFugueAuthorityVariable(github, integrationBindingWitnessName(record.request.request_id));
+  await deleteFugueAuthorityVariable(github, integrationRunStartVariableName(record.request));
   await releaseIntegrationCommit(github, record.request.request_id);
 }
 
@@ -695,7 +714,7 @@ export async function publishIntegrationRecord(
       }
       if (latest.run) {
         if (latest.run.id !== binding.id) throw new Error(`Integration request ${record.request.request_id} is already bound to protected run ${latest.run.id}.`);
-        await releaseIntegrationCommit(github, record.request.request_id);
+        await releaseIntegrationAuthorityVariable(github, latest);
         return latest;
       }
       const bound = await publishIntegrationRecord(github, {
@@ -705,7 +724,7 @@ export async function publishIntegrationRecord(
         terminal: null,
         created_at: binding.created_at,
       });
-      await releaseIntegrationCommit(github, record.request.request_id);
+      await releaseIntegrationAuthorityVariable(github, bound);
       return bound;
     }
     record = {
@@ -970,7 +989,7 @@ export async function bindDispatchedIntegrationRun(
     run: binding,
     created_at: binding.created_at,
   });
-  await releaseIntegrationCommit(github, requestId);
+  await releaseIntegrationAuthorityVariable(github, bound);
   return bound;
 }
 
