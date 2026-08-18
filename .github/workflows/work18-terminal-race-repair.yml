@@ -1,0 +1,97 @@
+name: Work 18 Terminal Race Repair
+
+on:
+  push:
+    branches: [bootstrap/work18-identity-lost-20260818]
+
+jobs:
+  repair:
+    if: contains(github.event.head_commit.message, '[terminal-race-repair]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+          fetch-depth: 1
+      - name: Apply exact focused repairs
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "9f056f6eb977bfa5f45f10250c0570fc6d021d03"
+          python <<'PY'
+          from pathlib import Path
+          import re
+
+          status_path = Path('src/core/integration-status.ts')
+          status = status_path.read_text()
+          status = status.replace(
+              'const INTEGRATION_RUN_START_PREFIX = "FUGUE_INT_S_";\nexport const INTEGRATION_AUTHORITY_SLOT_LIMIT = 64;',
+              'const INTEGRATION_RUN_START_PREFIX = "FUGUE_INT_S_";\nconst INTEGRATION_DISPATCH_FENCE_PREFIX = "FUGUE_INT_F_";\nconst INTEGRATION_BINDING_WITNESS_PREFIX = "FUGUE_INT_B_";\nexport const INTEGRATION_AUTHORITY_SLOT_LIMIT = 64;',
+              1,
+          )
+          needle = '''export function integrationRunStartVariableName(request: IntegrationRequest): string {\n  return `${INTEGRATION_RUN_START_PREFIX}${String(request.identity.prNumber).padStart(10, "0")}_${integrationRequestToken(request.request_id)}`;\n}\n'''
+          insert = needle + '''\nfunction integrationRecoverySuffix(requestId: string): string {\n  return createHash("sha256").update(requestId, "utf8").digest("hex").slice(0, 32).toUpperCase();\n}\n\nfunction integrationDispatchFenceName(requestId: string): string {\n  return `${INTEGRATION_DISPATCH_FENCE_PREFIX}${integrationRecoverySuffix(requestId)}`;\n}\n\nfunction integrationBindingWitnessName(requestId: string): string {\n  return `${INTEGRATION_BINDING_WITNESS_PREFIX}${integrationRecoverySuffix(requestId)}`;\n}\n'''
+          if needle not in status:
+              raise SystemExit('run-start helper insertion point missing')
+          status = status.replace(needle, insert, 1)
+          old_release = '''export async function releaseIntegrationAuthorityVariable(github: FugueGitHub, record: IntegrationRecord): Promise<void> {\n  if (!record.dispatch) return;\n  await deleteFugueAuthorityVariable(github, integrationRunStartVariableName(record.request));\n  await deleteFugueAuthorityVariable(github, record.dispatch.anchor_name);\n  await releaseIntegrationCommit(github, record.request.request_id);\n}\n'''
+          new_release = '''export async function releaseIntegrationAuthorityVariable(github: FugueGitHub, record: IntegrationRecord): Promise<void> {\n  if (!record.dispatch) return;\n  // Keep C as the request-local tombstone until every producer prerequisite/evidence slot is gone.\n  // A crash during cleanup therefore remains fail-closed; the next reconciliation repeats the same\n  // request-specific deletes and removes C last without reopening or rebinding the request.\n  await deleteFugueAuthorityVariable(github, integrationDispatchFenceName(record.request.request_id));\n  await deleteFugueAuthorityVariable(github, record.dispatch.anchor_name);\n  await deleteFugueAuthorityVariable(github, integrationBindingWitnessName(record.request.request_id));\n  await deleteFugueAuthorityVariable(github, integrationRunStartVariableName(record.request));\n  await releaseIntegrationCommit(github, record.request.request_id);\n}\n'''
+          if old_release not in status:
+              raise SystemExit('release function not found')
+          status = status.replace(old_release, new_release, 1)
+          status = status.replace(
+              '        await releaseIntegrationCommit(github, record.request.request_id);\n        return latest;',
+              '        await releaseIntegrationAuthorityVariable(github, latest);\n        return latest;',
+              1,
+          )
+          status = status.replace(
+              '      await releaseIntegrationCommit(github, record.request.request_id);\n      return bound;',
+              '      await releaseIntegrationAuthorityVariable(github, bound);\n      return bound;',
+              1,
+          )
+          status = status.replace(
+              '  await releaseIntegrationCommit(github, requestId);\n  return bound;',
+              '  await releaseIntegrationAuthorityVariable(github, bound);\n  return bound;',
+              1,
+          )
+          status_path.write_text(status)
+
+          control_path = Path('.github/workflows/fugue-control-plane.yml')
+          control = control_path.read_text()
+          old = '              committed.run_created_at !== runCreatedAt || committed.html_url !== htmlUrl) {'
+          new = "              !Number.isFinite(Date.parse(String(committed.run_created_at ?? ''))) || committed.html_url !== htmlUrl) {"
+          if old not in control:
+              raise SystemExit('control exact-winner check not found')
+          control_path.write_text(control.replace(old, new, 1))
+
+          tests_path = Path('tests/reconcile.test.ts')
+          tests = tests_path.read_text()
+          cancellation = '''  it("keeps known attempt cancellation terminal and refuses replacement after deletion", async () => {\n    const github = makeGithub();\n    const record = await publishAuthorizedRecord(github, 700, "2026-08-17T03:36:00.000Z");\n    await installRunStartEvidence(github, record, 700, "2026-08-17T03:36:01.000Z");\n    await expect(sealIntegrationWorkflowRunEvent(github, completionEvent(record.request, 700, "cancelled", "2026-08-17T03:36:05.000Z"))).resolves.toBe(true);\n    let current = await getCurrentIntegrationRecord(github, snapshot().identity);\n    expect(current?.run?.id).toBe(700);\n    expect(current?.terminal?.state).toBe("error");\n    expect((await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T04:00:00Z"))).dispatch).toBe(false);\n\n    github.__runs.splice(0); github.__attempts.clear(); github.__comments.splice(0);\n    current = await getCurrentIntegrationRecord(github, snapshot().identity);\n    expect(current?.run?.id).toBe(700);\n    expect(current?.terminal?.state).toBe("error");\n    expect((await ensureIntegrationDispatch(github, snapshot(), Date.parse("2026-08-17T05:00:00Z"))).dispatch).toBe(false);\n  });\n'''
+          tests, count = re.subn(
+              r'  it\("keeps an observed cancellation retryable but never guesses cancellation after evidence/run deletion", async \(\) => \{.*?^  \}\);\n',
+              cancellation,
+              tests,
+              count=1,
+              flags=re.S | re.M,
+          )
+          if count != 1:
+              raise SystemExit('old cancellation regression not found')
+          no_attempt = '''  it("reclaims the bounded per-PR Integration authority slot across repeated proven no-attempt aborts", async () => {\n    const github = makeGithub();\n    let now = Date.parse("2026-08-17T03:50:00.000Z");\n    let priorRequestId: string | undefined;\n    for (let index = 0; index < 12; index += 1) {\n      const next = await ensureIntegrationDispatch(github, snapshot(), now);\n      expect(next.dispatch).toBe(true);\n      expect(next.request?.request_id).not.toBe(priorRequestId);\n      priorRequestId = next.request?.request_id;\n      expect([...github.__authorityVariables.keys()].filter((name) => name.startsWith("FUGUE_INT_A_")).length).toBeLessThanOrEqual(1);\n      // No F, B, S, C or run exists: protected dispatch never crossed its may-have-dispatched\n      // boundary, so this is the sole retryable aborted transport class.\n      now += 11 * 60 * 1000;\n    }\n  });\n'''
+          tests, count = re.subn(
+              r'  it\("reclaims the bounded per-PR Integration authority slot across repeated cancellations", async \(\) => \{.*?^  \}\);\n',
+              no_attempt,
+              tests,
+              count=1,
+              flags=re.S | re.M,
+          )
+          if count != 1:
+              raise SystemExit('old repeated cancellation regression not found')
+          tests_path.write_text(tests)
+          PY
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add src/core/integration-status.ts .github/workflows/fugue-control-plane.yml tests/reconcile.test.ts
+          git diff --cached --check
+          git commit -m 'Linearize terminal cleanup and known cancellation'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
