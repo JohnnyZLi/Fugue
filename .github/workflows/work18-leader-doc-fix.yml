@@ -1,0 +1,74 @@
+name: Work 18 Leader Documentation Alignment
+
+on:
+  push:
+    branches: [bootstrap/work18-worker-repair-20260818-4]
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  fix:
+    if: contains(github.event.head_commit.message, '[work18-leader-doc-fix]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+      - name: Confirm exact Worker head and unchanged Issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "9983f39bd1f49db551542776796e42be2a0ee3a0"
+          test "$(gh api repos/JohnnyZLi/Fugue/issues/18 --jq .updated_at)" = "2026-08-18T04:28:24Z"
+      - name: Align Leader trust/recovery prose
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('docs/leader-chat.md')
+          s=p.read_text()
+          replacements=[
+            (
+              "The Human only says whether they acknowledge it. The Leader re-fetches the current identity and posts the structured `fugue-human-submit` request through GitHub. A changed head/base/policy/spec makes the old acknowledgement stale.",
+              "The Human only says whether they acknowledge it. The Leader re-fetches the current identity and posts a fresh structured `fugue-human-submit` request through GitHub. Protected Fugue accepts QA/Human request comments only when immutable GitHub comment provenance shows no editor/`lastEditedAt`; an edited body is non-authoritative even when the original author had write permission. A changed head/base/policy/spec makes the old acknowledgement stale."
+            ),
+            (
+              "- Before repository checkout/setup/build, attempt 1 proves the capability from that immutable anchor and creates a separate request-specific OIDC-signed run-start record with first-create-wins semantics carrying the exact `GITHUB_RUN_ID` and attempt 1. Live Authority names are never PATCHed or reused; stale cleanup is request-specific, repository-wide reconciliation scavenges aged pre-d3 orphan anchors, and d3-bound/terminal requests reclaim only their own transient records.",
+              "- The protected `prepare` job references `fugue-authority` with an environment URL carrying only the request ID, correlation token, and exact `GITHUB_RUN_ID`. GitHub persists the corresponding deployment/status before the first in-job environment audit or Authority App token mint, so attempt identity survives a crash plus shared Actions deletion before d3/run-start binding. The job then proves the capability and creates the request-specific OIDC-signed run-start record. Live Authority names are never PATCHed or reused; stale cleanup is request-specific, repository-wide reconciliation scavenges aged pre-d3 orphan anchors, and d3-bound/terminal requests reclaim only their own transient records."
+            ),
+            (
+              "- Filtered workflow-run search is not used to select the bound run, so arbitrary later same-request run flooding cannot change first-run identity.",
+              "- Workflow-run enumeration is not binding authority. Lost-bind recovery derives the correlation token from the one-use protected anchor, requires two identical complete scans of the protected `fugue-authority` deployment history, and binds the globally lowest matching run ID. Later same-request flooding or deletion-shifted workflow-run pages therefore cannot change first-run identity."
+            ),
+            (
+              "- If a run crossed the durable run-start boundary and later disappears before terminal publication, recovery fails closed to terminal failure after its grace period even if the `workflow_run` sealing consumer was cancelled or deleted.",
+              "- If a protected deployment witness, run-start record, or returned dispatch binding proves attempt 1 existed and the Actions run later disappears before terminal publication, recovery retains that exact run identity and fails closed to terminal failure after its grace period even if the `workflow_run` sealing consumer was cancelled or deleted."
+            ),
+            (
+              "- Only transport that never crossed run-start, or an actually observed cancellation/abortion, may recover with a **new request ID**. Deletion alone never means retry.",
+              "- Only transport for which a stable protected deployment scan proves no attempt was created after the recovery grace window, or an actually observed cancellation/abortion, may recover with a **new request ID**. Deletion alone never means retry."
+            ),
+            (
+              "Current review-start/QA verdicts and explicit Human control-plane acknowledgement are protected d3 records; their GitHub comments/statuses are repairable mirrors.",
+              "Current review-start/QA verdicts and explicit Human control-plane acknowledgement are protected d3 records; their GitHub comments/statuses are repairable mirrors. Edited QA/Human request bodies never inherit the original comment author's authority, and rejected hostile requests advance a fixed-size exact-identity semantic d3 filter rather than unbounded raw comment IDs/body hashes."
+            ),
+            (
+              "Integration keeps durable request authorization distinct from attempt existence: a pre-POST crash can recover after grace, while a created-but-unbound attempt is recovered by enumerating unfiltered protected workflow history and selecting the globally lowest run ID carrying the secret-derived correlation token. The token is public correlation only and never binding authority, so later same-request replay cannot outrank the first run; genuine pre-run-start failure remains terminal once that first run is recovered.",
+              "Integration keeps durable request authorization distinct from attempt existence: a pre-POST crash can recover after grace, while a created-but-unbound attempt is recovered from persistent protected `fugue-authority` deployment/status history. Recovery requires a stable repeated complete scan and selects the globally lowest run ID carrying the secret-derived correlation token; mutable workflow-run pagination is not consulted as binding authority. The token is public correlation only, so later same-request replay cannot outrank the first run, and a genuine pre-run-start failure remains terminal even if the first Actions run is deleted before d3/run-start binding."
+            ),
+          ]
+          for old,new in replacements:
+            if s.count(old)!=1: raise SystemExit(f'expected one Leader doc anchor, got {s.count(old)}: {old[:80]}')
+            s=s.replace(old,new)
+          p.write_text(s)
+          PY
+          git diff --check
+          test "$(git diff --name-only)" = "docs/leader-chat.md"
+      - name: Publish Leader documentation alignment
+        run: |
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add docs/leader-chat.md
+          git commit -m 'Align Leader docs with current recovery authority'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
