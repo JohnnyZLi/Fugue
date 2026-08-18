@@ -1,0 +1,131 @@
+name: Work 18 Identity Lost Repair
+
+on:
+  push:
+    branches: [bootstrap/work18-identity-lost-20260818]
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  repair:
+    if: contains(github.event.head_commit.message, '[identity-lost-repair]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repair control
+        uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-identity-lost-20260818
+          path: control
+      - name: Checkout exact canonical pre-repair head
+        uses: actions/checkout@v4
+        with:
+          ref: 802dca5df1c05a35d659472929efef60f450a36f
+          path: work
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: work/package-lock.json
+      - name: Gate live Worker assignment and revised Issue identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git -C work rev-parse HEAD)" = "802dca5df1c05a35d659472929efef60f450a36f"
+          test "$(git -C work ls-remote origin refs/heads/agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration | cut -f1)" = "802dca5df1c05a35d659472929efef60f450a36f"
+          test "$(gh api repos/JohnnyZLi/Fugue/issues/18 --jq .updated_at)" = "2026-08-18T11:12:38Z"
+          gh api repos/JohnnyZLi/Fugue/issues/18 --jq .body > /tmp/issue-body.txt
+      - name: Install exact dependency tree
+        working-directory: work
+        run: npm ci
+      - name: Gate Worker metadata, ownership and revised work-spec digest
+        working-directory: work
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs'; import crypto from 'node:crypto'; import { parse as parseYaml } from 'yaml';
+          const body=fs.readFileSync('/tmp/issue-body.txt','utf8'); const sm='<!-- fugue-work'; const em='-->';
+          const s=body.indexOf(sm), e=body.indexOf(em,s+sm.length); if(s<0||e<0) throw new Error('missing fugue-work');
+          const m=parseYaml(body.slice(s+sm.length,e).trim());
+          if(m.execution?.worker_id!=='wkr-b0057a9e'||m.execution?.branch!=='agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration') throw new Error('Worker assignment drift');
+          const owned=new Set(m.spec?.ownership?.owned??[]), coord=new Set(m.spec?.ownership?.coordinate??[]), forbidden=new Set(m.spec?.ownership?.forbidden??[]);
+          for(const path of ['src/core/reconcile.ts','src/core/integration-plan.ts','tests/state-authority-blockers.test.ts','docs/leader-chat.md']) if(!owned.has(path)) throw new Error(`owned path drift ${path}`);
+          for(const path of ['src/core/integration-status.ts','src/core/workflow.ts','README.md','AGENTS.md']) if(!coord.has(path)) throw new Error(`coordinate path drift ${path}`);
+          if(!forbidden.has('package-lock.json')) throw new Error('forbidden package-lock drift');
+          const req=`${body.slice(0,s)}${body.slice(e+em.length)}`.replace(/\r\n?/g,'\n').split('\n').map(x=>x.replace(/[ \t]+$/g,'')).join('\n').trim();
+          const sort=v=>Array.isArray(v)?v.map(sort):v&&typeof v==='object'?Object.fromEntries(Object.entries(v).sort(([a],[b])=>a.localeCompare(b)).map(([k,x])=>[k,sort(x)])):v;
+          const digest='sha256:'+crypto.createHash('sha256').update(JSON.stringify(sort({requirements:req,spec:m.spec})),'utf8').digest('hex');
+          if(digest!=='sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985') throw new Error(`work-spec drift ${digest}`);
+          NODE
+      - name: Apply focused repair
+        run: python3 control/.github/work18-identity-lost.py
+      - name: Audit narrow scope and closed trust boundaries
+        run: |
+          set -euo pipefail
+          cd work
+          git diff --check
+          test -z "$(git diff --name-only -- package-lock.json)"
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' AGENTS.md README.md docs/leader-chat.md src/core/integration-plan.ts src/core/integration-status.ts src/core/reconcile.ts src/core/workflow.ts tests/state-authority-blockers.test.ts | sort)"
+          printf '%s\n' "$changed"
+          test "$changed" = "$expected"
+          grep -q 'return_run_details: true' src/core/reconcile.ts
+          ! grep -q 'IntegrationExactRunIdentityUnavailableError' src/core/reconcile.ts
+          ! grep -q 'kind: "unresolved"' src/core/reconcile.ts
+          ! grep -q 'GET /repos/{owner}/{repo}/deployments' src/core/integration-status.ts
+          ! grep -q 'listWorkflowRuns' src/core/integration-status.ts
+          grep -q 'state: z.literal("identity_lost")' src/core/integration-plan.ts
+          grep -q 'cleanupTerminalProtectedIntegrationRecovery' src/core/reconcile.ts
+          ! grep -qi 'remains unresolved' AGENTS.md README.md docs/leader-chat.md
+      - name: Typecheck repaired tree
+        working-directory: work
+        run: npm run check
+      - name: Test repaired tree
+        working-directory: work
+        run: npm test
+      - name: Build repaired tree
+        working-directory: work
+        run: npm run build
+      - name: Publish exact green canonical repair
+        run: |
+          set -euo pipefail
+          cd work
+          test "$(git ls-remote origin refs/heads/agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration | cut -f1)" = "802dca5df1c05a35d659472929efef60f450a36f"
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add AGENTS.md README.md docs/leader-chat.md src/core/integration-plan.ts src/core/integration-status.ts src/core/reconcile.ts src/core/workflow.ts tests/state-authority-blockers.test.ts
+          git diff --cached --check
+          test -z "$(git diff --cached --name-only -- package-lock.json)"
+          git commit -m 'Terminalize irrecoverable Integration identity loss'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+          echo "REPAIRED_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Record green repair
+        run: |
+          set -euo pipefail
+          cd control
+          git pull --ff-only origin bootstrap/work18-identity-lost-20260818
+          printf 'run_id=%s\nstatus=success\nrepaired_head=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' "$REPAIRED_HEAD" 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-identity-lost-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-identity-lost-result.txt
+          git commit -m 'Record focused identity-lost repair'
+          git push origin HEAD:bootstrap/work18-identity-lost-20260818
+
+  record-failure:
+    needs: repair
+    if: always() && needs.repair.result == 'failure' && contains(github.event.head_commit.message, '[identity-lost-repair]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-identity-lost-20260818
+      - run: |
+          printf 'run_id=%s\nstatus=failure\n' '${{ github.run_id }}' > .github/work18-identity-lost-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-identity-lost-result.txt
+          git commit -m 'Record failed identity-lost repair' || exit 0
+          git push origin HEAD:bootstrap/work18-identity-lost-20260818
