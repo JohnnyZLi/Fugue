@@ -2,12 +2,12 @@ import { vi } from "vitest";
 
 // The legacy blocker suite exercises Integration replay/deletion state transitions with a synthetic
 // deployment fixture. Isolate that transport fixture behind the new run-witness provider; dedicated
-// integration-authority-root tests below exercise the real protected-witness verifier and prove
+// integration-authority-root tests exercise the real protected-witness verifier and prove
 // Deployments/Deployment Statuses are non-authoritative.
-vi.mock("../src/core/integration-run-witness.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/core/integration-run-witness.js")>();
+vi.mock("../src/core/integration-run-witness.js", () => {
+  class IntegrationRunWitnessDiscoveryPendingError extends Error {}
   return {
-    ...actual,
+    IntegrationRunWitnessDiscoveryPendingError,
     findEarliestProtectedIntegrationRunWitness: vi.fn(async (github: any) => {
       const deployments = [...(github.__deployments ?? [])].sort((left: any, right: any) => right.id - left.id);
       const matches: Array<{ id: number; createdAt: string }> = [];
