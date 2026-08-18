@@ -1,0 +1,25 @@
+name: Work 18 Repair Diagnostics
+on:
+  push:
+    branches: [bootstrap/work18-worker-repair-20260818]
+permissions:
+  contents: write
+jobs:
+  diagnose:
+    if: contains(github.event.head_commit.message, '[work18-diagnose]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: bootstrap/work18-worker-repair-20260818, path: control}
+      - uses: actions/checkout@v4
+        with: {ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration, path: work, persist-credentials: false}
+      - run: |
+          python3 control/.github/work18-repair.py work
+          python3 control/.github/work18-repair-fix.py work
+          { echo '---500-570---'; nl -ba work/src/core/state.ts | sed -n '500,570p'; echo '---1450-1535---'; nl -ba work/src/core/state.ts | sed -n '1450,1535p'; echo '---800-860 integration---'; nl -ba work/src/core/integration-status.ts | sed -n '790,870p'; } > control/.github/work18-transformed.txt
+          cd control
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-transformed.txt
+          git commit -m 'Record transformed work-18 diagnostics'
+          git push origin HEAD:bootstrap/work18-worker-repair-20260818
