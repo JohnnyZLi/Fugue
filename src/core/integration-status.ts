@@ -433,6 +433,56 @@ function integrationRunBindingFromEvidence(github: FugueGitHub, evidence: Integr
   };
 }
 
+
+/**
+ * Recover the globally earliest protected attempt-1 run for an unbound request. The HMAC token is
+ * deliberately public once the legitimate run exists, so it is only a correlation selector. It can
+ * never authorize a run by itself: we enumerate the protected workflow without capped filters and
+ * choose the lowest matching server-assigned run ID. A later replay therefore cannot outrank the
+ * run that first made the unpredictable token observable.
+ */
+async function findEarliestCorrelatedIntegrationWorkflowRun(
+  github: FugueGitHub,
+  record: IntegrationRecord,
+): Promise<IntegrationWorkflowRun | undefined> {
+  if (!record.dispatch) return undefined;
+  const anchorBody = await getFugueAuthorityVariable(github, record.dispatch.anchor_name);
+  if (!anchorBody) return undefined;
+  const anchor = await verifyIntegrationDispatchAnchor(github, record, anchorBody);
+  if (!anchor) throw new Error(`Protected Integration request anchor ${record.dispatch.anchor_name} is not valid for earliest-run recovery.`);
+
+  const expectedTitle = integrationRunTitleWithToken(
+    record.request,
+    integrationDispatchRunToken(record.request.request_id, anchor.dispatch_secret),
+  );
+  const requestCreated = Date.parse(record.request.created_at);
+  const authorizedAt = Date.parse(anchor.authorized_at);
+  const minimumCreated = Math.max(requestCreated, authorizedAt);
+  if (!Number.isFinite(minimumCreated)) return undefined;
+
+  const { owner, repo } = github.repository;
+  let earliest: WorkflowRunRecord | undefined;
+  for (let page = 1; ; page += 1) {
+    const response = await github.octokit.rest.actions.listWorkflowRuns({
+      owner,
+      repo,
+      workflow_id: "fugue-integration.yml",
+      per_page: 100,
+      page,
+    });
+    const runs = ((response.data as unknown as { workflow_runs?: WorkflowRunRecord[] }).workflow_runs ?? []);
+    for (const run of runs) {
+      const created = Date.parse(run.created_at ?? "");
+      if (!isTrustedProtocolWorkflowRun(run) || run.event !== "workflow_dispatch" ||
+          run.head_sha !== record.identity.baseSha || run.display_title !== expectedTitle ||
+          normalizedRunAttempt(run.run_attempt) !== 1 || !Number.isFinite(created) || created < minimumCreated) continue;
+      if (!earliest || run.id < earliest.id) earliest = run;
+    }
+    if (runs.length < 100) break;
+  }
+  return earliest ? workflowRun(earliest) : undefined;
+}
+
 export async function currentIntegrationState(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
@@ -471,7 +521,6 @@ export async function currentIntegrationState(
     return { state: "pending", request, targetUrl: live.htmlUrl };
   }
 
-  if (record.dispatch_started_at) return { state: "pending", request };
   const created = Date.parse(request.created_at);
   if (!Number.isFinite(created)) return { state: "error", request };
   return now - created >= INTEGRATION_REQUEST_RECOVERY_GRACE_MS
@@ -530,16 +579,16 @@ export async function sealIntegrationWorkflowRunEvent(
   }
   const evidence = record.run ? undefined : await getIntegrationRunStartEvidence(github, record);
   let binding = record.run ?? (evidence ? integrationRunBindingFromEvidence(github, evidence) : undefined);
-  if (!binding && match[3] && record.dispatch && record.dispatch_started_at) {
-    const anchorBody = await getFugueAuthorityVariable(github, record.dispatch.anchor_name);
-    const anchor = anchorBody ? await verifyIntegrationDispatchAnchor(github, record, anchorBody) : undefined;
-    if (!anchor || integrationDispatchRunToken(record.request.request_id, anchor.dispatch_secret) !== match[3]) return false;
-    const eventCreated = Date.parse(event.createdAt);
-    const minimumCreated = Math.max(Date.parse(record.request.created_at), Date.parse(record.dispatch_started_at));
-    if (!Number.isFinite(eventCreated) || !Number.isFinite(minimumCreated) || eventCreated < minimumCreated) return false;
-    binding = { id: event.runId, attempt: 1, created_at: event.createdAt, html_url: event.htmlUrl };
+  if (!binding) {
+    // A token in a run title is public presentation after the first run exists. Never bind from the
+    // completion event itself. Reconstruct the entire matching protected-workflow set and accept this
+    // event only if GitHub's globally earliest matching attempt-1 run is this exact run ID.
+    if (!match[3] || !record.dispatch) return false;
+    const earliest = await findEarliestCorrelatedIntegrationWorkflowRun(github, record);
+    if (!earliest || earliest.id !== event.runId) return false;
+    binding = { id: earliest.id, attempt: 1, created_at: earliest.createdAt, html_url: earliest.htmlUrl };
   }
-  if (!binding || binding.id !== event.runId) return false;
+  if (binding.id !== event.runId) return false;
   const createdAt = new Date().toISOString();
   if (event.conclusion === "cancelled") {
     await publishIntegrationRecord(github, {
@@ -711,9 +760,21 @@ export async function ensureIntegrationDispatch(
     if (evidence && !current.run) {
       current = await publishIntegrationRecord(github, {
         ...current,
+        dispatch_started_at: current.dispatch_started_at ?? evidence.created_at,
         run: integrationRunBindingFromEvidence(github, evidence),
         created_at: new Date(now).toISOString(),
       });
+    }
+    if (!current.run) {
+      const earliest = await findEarliestCorrelatedIntegrationWorkflowRun(github, current);
+      if (earliest) {
+        current = await publishIntegrationRecord(github, {
+          ...current,
+          dispatch_started_at: current.dispatch_started_at ?? earliest.createdAt,
+          run: { id: earliest.id, attempt: 1, created_at: earliest.createdAt, html_url: earliest.htmlUrl },
+          created_at: new Date(now).toISOString(),
+        });
+      }
     }
     if (current.run) {
       const bound = await getBoundIntegrationWorkflowRun(github, current);
@@ -758,22 +819,19 @@ export async function ensureIntegrationDispatch(
         return { request: current.request, dispatch: false };
       }
     } else if (!evidence) {
-      const created = Date.parse(current.dispatch_started_at ?? current.request.created_at);
+      const created = Date.parse(current.request.created_at);
       if (!Number.isFinite(created) || now - created < INTEGRATION_REQUEST_RECOVERY_GRACE_MS) {
         return { request: current.request, dispatch: false };
       }
-      if (current.dispatch_started_at) {
-        // Crossing the durable dispatch-creation boundary is irreversible. Without exact run-start,
-        // returned-run binding, or the authenticated completion event we cannot prove whether GitHub
-        // created the attempt, so remain pending forever rather than silently converting possible
-        // attempt-1 failure into abort/retry. The workflow_run event can still seal the exact run ID.
-        return { request: current.request, dispatch: false };
-      }
+      // No exact returned binding, protected run-start, or globally earliest correlated workflow run
+      // exists after the recovery grace period. This includes legacy records carrying the old
+      // pre-POST dispatch_started_at marker: that marker is no longer evidence that GitHub created a
+      // run, so a crash before the POST cannot wedge the request forever.
       await publishIntegrationRecord(github, {
         ...current,
         terminal: {
           state: "aborted",
-          detail: "Authorized Integration dispatch never crossed its protected dispatch-creation boundary; transport may recover with a fresh request.",
+          detail: "Authorized Integration request has no discoverable protected attempt-1 run after the recovery grace period; transport may recover with a fresh request.",
           created_at: new Date(now).toISOString(),
         },
         created_at: new Date(now).toISOString(),
@@ -883,6 +941,7 @@ export async function bindDispatchedIntegrationRun(
   }
   return publishIntegrationRecord(github, {
     ...current,
+    dispatch_started_at: current.dispatch_started_at ?? createdAt,
     run: { id: runId, attempt: 1, created_at: createdAt, html_url: htmlUrl },
     created_at: createdAt,
   });

@@ -27,7 +27,7 @@ import { upsertStateComment } from "./state-comment.js";
 import { actionLabel, observeWork, planWork, type WorkflowAction } from "./workflow.js";
 import { claimWorker } from "./worker.js";
 import type { FugueGitHub } from "./github.js";
-import { bindDispatchedIntegrationRun, ensureIntegrationDispatch, integrationDispatchRunToken, markIntegrationDispatchStarted, reclaimOrphanIntegrationAuthorityVariables, sealIntegrationWorkflowRunEvent } from "./integration-status.js";
+import { bindDispatchedIntegrationRun, ensureIntegrationDispatch, integrationDispatchRunToken, reclaimOrphanIntegrationAuthorityVariables, sealIntegrationWorkflowRunEvent } from "./integration-status.js";
 import { FUGUE_PROTOCOL_ACTOR } from "./provenance.js";
 import { captureEvaluation } from "./evaluation.js";
 import { loadCurrentCanonicalWorkState, publishCanonicalWorkState } from "./state.js";
@@ -483,14 +483,13 @@ export async function dispatchIntegration(github: FugueGitHub, policy: ActivePol
   }
   const next = await ensureIntegrationDispatch(github, snapshot, now);
   if (!next.dispatch || !next.request || !next.dispatchSecret || !next.authorityAnchor) return;
-  const dispatchStartedAt = new Date().toISOString();
-  await markIntegrationDispatchStarted(github, snapshot, next.request.request_id, dispatchStartedAt);
   const runToken = integrationDispatchRunToken(next.request.request_id, next.dispatchSecret);
   const dispatched = await github.octokit.request("POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches", {
     owner,
     repo,
     workflow_id: "fugue-integration.yml",
     ref: policy.identity.baseBranch,
+    return_run_details: true,
     inputs: {
       pr: prNumber, request_id: next.request.request_id, dispatch_secret: next.dispatchSecret,
       authority_anchor: next.authorityAnchor, run_token: runToken,

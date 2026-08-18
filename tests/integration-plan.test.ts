@@ -205,9 +205,12 @@ describe("GitHub-hosted Integration plan", () => {
     }
   });
 
-  it("does not use filtered workflow-run search as Integration binding authority", async () => {
+  it("uses only unfiltered workflow-run enumeration for lost Integration binding recovery", async () => {
     const source = await readFile("src/core/integration-status.ts", "utf8");
-    expect(source).not.toContain("listWorkflowRuns");
+    expect(source).toContain("listWorkflowRuns");
+    expect(source).toContain('workflow_id: "fugue-integration.yml"');
+    expect(source).toContain("per_page: 100");
+    expect(source).not.toMatch(/listWorkflowRuns\(\{[\s\S]{0,500}?(?:actor|branch|created|event|head_sha|status):/);
     expect(source).toContain("getIntegrationRunStartEvidence");
   });
 

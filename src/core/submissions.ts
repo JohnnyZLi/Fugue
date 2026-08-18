@@ -58,6 +58,18 @@ const submissionRejectionSchema = z.object({
   comment_ids: z.array(z.number().int().positive()).min(1),
 });
 
+const submissionRejectionProgressSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("submission_rejection_progress"),
+  identity: evaluationIdentitySchema,
+  sequence: z.number().int().nonnegative(),
+  comment_ids: z.array(z.number().int().positive()),
+  fingerprints: z.array(z.string().regex(/^sha256:[0-9a-f]{64}$/)),
+  created_at: z.string().min(1),
+});
+
+type SubmissionRejectionProgress = z.infer<typeof submissionRejectionProgressSchema>;
+
 export type QaSubmission = z.infer<typeof qaSubmissionSchema>;
 export type HumanSubmission = z.infer<typeof humanSubmissionSchema>;
 
@@ -107,18 +119,46 @@ export async function processCurrentSubmissions(
     per_page: 100,
   });
 
-  const rejectedIds = await rejectedSubmissionIds(github, comments as SubmissionComment[]);
+  let progress = await recoverSubmissionRejectionProgress(github, snapshot);
+  const legacyIds = await rejectedSubmissionReceiptIds(github, comments as SubmissionComment[]);
+  if ([...legacyIds].some((id) => !(progress?.comment_ids ?? []).includes(id))) {
+    const migrated = [...legacyIds].map((id) => {
+      const comment = (comments as SubmissionComment[]).find((candidate) => candidate.id === id);
+      return { id, fingerprint: submissionFingerprint(comment?.user?.login ?? "", comment?.body ?? "") };
+    });
+    progress = await recordSubmissionRejectionProgress(github, snapshot, migrated);
+  }
+  const rejectedIds = new Set(progress?.comment_ids ?? []);
+  const rejectedFingerprints = new Set(progress?.fingerprints ?? []);
+  const fingerprints = new Map<number, string>();
   const qaInputs: Array<SubmissionInput<QaSubmission>> = [];
   const humanInputs: Array<SubmissionInput<HumanSubmission>> = [];
 
+  const reject = async (commentIds: number[], reason: string): Promise<void> => {
+    const entries = commentIds.map((id) => ({ id, fingerprint: fingerprints.get(id) ?? submissionFingerprint("", String(id)) }));
+    progress = await recordSubmissionRejectionProgress(github, snapshot, entries);
+    for (const entry of entries) {
+      rejectedIds.add(entry.id);
+      rejectedFingerprints.add(entry.fingerprint);
+    }
+    try {
+      await rejectSubmissions(github, snapshot.pr.number, commentIds, reason);
+    } catch {
+      // Durable rejection progress is authoritative; a presentation receipt failure cannot make the
+      // same hostile submission consume another reconciliation transition.
+    }
+  };
+
   for (const comment of comments) {
-    if (rejectedIds.has(comment.id)) continue;
     const body = comment.body ?? "";
     if (!body.includes(REVIEW_START) && !body.includes(HUMAN_START)) continue;
+    const actor = comment.user?.login ?? "";
+    const fingerprint = submissionFingerprint(actor, body);
+    fingerprints.set(comment.id, fingerprint);
+    if (rejectedIds.has(comment.id) || rejectedFingerprints.has(fingerprint)) continue;
 
-    const actor = comment.user?.login;
     if (!actor) {
-      await rejectSubmissions(github, snapshot.pr.number, [comment.id], "Submission has no attributable GitHub actor.");
+      await reject([comment.id], "Submission has no attributable GitHub actor.");
       return { accepted: 1 };
     }
 
@@ -128,9 +168,7 @@ export async function processCurrentSubmissions(
       const human = parseHumanSubmission(body);
       if (human) humanInputs.push({ submission: human, actor, commentId: comment.id });
     } catch (error) {
-      await rejectSubmissions(
-        github,
-        snapshot.pr.number,
+      await reject(
         [comment.id],
         `Malformed Fugue submission: ${message(error)}`,
       );
@@ -146,9 +184,7 @@ export async function processCurrentSubmissions(
     if (activity?.completed?.session_id === input.submission.session_id) continue;
     if (activity?.active?.session_id === input.submission.session_id) continue;
 
-    await rejectSubmissions(
-      github,
-      snapshot.pr.number,
+    await reject(
       [input.commentId],
       `QA session ${input.submission.session_id} is not current for the exact PR evaluation identity.`,
     );
@@ -166,9 +202,7 @@ export async function processCurrentSubmissions(
 
     for (const match of matches) {
       if (!(await canSubmitProtocolEvidence(github, match.actor))) {
-        await rejectSubmissions(
-          github,
-          snapshot.pr.number,
+        await reject(
           [match.commentId],
           `@${match.actor} does not have repository write permission required to submit Fugue protocol evidence.`,
         );
@@ -179,9 +213,7 @@ export async function processCurrentSubmissions(
     const unique = new Map<string, typeof matches[number]>();
     for (const match of matches) unique.set(JSON.stringify(match.submission), match);
     if (unique.size > 1) {
-      await rejectSubmissions(
-        github,
-        snapshot.pr.number,
+      await reject(
         matches.map((match) => match.commentId),
         `Conflicting ${roleHeading(requirement.role)} submissions exist for session ${activity.active.session_id}; submit one fresh verdict.`,
       );
@@ -202,9 +234,7 @@ export async function processCurrentSubmissions(
   if (snapshot.qa.controlPlaneChanged && !(await hasCurrentHumanAcknowledgement(github, snapshot))) {
     for (const input of humanInputs) {
       if (!sameEvaluationIdentity(input.submission.identity, snapshot.identity)) {
-        await rejectSubmissions(
-          github,
-          snapshot.pr.number,
+        await reject(
           [input.commentId],
           "Human control-plane acknowledgement is bound to a stale PR evaluation identity.",
         );
@@ -218,9 +248,7 @@ export async function processCurrentSubmissions(
     const selected = matches.at(-1);
     if (selected) {
       if (!(await canSubmitProtocolEvidence(github, selected.actor))) {
-        await rejectSubmissions(
-          github,
-          snapshot.pr.number,
+        await reject(
           [selected.commentId],
           `@${selected.actor} does not have repository write permission required for control-plane acknowledgement.`,
         );
@@ -353,7 +381,72 @@ async function recoverHumanAcknowledgementAuthority(
   return recovered.record?.value;
 }
 
-async function rejectedSubmissionIds(
+function submissionRejectionIdentityToken(snapshot: EvaluationSnapshot): string {
+  return createHash("sha256").update(JSON.stringify(snapshot.identity), "utf8").digest("hex").slice(0, 20);
+}
+
+function submissionRejectionScope(snapshot: EvaluationSnapshot): string {
+  return `submission-rejection/${snapshot.identity.prNumber}/${submissionRejectionIdentityToken(snapshot)}`;
+}
+
+function submissionFingerprint(actor: string, body: string): string {
+  return `sha256:${createHash("sha256").update(`${actor}\0${body}`, "utf8").digest("hex")}`;
+}
+
+async function recoverSubmissionRejectionProgress(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+): Promise<SubmissionRejectionProgress | undefined> {
+  const recovered = await recoverDurableProtocolRecord(github, {
+    storageSha: snapshot.identity.headSha,
+    publisherSha: snapshot.identity.baseSha,
+    scope: submissionRejectionScope(snapshot),
+    issueNumber: snapshot.pr.number,
+    parse: (body) => {
+      const marker = "<!-- fugue-submission-rejection-progress";
+      const value = parseMarked(body, marker, submissionRejectionProgressSchema);
+      return value;
+    },
+    timestamp: (value) => Date.parse(value.created_at),
+    order: (value) => `submission-rejection-v1:${String(value.sequence).padStart(20, "0")}`,
+    validate: (value) => sameEvaluationIdentity(value.identity, snapshot.identity),
+  });
+  return recovered.record?.value;
+}
+
+async function recordSubmissionRejectionProgress(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+  entries: Array<{ id: number; fingerprint: string }>,
+): Promise<SubmissionRejectionProgress> {
+  const current = await recoverSubmissionRejectionProgress(github, snapshot);
+  const ids = [...new Set([...(current?.comment_ids ?? []), ...entries.map((entry) => entry.id)])].sort((a, b) => a - b);
+  const fingerprints = [...new Set([...(current?.fingerprints ?? []), ...entries.map((entry) => entry.fingerprint)])].sort();
+  if (current && ids.length === current.comment_ids.length && fingerprints.length === current.fingerprints.length) return current;
+  const sequence = (current?.sequence ?? -1) + 1;
+  const createdAt = new Date().toISOString();
+  const value = submissionRejectionProgressSchema.parse({
+    version: 1,
+    kind: "submission_rejection_progress",
+    identity: snapshot.identity,
+    sequence,
+    comment_ids: ids,
+    fingerprints,
+    created_at: createdAt,
+  });
+  const marker = `<!-- fugue-submission-rejection-progress\n${stringifyYaml(value).trim()}\n${END}`;
+  await publishDurableProtocolRecord(github, {
+    storageSha: snapshot.identity.headSha,
+    publisherSha: snapshot.identity.baseSha,
+    scope: submissionRejectionScope(snapshot),
+    unsignedBody: `${marker}\n\nFUGUE SUBMISSION REJECTION PROGRESS — CANONICAL`,
+    publicationTimestamp: Date.parse(createdAt),
+    authorityOrder: `submission-rejection-v1:${String(sequence).padStart(20, "0")}`,
+  });
+  return (await recoverSubmissionRejectionProgress(github, snapshot)) ?? value;
+}
+
+async function rejectedSubmissionReceiptIds(
   github: FugueGitHub,
   comments: SubmissionComment[],
 ): Promise<Set<number>> {
