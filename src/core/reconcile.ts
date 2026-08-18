@@ -27,7 +27,7 @@ import { upsertStateComment } from "./state-comment.js";
 import { actionLabel, observeWork, planWork, type WorkflowAction } from "./workflow.js";
 import { claimWorker } from "./worker.js";
 import type { FugueGitHub } from "./github.js";
-import { ensureIntegrationDispatch, reclaimOrphanIntegrationAuthorityVariables, sealIntegrationWorkflowRunEvent } from "./integration-status.js";
+import { bindDispatchedIntegrationRun, ensureIntegrationDispatch, reclaimOrphanIntegrationAuthorityVariables, sealIntegrationWorkflowRunEvent } from "./integration-status.js";
 import { FUGUE_PROTOCOL_ACTOR } from "./provenance.js";
 import { captureEvaluation } from "./evaluation.js";
 import { loadCurrentCanonicalWorkState, publishCanonicalWorkState } from "./state.js";
@@ -273,13 +273,11 @@ export async function ingestCoordinatorIssueEvent(
   if (!alreadyAuthorized && !(await canCanonicalizeCoordinatorEvent(github, event.actor))) return false;
 
   const existing = await loadCurrentCanonicalWorkState(github, event.issueNumber, policy.identity.baseSha);
+  const coordinator = coordinatorIdentity(event);
+  if (existing && coordinator && compareCoordinatorIdentity(existing, coordinator) >= 0) return false;
 
   if (event.action === "labeled" || event.action === "unlabeled") {
     if (!existing || !event.label || !event.issueLabels) return false;
-    const eventRevision = Date.parse(event.issueUpdatedAt ?? "");
-    const stateRevision = Date.parse(existing.created_at);
-    // Replaying an old Human label snapshot must not roll back a later protected lifecycle transition.
-    if (Number.isFinite(eventRevision) && Number.isFinite(stateRevision) && stateRevision > eventRevision) return false;
     let state = existing.state;
     let agentReady = existing.agent_ready;
     if (STATE_LABELS.has(event.label as WorkState["stateLabel"]) && event.action === "labeled") {
@@ -296,6 +294,7 @@ export async function ingestCoordinatorIssueEvent(
       pr: existing.pr,
       baseSha: policy.identity.baseSha,
       predecessor: existing,
+      ...(coordinator ? { coordinator } : {}),
     }));
   }
 
@@ -320,7 +319,35 @@ export async function ingestCoordinatorIssueEvent(
     pr: existing?.pr ?? null,
     baseSha: policy.identity.baseSha,
     ...(existing ? { predecessor: existing } : { logicalRoot: true }),
+    ...(coordinator ? { coordinator } : {}),
   }));
+}
+
+function coordinatorIdentity(event: CoordinatorIssueEvent): { issueUpdatedAt: string; eventSequence: number; eventId: string } | undefined {
+  if (!event.issueUpdatedAt || !event.issueNumber) return undefined;
+  return {
+    issueUpdatedAt: event.issueUpdatedAt,
+    eventSequence: event.eventSequence ?? 0,
+    eventId: event.eventId ?? `${event.issueNumber}:${event.issueUpdatedAt}:${event.action}:${event.label ?? ""}`,
+  };
+}
+
+function compareCoordinatorIdentity(
+  state: { coordinator_issue_updated_at?: string | undefined; coordinator_event_sequence?: number | undefined; coordinator_event_id?: string | undefined },
+  incoming: { issueUpdatedAt: string; eventSequence: number; eventId: string },
+): number {
+  if (state.coordinator_issue_updated_at === undefined || state.coordinator_event_sequence === undefined ||
+      state.coordinator_event_id === undefined) return -1;
+  const left = Date.parse(state.coordinator_issue_updated_at);
+  const right = Date.parse(incoming.issueUpdatedAt);
+  if (Number.isFinite(left) && Number.isFinite(right) && left !== right) return left < right ? -1 : 1;
+  if (state.coordinator_issue_updated_at !== incoming.issueUpdatedAt) {
+    return state.coordinator_issue_updated_at.localeCompare(incoming.issueUpdatedAt);
+  }
+  if (state.coordinator_event_sequence !== incoming.eventSequence) {
+    return state.coordinator_event_sequence < incoming.eventSequence ? -1 : 1;
+  }
+  return state.coordinator_event_id.localeCompare(incoming.eventId);
 }
 
 export async function allocateWorker(github: FugueGitHub, policy: ActivePolicy, work: WorkState): Promise<void> {
@@ -456,13 +483,21 @@ export async function dispatchIntegration(github: FugueGitHub, policy: ActivePol
   }
   const next = await ensureIntegrationDispatch(github, snapshot, now);
   if (!next.dispatch || !next.request || !next.dispatchSecret || !next.authorityAnchor) return;
-  await github.octokit.rest.actions.createWorkflowDispatch({
+  const dispatched = await github.octokit.request("POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches", {
     owner,
     repo,
     workflow_id: "fugue-integration.yml",
     ref: policy.identity.baseBranch,
     inputs: { pr: prNumber, request_id: next.request.request_id, dispatch_secret: next.dispatchSecret, authority_anchor: next.authorityAnchor },
+    headers: { "X-GitHub-Api-Version": "2026-03-10" },
   });
+  const data = dispatched.data as unknown as { workflow_run_id?: unknown; html_url?: unknown; run_url?: unknown };
+  const runId = typeof data.workflow_run_id === "number" ? data.workflow_run_id : Number.NaN;
+  const htmlUrl = typeof data.html_url === "string" ? data.html_url : typeof data.run_url === "string" ? data.run_url : "";
+  if (!Number.isInteger(runId) || runId <= 0 || !htmlUrl) {
+    throw new Error(`Protected Integration dispatch for request ${next.request.request_id} did not return its exact run identity.`);
+  }
+  await bindDispatchedIntegrationRun(github, snapshot, next.request.request_id, runId, htmlUrl, new Date().toISOString());
 }
 
 async function syncPrDraft(github: FugueGitHub, prNumber: number, expectedDraft: boolean): Promise<void> {

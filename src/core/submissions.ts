@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { z } from "zod";
 import {
@@ -17,6 +18,7 @@ import {
   type GitHubCommentLike,
 } from "./provenance.js";
 import { completeReview, currentReviewActivities, type CompleteReviewOptions } from "./reviews.js";
+import { publishDurableProtocolRecord, recoverDurableProtocolRecord } from "./state.js";
 
 const REVIEW_START = "<!-- fugue-review-submit";
 const HUMAN_START = "<!-- fugue-human-submit";
@@ -267,6 +269,7 @@ export async function recordHumanControlPlaneAcknowledgement(
     throw new Error("PR evaluation identity changed before acknowledgement could be recorded.");
   }
 
+  await publishHumanAcknowledgementAuthority(github, snapshot, attestation);
   await createProtocolComment(
     github,
     prNumber,
@@ -278,6 +281,9 @@ export async function hasCurrentHumanAcknowledgement(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
 ): Promise<boolean> {
+  const durable = await recoverHumanAcknowledgementAuthority(github, snapshot);
+  if (durable) return true;
+
   const { owner, repo } = github.repository;
   const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
     owner,
@@ -291,12 +297,57 @@ export async function hasCurrentHumanAcknowledgement(
     try {
       const value = parseAttestation(comment.body ?? "");
       if (value?.kind !== "human_control_plane") continue;
-      if (sameEvaluationIdentity(value.identity, snapshot.identity)) return true;
+      if (!sameEvaluationIdentity(value.identity, snapshot.identity)) continue;
+      await publishHumanAcknowledgementAuthority(github, snapshot, value);
+      return true;
     } catch {
       // Historical malformed evidence is not current acknowledgement.
     }
   }
   return false;
+}
+
+function humanIdentityToken(snapshot: EvaluationSnapshot): string {
+  return createHash("sha256").update(JSON.stringify(snapshot.identity), "utf8").digest("hex").slice(0, 20);
+}
+
+function humanAcknowledgementScope(snapshot: EvaluationSnapshot): string {
+  return `human-cp/${snapshot.identity.prNumber}/${humanIdentityToken(snapshot)}`;
+}
+
+async function publishHumanAcknowledgementAuthority(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+  value: ReturnType<typeof humanControlPlaneAttestationSchema.parse>,
+): Promise<void> {
+  await publishDurableProtocolRecord(github, {
+    storageSha: snapshot.identity.headSha,
+    publisherSha: snapshot.identity.baseSha,
+    scope: humanAcknowledgementScope(snapshot),
+    unsignedBody: `${serializeAttestation(value)}\n\nHUMAN CONTROL-PLANE ACKNOWLEDGEMENT — CANONICAL`,
+    publicationTimestamp: Date.parse(value.created_at),
+    authorityOrder: `human-cp-v1:${value.created_at}`,
+  });
+}
+
+async function recoverHumanAcknowledgementAuthority(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+): Promise<ReturnType<typeof humanControlPlaneAttestationSchema.parse> | undefined> {
+  const recovered = await recoverDurableProtocolRecord(github, {
+    storageSha: snapshot.identity.headSha,
+    publisherSha: snapshot.identity.baseSha,
+    scope: humanAcknowledgementScope(snapshot),
+    issueNumber: snapshot.pr.number,
+    parse: (body) => {
+      const value = parseAttestation(body);
+      return value?.kind === "human_control_plane" ? value : null;
+    },
+    timestamp: (value) => Date.parse(value.created_at),
+    order: (value) => `human-cp-v1:${value.created_at}`,
+    validate: (value) => sameEvaluationIdentity(value.identity, snapshot.identity) && value.verdict === "acknowledged",
+  });
+  return recovered.record?.value;
 }
 
 async function rejectedSubmissionIds(

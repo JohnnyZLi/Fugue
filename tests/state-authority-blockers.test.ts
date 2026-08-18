@@ -1,7 +1,15 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { FugueGitHub } from "../src/core/github.js";
+import type { EvaluationSnapshot } from "../src/core/evaluation.js";
+import type { ActivePolicy } from "../src/core/policy.js";
 import { workMetadataSchema } from "../src/core/metadata.js";
+import { ingestCoordinatorIssueEvent } from "../src/core/reconcile.js";
+import { currentReviewActivities } from "../src/core/reviews.js";
+import { hasCurrentHumanAcknowledgement } from "../src/core/submissions.js";
+import { createIntegrationRecord, createIntegrationRequest } from "../src/core/integration-plan.js";
+import { authorizeIntegrationDispatch, bindDispatchedIntegrationRun, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, publishIntegrationRecord, sealIntegrationWorkflowRunEvent } from "../src/core/integration-status.js";
+import { humanControlPlaneAttestationSchema, qaAttestationSchema, reviewStartSchema, serializeAttestation } from "../src/core/attestations.js";
 import {
   assertRepositoryDefaultBranchRevision,
   createDurableManifestProof,
@@ -26,6 +34,7 @@ vi.mock("../src/core/provenance.js", async (importOriginal) => {
   return {
     ...actual,
     assertRepositoryDefaultBranchRevision: vi.fn(async (github: FugueGitHub, expected: string) => {
+      await (github as TestGithub).__beforeRevisionCheck?.();
       const actualSha = (github as TestGithub).__baseSha;
       if (actualSha.toLowerCase() !== expected.toLowerCase()) {
         throw new Error(`stale protected revision ${actualSha.slice(0, 8)}`);
@@ -63,7 +72,8 @@ async function defaultPublicationVerifier(
 ): Promise<boolean> {
   const publisherSha = (github as TestGithub).__publisherSha ?? expected;
   if (publisherSha.toLowerCase() !== expected.toLowerCase()) return false;
-  if (body.includes("<!-- fugue-durable-recovery")) return body.includes("token: test-proof");
+  if (body.includes("<!-- fugue-durable-recovery") || body.includes("INTEGRATION DISPATCH — AUTHORIZED") ||
+      body.includes("INTEGRATION RUN — STARTED")) return body.includes("token: test-proof");
   const key = body.match(/Fugue-Authority-Key: ([0-9a-f]{32})/i)?.[1];
   const commit = body.match(/Fugue-Authority-Commit: ([0-9a-f]{32})/i)?.[1];
   return Boolean(key && commit && !/^0+$/.test(key) && !/^0+$/.test(commit));
@@ -110,6 +120,7 @@ interface TestGithub extends FugueGitHub {
   __comments: TestComment[];
   __statuses: TestStatus[];
   __beforeRecoverySign?: (body: string) => Promise<void> | void;
+  __beforeRevisionCheck?: () => Promise<void> | void;
 }
 
 function makeGithub(): TestGithub {
@@ -126,6 +137,7 @@ function makeGithub(): TestGithub {
     __comments: comments,
     __statuses: statuses,
     octokit: {
+      paginate: vi.fn(async (method: (args: Record<string, unknown>) => Promise<{ data: unknown }>, args: Record<string, unknown>) => (await method(args)).data),
       rest: {
         issues: {
           get: vi.fn(async (args: { issue_number: number }) => ({
@@ -157,6 +169,12 @@ function makeGithub(): TestGithub {
             if (index >= 0) comments.splice(index, 1);
             return { data: {} };
           }),
+        },
+        pulls: {
+          get: vi.fn(async (args: { pull_number: number }) => ({ data: { number: args.pull_number, head: { sha: "a".repeat(40) } } })),
+        },
+        actions: {
+          listWorkflowRuns: vi.fn(async () => ({ data: { workflow_runs: [] } })),
         },
         repos: {
           createCommitStatus: vi.fn(async (args: {
@@ -446,4 +464,108 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
     expect(recoveredFirst.record?.body).toContain(`first-body:${first}`);
     expect(recoveredSecond.record?.body).toContain(`second-body:${second}`);
   });
+
+  it("replays newer Coordinator intent by immutable issue revision even after a slower older publication timestamp", async () => {
+    const github = makeGithub();
+    const root = createCanonicalWorkState({
+      issue: 18, title: "Coordinator root", state: "state:ready", agentReady: true,
+      requirements: "## Outcome\nroot", metadata: metadata(false), pr: null, baseSha: BASE,
+      createdAt: "2026-08-17T08:00:00.000Z", logicalRoot: true,
+      coordinator: { issueUpdatedAt: "2026-08-17T07:00:00.000Z", eventSequence: 10, eventId: "e1" },
+    });
+    await publishCanonicalWorkState(github, root);
+    const current = (await loadCurrentCanonicalWorkState(github, 18, BASE))!;
+    const slowOldPublication = createCanonicalWorkState({
+      issue: 18, title: current.title, state: "state:working", agentReady: current.agent_ready,
+      requirements: canonicalRequirements(current), metadata: current.metadata, pr: current.pr, baseSha: BASE,
+      createdAt: "2026-08-17T09:00:00.000Z", predecessor: current,
+    });
+    await publishCanonicalWorkState(github, slowOldPublication);
+
+    const policy = { identity: { baseSha: BASE } } as unknown as ActivePolicy;
+    await expect(ingestCoordinatorIssueEvent(github, policy, {
+      eventName: "issues", action: "unlabeled", actor: "human", issueNumber: 18,
+      label: "agent:ready", issueTitle: "Coordinator root", issueBody: "", issueLabels: ["state:working"],
+      issueUpdatedAt: "2026-08-17T07:30:00.000Z", eventSequence: 11, eventId: "e2",
+    }, true)).resolves.toBe(true);
+    const applied = await loadCurrentCanonicalWorkState(github, 18, BASE);
+    expect(applied?.agent_ready).toBe(false);
+    expect(applied?.coordinator_event_id).toBe("e2");
+  });
+
+  it("keeps final Authority witness fenced while stale cleanup races compaction and reserve recreation", async () => {
+    const github = makeGithub();
+    let raced = false;
+    github.__beforeRevisionCheck = async () => {
+      if (raced || ![...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3G_"))) return;
+      const target = [...github.__authorityVariables.keys()].find((name) => /^FUGUE_D3_[0-9A-F]{16}_[0-9A-F]{16}$/i.test(name));
+      if (!target) return;
+      raced = true;
+      github.__baseSha = NEXT_BASE;
+      await compactFugueRecoveryAuthorityVariables(github);
+    };
+    await expect(publishDurableProtocolRecord(github, {
+      storageSha: BASE, publisherSha: BASE, scope: "guarded-create-race",
+      unsignedBody: "must-not-survive-guard-race", publicationTimestamp: Date.parse("2026-08-17T08:10:00.000Z"),
+      authorityOrder: "2026-08-17T08:10:00.000Z",
+    })).rejects.toThrow(/stale protected revision/);
+    github.__beforeRevisionCheck = undefined;
+    expect(recoveryScopes(github).has("guarded-create-race")).toBe(false);
+    expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_D3G_"))).toBe(false);
+    expect(github.__authorityVariables.get("FUGUE_D3R_00")).toBe("reserved-for-fugue-recovery-compaction");
+  });
+
+  it("recovers accepted QA and Human evidence from d3 after every presentation comment is deleted", async () => {
+    const github = makeGithub();
+    const identity = {
+      prNumber: 19, headSha: "a".repeat(40), baseBranch: "main", baseSha: BASE,
+      policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
+      workSpecDigest: "sha256:spec",
+    };
+    const snapshot = { identity, pr: { number: 19 }, qa: { controlPlaneChanged: true } } as unknown as EvaluationSnapshot;
+    const session = reviewStartSchema.parse({ version: 1, kind: "review_start", session_id: "rev-code-durable1", role: "code", identity, fugue_version: "test", created_at: "2026-08-17T08:20:00.000Z" });
+    const qa = qaAttestationSchema.parse({ version: 1, kind: "qa", attestation_id: "att-code-durable1", session_id: session.session_id, role: "code", identity, fugue_version: "test", verdict: "approved", created_at: "2026-08-17T08:21:00.000Z" });
+    const human = humanControlPlaneAttestationSchema.parse({ version: 1, kind: "human_control_plane", attestation_id: "att-human-durable1", identity, fugue_version: "test", actor: "human", verdict: "acknowledged", created_at: "2026-08-17T08:22:00.000Z" });
+    for (const value of [session, qa, human]) {
+      await github.octokit.rest.issues.createComment({ owner: "JohnnyZLi", repo: "Fugue", issue_number: 19, body: serializeAttestation(value) });
+    }
+    const before = await currentReviewActivities(github, snapshot);
+    expect(before.get("code")?.completed?.attestation_id).toBe(qa.attestation_id);
+    await expect(hasCurrentHumanAcknowledgement(github, snapshot)).resolves.toBe(true);
+    github.__comments.splice(0);
+    const after = await currentReviewActivities(github, snapshot);
+    expect(after.get("code")?.completed?.attestation_id).toBe(qa.attestation_id);
+    await expect(hasCurrentHumanAcknowledgement(github, snapshot)).resolves.toBe(true);
+  });
+
+  it("seals a genuine protected attempt-1 failure even when it completes before custom run-start evidence", async () => {
+    const github = makeGithub();
+    const identity = {
+      prNumber: 19, headSha: "a".repeat(40), baseBranch: "main", baseSha: BASE,
+      policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 18, workId: "work-18",
+      workSpecDigest: "sha256:spec",
+    };
+    const snapshot = { identity, pr: { number: 19 } } as unknown as EvaluationSnapshot;
+    const request = createIntegrationRequest(identity, "2026-08-17T08:30:00.000Z", "1".repeat(16));
+    const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-17T08:30:00.000Z", undefined);
+    await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+      dispatch: authorized.authorization, createdAt: "2026-08-17T08:30:00.000Z",
+    }));
+    await bindDispatchedIntegrationRun(
+      github, snapshot, authorized.request.request_id, 4242,
+      "https://github.com/JohnnyZLi/Fugue/actions/runs/4242", "2026-08-17T08:30:30.000Z",
+    );
+    expect(await getIntegrationRunStartEvidence(github, (await getCurrentIntegrationRecord(github, identity))!)).toBeUndefined();
+    await expect(sealIntegrationWorkflowRunEvent(github, {
+      eventName: "workflow_run", workflowName: "Fugue Integration", runId: 4242, runAttempt: 1,
+      conclusion: "failure", status: "completed", headSha: BASE,
+      displayTitle: `Fugue Integration PR #19 ${authorized.request.request_id}`,
+      createdAt: "2026-08-17T08:31:00.000Z", htmlUrl: "https://github.com/JohnnyZLi/Fugue/actions/runs/4242",
+      actor: "github-actions[bot]",
+    })).resolves.toBe(true);
+    const terminal = await getCurrentIntegrationRecord(github, identity);
+    expect(terminal?.run?.id).toBe(4242);
+    expect(terminal?.terminal?.state).toBe("failure");
+  });
+
 });

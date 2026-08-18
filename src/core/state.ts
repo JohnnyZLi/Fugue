@@ -43,6 +43,9 @@ const REPOSITORY_AUTHORITY_VARIABLE_CAPACITY = 500;
 const RECOVERY_AUTHORITY_PREFIX = "FUGUE_D3_";
 const RECOVERY_PACK_PREFIX = "FUGUE_D3P_";
 const RECOVERY_RESERVE_PREFIX = "FUGUE_D3R_";
+const RECOVERY_MUTATION_GUARD_PREFIX = "FUGUE_D3G_";
+const RECOVERY_MUTATION_GUARD_RESERVE = "FUGUE_D3R_00";
+const RECOVERY_MUTATION_GUARD_GRACE_MS = 10 * 60 * 1000;
 const RECOVERY_RESERVE_COUNT = 8;
 const RECOVERY_RESERVE_VALUE = "reserved-for-fugue-recovery-compaction";
 const RECOVERY_COMPACTION_RETRY_LIMIT = 16;
@@ -75,6 +78,18 @@ export const canonicalWorkStateSchema = z.object({
   created_at: z.string().min(1),
   authority_sequence: z.number().int().nonnegative().optional(),
   parent_digest: z.string().regex(/^sha256:[0-9a-f]{64}$/i).nullable().optional(),
+  coordinator_issue_updated_at: z.string().min(1).optional(),
+  coordinator_event_sequence: z.number().int().nonnegative().optional(),
+  coordinator_event_id: z.string().min(1).optional(),
+}).superRefine((value, context) => {
+  const coordinatorFields = [
+    value.coordinator_issue_updated_at,
+    value.coordinator_event_sequence,
+    value.coordinator_event_id,
+  ].filter((field) => field !== undefined).length;
+  if (coordinatorFields !== 0 && coordinatorFields !== 3) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Canonical work-state Coordinator identity must be complete." });
+  }
 });
 
 export const coordinatorSnapshotSchema = z.object({
@@ -221,6 +236,7 @@ export function createCanonicalWorkState(input: {
   createdAt?: string;
   predecessor?: CanonicalWorkState;
   logicalRoot?: boolean;
+  coordinator?: { issueUpdatedAt: string; eventSequence: number; eventId: string };
 }): CanonicalWorkState {
   assertWorkMetadataForIssue(input.metadata, input.issue);
   const predecessor = input.predecessor ? canonicalWorkStateSchema.parse(input.predecessor) : undefined;
@@ -234,6 +250,15 @@ export function createCanonicalWorkState(input: {
     ? (predecessor.authority_sequence ?? -1) + 1
     : input.logicalRoot ? 0 : undefined;
   const parentDigest = predecessor ? canonicalWorkStateDigest(predecessor) : input.logicalRoot ? null : undefined;
+  const inheritedCoordinator = predecessor?.coordinator_issue_updated_at !== undefined &&
+      predecessor.coordinator_event_sequence !== undefined && predecessor.coordinator_event_id !== undefined
+    ? {
+        issueUpdatedAt: predecessor.coordinator_issue_updated_at,
+        eventSequence: predecessor.coordinator_event_sequence,
+        eventId: predecessor.coordinator_event_id,
+      }
+    : undefined;
+  const coordinator = input.coordinator ?? inheritedCoordinator;
   return canonicalWorkStateSchema.parse({
     version: 1,
     kind: "work_state",
@@ -247,6 +272,11 @@ export function createCanonicalWorkState(input: {
     base_sha: input.baseSha,
     created_at: input.createdAt ?? new Date().toISOString(),
     ...(authoritySequence === undefined ? {} : { authority_sequence: authoritySequence, parent_digest: parentDigest }),
+    ...(coordinator ? {
+      coordinator_issue_updated_at: coordinator.issueUpdatedAt,
+      coordinator_event_sequence: coordinator.eventSequence,
+      coordinator_event_id: coordinator.eventId,
+    } : {}),
   });
 }
 
@@ -300,7 +330,10 @@ export function sameCanonicalWorkState(left: CanonicalWorkState, right: Canonica
     left.agent_ready === right.agent_ready &&
     left.requirements_b64 === right.requirements_b64 &&
     JSON.stringify(left.metadata) === JSON.stringify(right.metadata) &&
-    JSON.stringify(left.pr) === JSON.stringify(right.pr);
+    JSON.stringify(left.pr) === JSON.stringify(right.pr) &&
+    left.coordinator_issue_updated_at === right.coordinator_issue_updated_at &&
+    left.coordinator_event_sequence === right.coordinator_event_sequence &&
+    left.coordinator_event_id === right.coordinator_event_id;
 }
 
 function exactCanonicalWorkState(left: CanonicalWorkState, right: CanonicalWorkState): boolean {
@@ -801,18 +834,20 @@ async function createFugueAuthorityVariableAtRevision(
   value: string,
   expectedPublisherSha: string,
 ): Promise<boolean> {
-  await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
-  const created = await createFugueAuthorityVariable(github, name, value);
-  if (!created) return false;
+  const guard = await acquireRecoveryMutationGuard(github, expectedPublisherSha, name, value);
   try {
-    // The repository-variable API cannot predicate the POST on another resource's SHA. Treat the
-    // write as provisional until a post-mutation re-proof succeeds; a stale write is removed before
-    // this call can report a committed Authority witness.
     await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
-    return true;
-  } catch (error) {
-    await deleteAuthorityVariableIfExact(github, name, value);
-    throw error;
+    const created = await createFugueAuthorityVariable(github, name, value);
+    if (!created) return false;
+    try {
+      await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
+      return true;
+    } catch (error) {
+      await deleteAuthorityVariableIfExact(github, name, value);
+      throw error;
+    }
+  } finally {
+    if (guard) await releaseRecoveryMutationGuard(github, guard);
   }
 }
 
@@ -842,6 +877,132 @@ export async function deleteFugueAuthorityVariable(github: FugueGitHub, name: st
   if (!response.ok && response.status !== 404) {
     throw new CanonicalWorkStateIntegrityError(`Unable to delete stale Fugue authority variable ${name} (${response.status}).`);
   }
+}
+
+interface RecoveryMutationGuard {
+  version: 1;
+  publisher_sha: string;
+  target_name: string;
+  target_value: string;
+  source_name?: string;
+  source_value?: string;
+  created_at: string;
+}
+
+function recoveryMutationGuardName(guard: RecoveryMutationGuard): string {
+  const digest = createHash("sha256")
+    .update(`${guard.publisher_sha}\0${guard.source_name ?? ""}\0${guard.target_name}\0${guard.target_value}`, "utf8")
+    .digest("hex").slice(0, 24).toUpperCase();
+  return `${RECOVERY_MUTATION_GUARD_PREFIX}${digest}`;
+}
+
+function parseRecoveryMutationGuard(value: string): RecoveryMutationGuard | undefined {
+  try {
+    const parsed = JSON.parse(value) as Partial<RecoveryMutationGuard>;
+    if (parsed.version !== 1 || typeof parsed.publisher_sha !== "string" ||
+        !/^[0-9a-f]{40}$/i.test(parsed.publisher_sha) || typeof parsed.target_name !== "string" ||
+        typeof parsed.target_value !== "string" || typeof parsed.created_at !== "string") return undefined;
+    if ((parsed.source_name === undefined) !== (parsed.source_value === undefined)) return undefined;
+    return parsed as RecoveryMutationGuard;
+  } catch { return undefined; }
+}
+
+async function activeRecoveryMutationGuards(github: FugueGitHub): Promise<Array<{ name: string; guard: RecoveryMutationGuard }>> {
+  const result: Array<{ name: string; guard: RecoveryMutationGuard }> = [];
+  for (const variable of await listFugueAuthorityVariables(github, RECOVERY_MUTATION_GUARD_PREFIX)) {
+    const guard = parseRecoveryMutationGuard(variable.value);
+    if (!guard) {
+      throw new CanonicalWorkStateIntegrityError(`Protected recovery mutation guard ${variable.name} is malformed.`);
+    }
+    result.push({ name: variable.name, guard });
+  }
+  return result;
+}
+
+async function restoreRecoveryMutationGuardReserve(github: FugueGitHub, guardName: string, guardValue: string): Promise<void> {
+  if (await getFugueAuthorityVariable(github, guardName) !== guardValue) return;
+  if (await getFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_RESERVE) === RECOVERY_RESERVE_VALUE) {
+    await deleteFugueAuthorityVariable(github, guardName);
+    return;
+  }
+  if (await replaceFugueAuthorityVariable(
+    github, guardName, guardValue, RECOVERY_MUTATION_GUARD_RESERVE, RECOVERY_RESERVE_VALUE,
+  )) return;
+  throw new CanonicalWorkStateIntegrityError("Unable to restore the protected recovery mutation guard reserve.");
+}
+
+async function rollbackGuardedRecoveryMutation(
+  github: FugueGitHub,
+  guardName: string,
+  guardValue: string,
+  guard: RecoveryMutationGuard,
+): Promise<void> {
+  if (guard.source_name && guard.source_value !== undefined) {
+    const source = await getFugueAuthorityVariable(github, guard.source_name);
+    const target = await getFugueAuthorityVariable(github, guard.target_name);
+    if (source === undefined && target === guard.target_value) {
+      if (!(await replaceFugueAuthorityVariable(
+        github, guard.target_name, guard.target_value, guard.source_name, guard.source_value,
+      ))) {
+        throw new CanonicalWorkStateIntegrityError(
+          `Unable to recover interrupted protected recovery replacement ${guard.source_name} -> ${guard.target_name}.`,
+        );
+      }
+    } else if (source !== guard.source_value || (target !== undefined && target !== guard.target_value)) {
+      throw new CanonicalWorkStateIntegrityError("Protected recovery mutation guard observed conflicting source/target state.");
+    } else if (target === guard.target_value) {
+      await deleteAuthorityVariableIfExact(github, guard.target_name, guard.target_value);
+    }
+  } else {
+    await deleteAuthorityVariableIfExact(github, guard.target_name, guard.target_value);
+  }
+  await restoreRecoveryMutationGuardReserve(github, guardName, guardValue);
+}
+
+async function recoverInterruptedRecoveryMutation(github: FugueGitHub): Promise<boolean> {
+  const guards = await activeRecoveryMutationGuards(github);
+  if (!guards.length) return false;
+  if (guards.length > 1) throw new CanonicalWorkStateIntegrityError("Multiple protected recovery mutation guards are active.");
+  const { name, guard } = guards[0]!;
+  const value = await getFugueAuthorityVariable(github, name);
+  if (value === undefined) return false;
+  let publisherStillCurrent = true;
+  try { await assertRepositoryDefaultBranchRevision(github, guard.publisher_sha); }
+  catch { publisherStillCurrent = false; }
+  const age = Date.now() - Date.parse(guard.created_at);
+  if (publisherStillCurrent && Number.isFinite(age) && age < RECOVERY_MUTATION_GUARD_GRACE_MS) return true;
+  await rollbackGuardedRecoveryMutation(github, name, value, guard);
+  return false;
+}
+
+async function acquireRecoveryMutationGuard(
+  github: FugueGitHub,
+  publisherSha: string,
+  targetName: string,
+  targetValue: string,
+  sourceName?: string,
+  sourceValue?: string,
+): Promise<{ name: string; value: string } | undefined> {
+  if (await recoverInterruptedRecoveryMutation(github)) return undefined;
+  await assertRepositoryDefaultBranchRevision(github, publisherSha);
+  const guard: RecoveryMutationGuard = {
+    version: 1, publisher_sha: publisherSha, target_name: targetName, target_value: targetValue,
+    ...(sourceName && sourceValue !== undefined ? { source_name: sourceName, source_value: sourceValue } : {}),
+    created_at: new Date().toISOString(),
+  };
+  const value = JSON.stringify(guard);
+  const name = recoveryMutationGuardName(guard);
+  const reserve = await getFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_RESERVE);
+  if (reserve === RECOVERY_RESERVE_VALUE && await replaceFugueAuthorityVariable(
+    github, RECOVERY_MUTATION_GUARD_RESERVE, RECOVERY_RESERVE_VALUE, name, value,
+  )) return { name, value };
+  // Below the hard cap a missing guard reserve can be materialized without consuming recovery data.
+  if (reserve === undefined && await createFugueAuthorityVariable(github, name, value)) return { name, value };
+  return undefined;
+}
+
+async function releaseRecoveryMutationGuard(github: FugueGitHub, token: { name: string; value: string }): Promise<void> {
+  await restoreRecoveryMutationGuardReserve(github, token.name, token.value);
 }
 
 async function rollbackFugueAuthorityVariableReplacement(
@@ -888,40 +1049,57 @@ async function replaceFugueAuthorityVariable(
   targetValue: string,
   expectedPublisherSha?: string,
 ): Promise<boolean> {
+  const guard = expectedPublisherSha
+    ? await acquireRecoveryMutationGuard(github, expectedPublisherSha, targetName, targetValue, sourceName, expectedSourceValue)
+    : undefined;
   if (expectedPublisherSha) await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
-  if (sourceName === targetName) return expectedSourceValue === targetValue;
+  if (sourceName === targetName) {
+    if (guard) await releaseRecoveryMutationGuard(github, guard);
+    return expectedSourceValue === targetValue;
+  }
   const injected = injectedAuthorityVariables(github);
   let replaced = false;
   if (injected) {
-    if (injected.get(targetName) === targetValue) return true;
-    if (injected.has(targetName) || injected.get(sourceName) !== expectedSourceValue) return false;
-    injected.delete(sourceName);
-    injected.set(targetName, targetValue);
-    replaced = true;
+    if (injected.get(targetName) === targetValue) {
+      replaced = true;
+    } else if (injected.has(targetName) || injected.get(sourceName) !== expectedSourceValue) {
+      replaced = false;
+    } else {
+      injected.delete(sourceName);
+      injected.set(targetName, targetValue);
+      replaced = true;
+    }
   } else {
     const target = await getFugueAuthorityVariable(github, targetName);
-    if (target !== undefined) return target === targetValue;
-    if (await getFugueAuthorityVariable(github, sourceName) !== expectedSourceValue) return false;
-    const response = await authorityRequest(github, `/actions/variables/${encodeURIComponent(sourceName)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ name: targetName, value: targetValue }),
-    });
-    if (!response.ok && response.status !== 404 && response.status !== 409 && response.status !== 422) {
-      throw new CanonicalWorkStateIntegrityError(
-        `Unable to atomically replace protected Fugue authority variable ${sourceName} (${response.status}).`,
-      );
+    if (target !== undefined) {
+      replaced = target === targetValue;
+    } else if (await getFugueAuthorityVariable(github, sourceName) !== expectedSourceValue) {
+      replaced = false;
+    } else {
+      const response = await authorityRequest(github, `/actions/variables/${encodeURIComponent(sourceName)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: targetName, value: targetValue }),
+      });
+      if (!response.ok && response.status !== 404 && response.status !== 409 && response.status !== 422) {
+        throw new CanonicalWorkStateIntegrityError(
+          `Unable to atomically replace protected Fugue authority variable ${sourceName} (${response.status}).`,
+        );
+      }
+      replaced = await getFugueAuthorityVariable(github, targetName) === targetValue;
     }
-    replaced = await getFugueAuthorityVariable(github, targetName) === targetValue;
   }
-  if (!replaced || !expectedPublisherSha) return replaced;
+  if (!replaced || !expectedPublisherSha) {
+    if (guard) await releaseRecoveryMutationGuard(github, guard);
+    return replaced;
+  }
   try {
-    // A slot-preserving rename carrying a new witness is also provisional until the exact protected
-    // revision is re-proved after GitHub has applied the PATCH.
     await assertRepositoryDefaultBranchRevision(github, expectedPublisherSha);
     return true;
   } catch (error) {
     await rollbackFugueAuthorityVariableReplacement(github, sourceName, expectedSourceValue, targetName, targetValue);
     throw error;
+  } finally {
+    if (guard) await releaseRecoveryMutationGuard(github, guard);
   }
 }
 
@@ -1095,6 +1273,7 @@ function recoveryReserveName(index: number): string {
 }
 
 async function ensureRecoveryReserveVariables(github: FugueGitHub): Promise<void> {
+  if ((await activeRecoveryMutationGuards(github)).length) return;
   const existing = new Set((await listFugueAuthorityVariables(github, RECOVERY_RESERVE_PREFIX)).map((entry) => entry.name));
   let allCount = (await listFugueAuthorityVariables(github, "")).length;
   for (let index = 0; index < RECOVERY_RESERVE_COUNT; index += 1) {
@@ -1153,6 +1332,9 @@ async function findRecoveryCursor(
   github: FugueGitHub,
   options: RecoveryIdentityOptions,
 ): Promise<{ variableName: string; cursor: RecoveryCursor } | undefined> {
+  if (await recoverInterruptedRecoveryMutation(github)) {
+    throw new DurableProtocolRecoveryPendingError("Protected recovery mutation is still provisional; committed authority remains fenced.");
+  }
   const identity = recoveryOptionsIdentity(options);
   let best: VerifiedRecoveryEntry | undefined;
   const variables = await listFugueAuthorityVariables(github, "FUGUE_D3");
@@ -1446,7 +1628,7 @@ async function consumeRecoveryReserveForAllocation(
 ): Promise<boolean> {
   if (await getFugueAuthorityVariable(github, allocation.name) === allocation.value) return true;
   const reserves = (await listFugueAuthorityVariables(github, RECOVERY_RESERVE_PREFIX))
-    .filter((reserve) => reserve.value === RECOVERY_RESERVE_VALUE)
+    .filter((reserve) => reserve.value === RECOVERY_RESERVE_VALUE && reserve.name !== RECOVERY_MUTATION_GUARD_RESERVE)
     .sort((left, right) => left.name.localeCompare(right.name));
   for (const reserve of reserves) {
     if (await replaceFugueAuthorityVariable(
@@ -1515,6 +1697,7 @@ export async function compactFugueRecoveryAuthorityVariables(
   preserveIdentity?: string,
   _reserveSlots = 0,
 ): Promise<void> {
+  if (await recoverInterruptedRecoveryMutation(github)) return;
   await ensureRecoveryReserveVariables(github);
   for (let attempt = 0; attempt < RECOVERY_COMPACTION_RETRY_LIMIT; attempt += 1) {
     const variables = await listFugueAuthorityVariables(github, "FUGUE_D3");

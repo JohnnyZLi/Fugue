@@ -145,3 +145,8 @@ No additional handoff packet is required.
 ## Canonical work-spec identity
 
 Leader, Worker, and QA sessions use the exact work-spec digest carried by current Fugue evaluation/review-start evidence. The digest is computed by the repository's single canonical work-spec normalization/hash function; reviewers do not invent a parallel digest. D3 receipt comments remain presentation hints and must never be used to choose authority over the durable record ordering.
+
+
+### Durable review and final-mutation recovery
+
+Current review-start/QA verdicts and explicit Human control-plane acknowledgement are protected d3 records; their GitHub comments/statuses are repairable mirrors. Canonical work state also carries the immutable Coordinator issue revision identity, so Human event replay is ordered by issue revision/sequence/event ID rather than work-state publication time. Final Authority-variable recovery writes are fenced while provisional so concurrent compaction/reserve maintenance cannot preserve a stale-base witness during rollback or crash recovery. A protected attempt-1 Integration failure observed before custom run-start evidence is sealed terminal against its exact durable request/run instead of becoming an unstarted retry.

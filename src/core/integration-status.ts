@@ -592,7 +592,7 @@ export async function publishIntegrationRecord(
 ): Promise<IntegrationRecord> {
   const current = await getCurrentIntegrationRecord(github, record.identity);
   if (current && sameIntegrationRecord(current, record)) {
-    if (current.run || current.terminal) await releaseIntegrationAuthorityVariable(github, current);
+    if (current.terminal) await releaseIntegrationAuthorityVariable(github, current);
     return current;
   }
   if (current && current.terminal && current.terminal.state !== "aborted") {
@@ -623,7 +623,7 @@ export async function publishIntegrationRecord(
     authorityOrder: normalized.created_at,
   });
   await replaceIntegrationLocator(github, normalized);
-  if (normalized.run || normalized.terminal) await releaseIntegrationAuthorityVariable(github, normalized);
+  if (normalized.terminal) await releaseIntegrationAuthorityVariable(github, normalized);
   return normalized;
 }
 
@@ -792,10 +792,36 @@ export async function bindIntegrationRun(
   if (!evidence || evidence.run_id !== runId) {
     throw new Error(`Integration run ${runId} does not match the one-use protected dispatch evidence for request ${requestId}.`);
   }
-  return publishIntegrationRecord(github, {
+  const bound = await publishIntegrationRecord(github, {
     ...current,
     run: integrationRunBindingFromEvidence(github, evidence),
     created_at: new Date().toISOString(),
+  });
+  await releaseIntegrationAuthorityVariable(github, bound);
+  return bound;
+}
+
+export async function bindDispatchedIntegrationRun(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+  requestId: string,
+  runId: number,
+  htmlUrl: string,
+  createdAt = new Date().toISOString(),
+): Promise<IntegrationRecord> {
+  if (!Number.isInteger(runId) || runId <= 0 || !htmlUrl) throw new Error("Protected Integration dispatch did not return a valid run identity.");
+  const current = await getCurrentIntegrationRecord(github, snapshot.identity);
+  if (!current || current.request.request_id !== requestId || current.terminal || !current.dispatch) {
+    throw new Error(`Integration run ${runId} does not match an active authorized durable request ${requestId}.`);
+  }
+  if (current.run) {
+    if (current.run.id !== runId) throw new Error(`Integration request ${requestId} is already bound to protected run ${current.run.id}.`);
+    return current;
+  }
+  return publishIntegrationRecord(github, {
+    ...current,
+    run: { id: runId, attempt: 1, created_at: createdAt, html_url: htmlUrl },
+    created_at: createdAt,
   });
 }
 
@@ -834,6 +860,7 @@ async function getIntegrationWorkflowRunForBinding(
 function workflowRun(run: WorkflowRunRecord): IntegrationWorkflowRun {
   return { id: run.id, status: run.status, conclusion: run.conclusion, htmlUrl: run.html_url, createdAt: run.created_at ?? "", attempt: 1 };
 }
+
 
 function matchesIntegrationRunIdentity(run: WorkflowRunRecord, request: IntegrationRequest, requestCreated: number): boolean {
   const runCreated = Date.parse(run.created_at ?? "");

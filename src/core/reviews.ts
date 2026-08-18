@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { FugueGitHub } from "./github.js";
 import {
   createAttestationId,
@@ -14,6 +15,7 @@ import { captureEvaluation, sameEvaluationIdentity, type EvaluationSnapshot } fr
 import { FUGUE_CLI_VERSION } from "./protocol.js";
 import { createProtocolComment, isTrustedProtocolComment } from "./provenance.js";
 import { resolveReviewActivity, type ReviewActivity } from "./review-activity.js";
+import { publishDurableProtocolRecord, recoverDurableProtocolRecord } from "./state.js";
 
 export interface CompleteReviewOptions {
   verdict: "approved" | "changes_requested" | "error";
@@ -54,6 +56,7 @@ export async function beginReview(
     created_at: new Date().toISOString(),
   });
 
+  await publishReviewAuthority(github, snapshot, session);
   const comment = await createProtocolComment(
     github,
     prNumber,
@@ -122,6 +125,7 @@ export async function completeReview(
     throw new Error("QA summary contains a reserved Fugue protocol marker.");
   }
   const summary = summaryText ? `\n\n${summaryText}` : "";
+  await publishReviewAuthority(github, snapshot, attestation);
   const comment = await createProtocolComment(
     github,
     prNumber,
@@ -154,39 +158,92 @@ export async function currentReviewActivities(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
 ): Promise<Map<QaRole, ReviewActivity>> {
+  const activities = new Map<QaRole, ReviewActivity>();
+  const unresolved: QaRole[] = [];
+  for (const role of QA_ROLES) {
+    const durable = await recoverReviewAuthority(github, snapshot, role);
+    if (durable?.kind === "qa") {
+      activities.set(role, resolveReviewActivity([], [durable]));
+    } else if (durable?.kind === "review_start") {
+      activities.set(role, resolveReviewActivity([durable], []));
+    } else {
+      unresolved.push(role);
+    }
+  }
+  if (!unresolved.length) return activities;
+
   const { owner, repo } = github.repository;
   const comments = await github.octokit.paginate(github.octokit.rest.issues.listComments, {
-    owner,
-    repo,
-    issue_number: snapshot.pr.number,
-    per_page: 100,
+    owner, repo, issue_number: snapshot.pr.number, per_page: 100,
   });
-
   const sessions = new Map<QaRole, ReviewStart[]>();
   const attestations = new Map<QaRole, QaAttestation[]>();
-  for (const role of QA_ROLES) {
-    sessions.set(role, []);
-    attestations.set(role, []);
-  }
-
+  for (const role of unresolved) { sessions.set(role, []); attestations.set(role, []); }
   for (const comment of comments) {
     if (!(await isTrustedProtocolComment(github, comment))) continue;
     let value: ReturnType<typeof parseAttestation>;
-    try {
-      value = parseAttestation(comment.body ?? "");
-    } catch {
-      continue;
-    }
+    try { value = parseAttestation(comment.body ?? ""); } catch { continue; }
     if (!value || !sameEvaluationIdentity(value.identity, snapshot.identity)) continue;
+    if (value.kind !== "review_start" && value.kind !== "qa") continue;
+    if (!unresolved.includes(value.role)) continue;
     if (value.kind === "review_start") sessions.get(value.role)?.push(value);
     if (value.kind === "qa") attestations.get(value.role)?.push(value);
   }
-
-  const activities = new Map<QaRole, ReviewActivity>();
-  for (const role of QA_ROLES) {
-    activities.set(role, resolveReviewActivity(sessions.get(role) ?? [], attestations.get(role) ?? []));
+  for (const role of unresolved) {
+    const migrated = resolveReviewActivity(sessions.get(role) ?? [], attestations.get(role) ?? []);
+    const canonical = migrated.completed ?? migrated.active;
+    if (canonical) await publishReviewAuthority(github, snapshot, canonical);
+    activities.set(role, migrated);
   }
   return activities;
+}
+
+function reviewIdentityToken(snapshot: EvaluationSnapshot): string {
+  return createHash("sha256").update(JSON.stringify(snapshot.identity), "utf8").digest("hex").slice(0, 16);
+}
+
+function reviewAuthorityScope(snapshot: EvaluationSnapshot, role: QaRole): string {
+  return `review/${snapshot.identity.prNumber}/${role}/${reviewIdentityToken(snapshot)}`;
+}
+
+function reviewAuthorityOrder(value: ReviewStart | QaAttestation): string {
+  return `review-v1:${value.kind === "qa" ? "1" : "0"}:${value.created_at}`;
+}
+
+async function publishReviewAuthority(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+  value: ReviewStart | QaAttestation,
+): Promise<void> {
+  await publishDurableProtocolRecord(github, {
+    storageSha: snapshot.identity.headSha,
+    publisherSha: snapshot.identity.baseSha,
+    scope: reviewAuthorityScope(snapshot, value.role),
+    unsignedBody: `${serializeAttestation(value)}\n\nFUGUE REVIEW EVIDENCE — CANONICAL`,
+    publicationTimestamp: Date.parse(value.created_at),
+    authorityOrder: reviewAuthorityOrder(value),
+  });
+}
+
+async function recoverReviewAuthority(
+  github: FugueGitHub,
+  snapshot: EvaluationSnapshot,
+  role: QaRole,
+): Promise<ReviewStart | QaAttestation | undefined> {
+  const recovered = await recoverDurableProtocolRecord(github, {
+    storageSha: snapshot.identity.headSha,
+    publisherSha: snapshot.identity.baseSha,
+    scope: reviewAuthorityScope(snapshot, role),
+    issueNumber: snapshot.pr.number,
+    parse: (body) => {
+      const value = parseAttestation(body);
+      return value?.kind === "review_start" || value?.kind === "qa" ? value : null;
+    },
+    timestamp: (value) => Date.parse(value.created_at),
+    order: reviewAuthorityOrder,
+    validate: (value) => value.role === role && sameEvaluationIdentity(value.identity, snapshot.identity),
+  });
+  return recovered.record?.value;
 }
 
 export async function currentQaAttestations(
