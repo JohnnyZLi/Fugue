@@ -21,6 +21,7 @@ import {
   createProtocolComment,
   isTrustedProtocolComment,
   isTrustedProtocolWorkflowRun,
+  readRepositoryDefaultBranchIdentity,
   signProtocolBody,
   verifyProtocolPublicationBodyAtRevision,
 } from "./provenance.js";
@@ -189,8 +190,6 @@ export async function claimExactIntegrationCommit(
   if (winner.kind === "integration_identity_lost_commit") {
     throw new Error(`Integration request ${context.requestId} already committed terminal identity_lost serialization.`);
   }
-  // B, S, and the synchronous return-details path can observe the same run at different clocks.
-  // Once one of them wins C, every other exact writer converges on that winner's canonical timestamp.
   if (winner.run_id !== candidate.runId || winner.html_url !== candidate.htmlUrl) {
     throw new Error(`Integration request ${context.requestId} already committed protected run ${winner.run_id}.`);
   }
@@ -267,6 +266,8 @@ const INTEGRATION_RECEIPT = "Fugue-Authority-Receipt: integration-d3";
 export const INTEGRATION_REQUEST_RECOVERY_GRACE_MS = 10 * 60 * 1000;
 const INTEGRATION_DISPATCH_ANCHOR_START = "<!-- fugue-integration-dispatch-anchor";
 const INTEGRATION_RUN_START = "<!-- fugue-integration-run-start";
+const HISTORICAL_INTEGRATION_IDENTITY_LOST_START = "<!-- fugue-historical-integration-identity-lost";
+const DURABLE_RECOVERY_START = "<!-- fugue-durable-recovery";
 const PROTOCOL_END = "-->";
 const INTEGRATION_ELECTION_PREFIX = "FUGUE_INT_E_";
 const INTEGRATION_ANCHOR_PREFIX = "FUGUE_INT_A_";
@@ -355,8 +356,20 @@ const historicalIntegrationBindingWitnessSchema = z.object({
   html_url: z.string().min(1),
 });
 
+const historicalIntegrationIdentityLostTombstoneSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("historical_integration_identity_lost"),
+  request: integrationRequestSchema,
+  dispatch: integrationDispatchAuthorizationSchema,
+  commit: integrationIdentityLostCommitSchema,
+  historical_record_digest: z.string().regex(/^sha256:[0-9a-f]{64}$/i),
+  recovery_base_sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  created_at: z.string().min(1),
+});
+
 type HistoricalIntegrationFence = z.infer<typeof historicalIntegrationFenceSchema>;
 type HistoricalIntegrationBindingWitness = z.infer<typeof historicalIntegrationBindingWitnessSchema>;
+type HistoricalIntegrationIdentityLostTombstone = z.infer<typeof historicalIntegrationIdentityLostTombstoneSchema>;
 
 type HistoricalIntegrationHintKind = "anchor" | "fence" | "binding" | "start" | "commit_exact" | "commit_identity_lost";
 interface HistoricalIntegrationAuthorityHint {
@@ -375,6 +388,11 @@ interface HistoricalIntegrationAuthorityHint {
   fenceDigest?: string;
 }
 
+interface RecoveredHistoricalIntegrationRecord {
+  record: IntegrationRecord;
+  body: string;
+}
+
 const HISTORICAL_INTEGRATION_CLEANUP_BUDGET = 16;
 const HISTORICAL_INTEGRATION_RECOVERY_SLICES = 4;
 
@@ -387,11 +405,6 @@ export interface CleanupAwareRunStartContext {
   runAttempt: number;
 }
 
-/**
- * Cleanup may remove every request-local transient after exact L is durable. The still-starting
- * workflow may treat that as benign only when the durable d3 record itself proves the exact request,
- * canonical evaluation, run ID, and attempt. Any mismatch remains fail-closed.
- */
 export function matchesCleanupAwareDurableRunStartBinding(
   record: IntegrationRecord,
   context: CleanupAwareRunStartContext,
@@ -430,6 +443,29 @@ function parseIntegrationEvidence<T>(body: string, marker: string, schema: z.Zod
 
 function integrationRequestToken(requestId: string): string {
   return createHash("sha256").update(requestId, "utf8").digest("hex").slice(0, 16).toUpperCase();
+}
+
+function historicalIdentityLostScope(request: IntegrationRequest): string {
+  return `int-hist/${request.identity.prNumber}/${integrationRequestToken(request.request_id)}`;
+}
+
+function historicalRecordDigest(body: string): string {
+  return `sha256:${createHash("sha256").update(body, "utf8").digest("hex")}`;
+}
+
+function serializeHistoricalIntegrationIdentityLostTombstone(value: HistoricalIntegrationIdentityLostTombstone): string {
+  return `${encodeIntegrationEvidence(
+    HISTORICAL_INTEGRATION_IDENTITY_LOST_START,
+    historicalIntegrationIdentityLostTombstoneSchema.parse(value),
+  )}\n\nHISTORICAL INTEGRATION — IDENTITY LOST`;
+}
+
+function parseHistoricalIntegrationIdentityLostTombstone(body: string): HistoricalIntegrationIdentityLostTombstone | null {
+  return parseIntegrationEvidence(
+    body,
+    HISTORICAL_INTEGRATION_IDENTITY_LOST_START,
+    historicalIntegrationIdentityLostTombstoneSchema,
+  );
 }
 
 function integrationIdentityToken(request: IntegrationRequest): string {
@@ -682,9 +718,6 @@ export async function getIntegrationRunStartEvidence(
 
 export async function releaseIntegrationAuthorityVariable(github: FugueGitHub, record: IntegrationRecord): Promise<void> {
   if (!record.dispatch) return;
-  // Keep C as the request-local tombstone until every producer prerequisite/evidence slot is gone.
-  // A crash during cleanup therefore remains fail-closed; the next reconciliation repeats the same
-  // request-specific deletes and removes C last without reopening or rebinding the request.
   await deleteFugueAuthorityVariable(github, integrationDispatchFenceName(record.request.request_id));
   await deleteFugueAuthorityVariable(github, record.dispatch.anchor_name);
   await deleteFugueAuthorityVariable(github, integrationBindingWitnessName(record.request.request_id));
@@ -781,7 +814,7 @@ function historicalHintKey(hint: HistoricalIntegrationAuthorityHint): string {
 async function recoverHistoricalIntegrationRecord(
   github: FugueGitHub,
   hint: HistoricalIntegrationAuthorityHint,
-): Promise<IntegrationRecord | undefined> {
+): Promise<RecoveredHistoricalIntegrationRecord | undefined> {
   for (let attempt = 0; attempt < HISTORICAL_INTEGRATION_RECOVERY_SLICES; attempt += 1) {
     try {
       const recovered = await recoverDurableProtocolRecord(github, {
@@ -798,7 +831,7 @@ async function recoverHistoricalIntegrationRecord(
           sameEvaluationIdentity(value.identity, value.request.identity) &&
           value.request.request_id === hint.requestId && value.dispatch?.anchor_name === hint.anchorName,
       });
-      if (recovered.record) return recovered.record.value;
+      if (recovered.record) return { record: recovered.record.value, body: recovered.record.body };
       if (recovered.exhausted) return undefined;
     } catch (error) {
       if (!(error instanceof DurableProtocolRecoveryPendingError)) throw error;
@@ -828,6 +861,171 @@ function historicalBindingMatchesRequest(
     witness.html_url === `https://github.com/${github.repository.fullName}/actions/runs/${witness.run_id}`;
 }
 
+function recoveryAuthorityBodies(value: string): string[] {
+  if (value.trimStart().startsWith(DURABLE_RECOVERY_START)) return [value];
+  try {
+    const parsed = JSON.parse(value) as { kind?: unknown; entries?: unknown };
+    if (parsed.kind !== "durable_recovery_pack" || !Array.isArray(parsed.entries)) return [];
+    return parsed.entries.filter((entry): entry is string => typeof entry === "string");
+  } catch {
+    return [];
+  }
+}
+
+function recoveryPublisherHint(body: string, storageSha: string, scope: string): string | undefined {
+  const start = body.indexOf(DURABLE_RECOVERY_START);
+  if (start < 0) return undefined;
+  const end = body.indexOf(PROTOCOL_END, start + DURABLE_RECOVERY_START.length);
+  if (end < 0) return undefined;
+  const block = body.slice(start + DURABLE_RECOVERY_START.length, end).trim();
+  const payload = block.match(/^version: 1\npayload: ([A-Za-z0-9_-]+)$/)?.[1];
+  if (!payload) return undefined;
+  try {
+    const cursor = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
+      scope?: unknown; storage_sha?: unknown; publisher_sha?: unknown; commit_witness?: unknown;
+    };
+    if (cursor.commit_witness !== true || cursor.scope !== scope ||
+        typeof cursor.storage_sha !== "string" || cursor.storage_sha.toLowerCase() !== storageSha.toLowerCase() ||
+        typeof cursor.publisher_sha !== "string" || !/^[0-9a-f]{40}$/i.test(cursor.publisher_sha)) return undefined;
+    return cursor.publisher_sha.toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
+function historicalIdentityLostTombstoneMatches(
+  tombstone: HistoricalIntegrationIdentityLostTombstone,
+  historical: RecoveredHistoricalIntegrationRecord,
+  publisherSha: string,
+): boolean {
+  const { record, body } = historical;
+  if (!record.dispatch) return false;
+  const commit = tombstone.commit;
+  return tombstone.recovery_base_sha.toLowerCase() === publisherSha.toLowerCase() &&
+    tombstone.historical_record_digest.toLowerCase() === historicalRecordDigest(body).toLowerCase() &&
+    JSON.stringify(tombstone.request) === JSON.stringify(record.request) &&
+    JSON.stringify(tombstone.dispatch) === JSON.stringify(record.dispatch) &&
+    sameEvaluationIdentity(tombstone.request.identity, record.identity) &&
+    commit.request_id === record.request.request_id && commit.pr_number === record.identity.prNumber &&
+    commit.head_sha.toLowerCase() === record.identity.headSha.toLowerCase() &&
+    commit.base_sha.toLowerCase() === record.identity.baseSha.toLowerCase() &&
+    commit.anchor_name === record.dispatch.anchor_name && commit.attempt === 1 &&
+    Number.isFinite(Date.parse(commit.boundary_created_at)) && Number.isFinite(Date.parse(commit.created_at)) &&
+    Number.isFinite(Date.parse(tombstone.created_at)) && Date.parse(tombstone.created_at) >= Date.parse(commit.created_at);
+}
+
+async function recoverHistoricalIdentityLostTombstone(
+  github: FugueGitHub,
+  historical: RecoveredHistoricalIntegrationRecord,
+): Promise<HistoricalIntegrationIdentityLostTombstone | undefined> {
+  const scope = historicalIdentityLostScope(historical.record.request);
+  const publishers = new Set<string>();
+  for (const variable of await listFugueAuthorityVariables(github, "FUGUE_D3")) {
+    for (const body of recoveryAuthorityBodies(variable.value)) {
+      const publisher = recoveryPublisherHint(body, historical.record.identity.headSha, scope);
+      if (publisher) publishers.add(publisher);
+    }
+  }
+
+  let winner: HistoricalIntegrationIdentityLostTombstone | undefined;
+  let pending = false;
+  for (const publisherSha of [...publishers].sort()) {
+    try {
+      const recovered = await recoverDurableProtocolRecord(github, {
+        storageSha: historical.record.identity.headSha,
+        publisherSha,
+        scope,
+        issueNumber: historical.record.identity.prNumber,
+        parse: parseHistoricalIntegrationIdentityLostTombstone,
+        timestamp: (value) => Date.parse(value.created_at),
+        order: (value) => value.created_at,
+        validate: (value) => historicalIdentityLostTombstoneMatches(value, historical, publisherSha),
+      });
+      if (!recovered.record) continue;
+      const candidate = recovered.record.value;
+      if (winner && JSON.stringify(winner.commit) !== JSON.stringify(candidate.commit)) {
+        throw new Error(`Historical Integration request ${historical.record.request.request_id} has conflicting protected identity_lost tombstones.`);
+      }
+      winner = candidate;
+    } catch (error) {
+      if (error instanceof DurableProtocolRecoveryPendingError) {
+        pending = true;
+        continue;
+      }
+      throw error;
+    }
+  }
+  if (winner) return winner;
+  if (pending) {
+    throw new DurableProtocolRecoveryPendingError(
+      `Historical Integration identity_lost tombstone for ${historical.record.request.request_id} exists but is not currently verifiable.`,
+    );
+  }
+  return undefined;
+}
+
+async function ensureHistoricalIdentityLostTombstone(
+  github: FugueGitHub,
+  historical: RecoveredHistoricalIntegrationRecord,
+  commit: IntegrationIdentityLostCommit,
+  now: number,
+): Promise<HistoricalIntegrationIdentityLostTombstone | undefined> {
+  const existing = await recoverHistoricalIdentityLostTombstone(github, historical);
+  if (existing) return existing;
+  const protectedBase = await readRepositoryDefaultBranchIdentity(github);
+  const createdAt = new Date(Math.max(Date.now(), now, Date.parse(commit.created_at))).toISOString();
+  const tombstone = historicalIntegrationIdentityLostTombstoneSchema.parse({
+    version: 1,
+    kind: "historical_integration_identity_lost",
+    request: historical.record.request,
+    dispatch: historical.record.dispatch,
+    commit,
+    historical_record_digest: historicalRecordDigest(historical.body),
+    recovery_base_sha: protectedBase.sha,
+    created_at: createdAt,
+  });
+  try {
+    const committedBody = await publishDurableProtocolRecord(github, {
+      storageSha: historical.record.identity.headSha,
+      publisherSha: protectedBase.sha,
+      scope: historicalIdentityLostScope(historical.record.request),
+      unsignedBody: serializeHistoricalIntegrationIdentityLostTombstone(tombstone),
+      publicationTimestamp: Date.parse(createdAt),
+      authorityOrder: createdAt,
+    });
+    const committed = parseHistoricalIntegrationIdentityLostTombstone(committedBody);
+    if (!committed || !historicalIdentityLostTombstoneMatches(committed, historical, protectedBase.sha)) {
+      throw new Error(`Historical Integration identity_lost tombstone for ${historical.record.request.request_id} returned another identity.`);
+    }
+    return committed;
+  } catch (error) {
+    const latest = await readRepositoryDefaultBranchIdentity(github);
+    if (latest.sha.toLowerCase() !== protectedBase.sha.toLowerCase()) return undefined;
+    throw error;
+  }
+}
+
+function historicalIdentityLostRecord(
+  historical: RecoveredHistoricalIntegrationRecord,
+  tombstone: HistoricalIntegrationIdentityLostTombstone,
+): IntegrationRecord {
+  const commit = tombstone.commit;
+  return {
+    ...historical.record,
+    dispatch_started_at: historical.record.dispatch_started_at ?? commit.boundary_created_at,
+    run: null,
+    terminal: {
+      state: "identity_lost",
+      attempt: 1,
+      boundary_created_at: commit.boundary_created_at,
+      fence_digest: commit.fence_digest,
+      detail: "Historical protected may-have-dispatched request is sealed by current-revision identity_lost tombstone authority; it can never retry or bind a later run.",
+      created_at: commit.created_at,
+    },
+    created_at: commit.created_at,
+  };
+}
+
 async function historicalTransientMatchesRecord(
   github: FugueGitHub,
   name: string,
@@ -846,7 +1044,6 @@ async function historicalTransientMatchesRecord(
   if (name === integrationBindingWitnessName(record.request.request_id)) {
     const witness = parseHistoricalJson(value, historicalIntegrationBindingWitnessSchema);
     if (!witness || !historicalBindingMatchesRequest(github, witness, record)) return false;
-    // Durable identity_lost makes any later protected exact B for this request permanently stale.
     return record.terminal?.state === "identity_lost" || Boolean(record.run && witness.run_id === record.run.id);
   }
   if (name === integrationRunStartVariableName(record.request)) {
@@ -862,7 +1059,6 @@ async function historicalTransientMatchesRecord(
     try {
       if (!(await verifyProtocolPublicationBodyAtRevision(github, value, record.identity.baseSha, timestamp))) return false;
     } catch { return false; }
-    // Durable identity_lost likewise makes a delayed protected S inert regardless of its numeric run.
     return record.terminal?.state === "identity_lost" || Boolean(record.run && start.run_id === record.run.id);
   }
   if (name === integrationCommitVariableName(record.request.request_id)) {
@@ -884,8 +1080,6 @@ async function releaseVerifiedHistoricalIntegrationAuthority(
   record: IntegrationRecord,
 ): Promise<void> {
   if (!record.dispatch) return;
-  // C remains last even for superseded identities. Each surviving slot is re-read and independently
-  // validated against the historical d3 record immediately before deletion.
   const names = [
     integrationDispatchFenceName(record.request.request_id),
     record.dispatch.anchor_name,
@@ -923,11 +1117,10 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
     if (budget <= 0) break;
     const group = hints.get(key)!;
     const hint = group[0]!;
-    const record = await recoverHistoricalIntegrationRecord(github, hint);
-    if (!record) continue;
+    const historical = await recoverHistoricalIntegrationRecord(github, hint);
+    if (!historical) continue;
+    const record = historical.record;
     const currentIdentity = currentIdentities.find((candidate) => sameEvaluationIdentity(candidate, record.identity));
-    // Any request under the current exact evaluation remains request-local lifecycle state, even if
-    // its d3 recovery is temporarily pending. Only evaluation drift can make a request historical.
     if (currentIdentity) continue;
     budget -= 1;
 
@@ -936,9 +1129,19 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
       continue;
     }
 
+    const existingTombstone = await recoverHistoricalIdentityLostTombstone(github, historical);
+    if (existingTombstone) {
+      await releaseVerifiedHistoricalIntegrationAuthority(github, historicalIdentityLostRecord(historical, existingTombstone));
+      continue;
+    }
+
     const exactHints = group.filter((candidate) => candidate.runId !== undefined);
     const exactRunIds = new Set(exactHints.map((candidate) => candidate.runId!));
     if (exactRunIds.size === 1) {
+      const protectedBase = await readRepositoryDefaultBranchIdentity(github);
+      // Exact L already won request-local authority. Never replace it with identity_lost, and never
+      // weaken the revision fence by trying to mint fresh d3 under a now-obsolete protected base.
+      if (protectedBase.sha.toLowerCase() !== record.identity.baseSha.toLowerCase()) continue;
       const exact = exactHints.find((candidate) => candidate.runId !== undefined)!;
       const expectedUrl = `https://github.com/${github.repository.fullName}/actions/runs/${exact.runId}`;
       if ((!exact.htmlUrl || exact.htmlUrl === expectedUrl) && exact.createdAt && Number.isFinite(Date.parse(exact.createdAt))) {
@@ -955,47 +1158,47 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
     }
     if (exactRunIds.size > 1) continue;
 
-    const committedLost = group.find((candidate) => candidate.kind === "commit_identity_lost");
+    const context = integrationCommitContext(record)!;
+    let commit = await readIntegrationCommit(github, context);
+    if (commit?.kind === "integration_exact_run_commit") continue;
     const fenceHint = group.find((candidate) => candidate.kind === "fence");
-    if (committedLost?.boundaryCreatedAt && committedLost.fenceDigest && committedLost.createdAt) {
-      await publishIntegrationRecord(github, {
-        ...record,
-        dispatch_started_at: record.dispatch_started_at ?? committedLost.boundaryCreatedAt,
-        run: null,
-        terminal: {
-          state: "identity_lost", attempt: 1,
-          boundary_created_at: committedLost.boundaryCreatedAt,
-          fence_digest: committedLost.fenceDigest,
-          detail: "Historical protected may-have-dispatched request completed identity_lost serialization before evaluation drift; scavenging finishes the durable terminal transition without retry.",
-          created_at: committedLost.createdAt,
-        },
-        created_at: committedLost.createdAt,
-      });
-      continue;
-    }
-    if (fenceHint?.createdAt && now - Date.parse(fenceHint.createdAt) >= INTEGRATION_REQUEST_RECOVERY_GRACE_MS) {
+    if (!commit && fenceHint?.createdAt && now - Date.parse(fenceHint.createdAt) >= INTEGRATION_REQUEST_RECOVERY_GRACE_MS) {
       const fence = parseHistoricalJson(fenceHint.raw, historicalIntegrationFenceSchema);
       if (fence && historicalFenceMatchesRecord(fence, record)) {
         const terminalAt = new Date(Math.max(now, Date.parse(record.created_at) + 1)).toISOString();
+        commit = await claimIdentityLostIntegrationCommit(github, context, {
+          boundaryCreatedAt: fence.created_at,
+          fenceDigest: `sha256:${createHash("sha256").update(fenceHint.raw, "utf8").digest("hex")}`,
+          createdAt: terminalAt,
+        });
+      }
+    }
+
+    if (commit?.kind === "integration_exact_run_commit") continue;
+    if (commit?.kind === "integration_identity_lost_commit") {
+      const protectedBase = await readRepositoryDefaultBranchIdentity(github);
+      if (protectedBase.sha.toLowerCase() === record.identity.baseSha.toLowerCase()) {
         await publishIntegrationRecord(github, {
           ...record,
-          dispatch_started_at: record.dispatch_started_at ?? fence.created_at,
+          dispatch_started_at: record.dispatch_started_at ?? commit.boundary_created_at,
           run: null,
           terminal: {
             state: "identity_lost", attempt: 1,
-            boundary_created_at: fence.created_at,
-            fence_digest: `sha256:${createHash("sha256").update(fenceHint.raw, "utf8").digest("hex")}`,
-            detail: "Historical protected may-have-dispatched request lost every exact run witness across evaluation drift; it is terminal identity_lost and cannot become retryable transport.",
-            created_at: terminalAt,
+            boundary_created_at: commit.boundary_created_at,
+            fence_digest: commit.fence_digest,
+            detail: "Historical protected may-have-dispatched request completed identity_lost serialization before evaluation drift; scavenging finishes the durable terminal transition without retry.",
+            created_at: commit.created_at,
           },
-          created_at: terminalAt,
+          created_at: commit.created_at,
         });
+        continue;
       }
+      const tombstone = await ensureHistoricalIdentityLostTombstone(github, historical, commit, now);
+      if (!tombstone) continue;
+      await releaseVerifiedHistoricalIntegrationAuthority(github, historicalIdentityLostRecord(historical, tombstone));
       continue;
     }
 
-    // No protected may-have-dispatched fence/serialized exception and no exact witness: the obsolete
-    // evaluation can release verified pre-POST transients, but scavenging never publishes retryable aborted.
     if (!record.dispatch_started_at && !fenceHint) await releaseVerifiedHistoricalIntegrationAuthority(github, record);
   }
 }
@@ -1041,8 +1244,6 @@ export async function reclaimOrphanIntegrationAuthorityVariables(
       throw error;
     }
     if (current?.request.request_id === anchor.request.request_id) {
-      // Election is redundant once request d3 exists, but defer A/F/B/S/C to exact current/historical
-      // lifecycle cleanup so C-last ordering and per-slot validation are preserved.
       await deleteFugueAuthorityVariable(github, variable.name);
       continue;
     }
@@ -1074,7 +1275,6 @@ function integrationRunBindingFromEvidence(github: FugueGitHub, evidence: Integr
   };
 }
 
-/** Deployment, Deployment Status, workflow-run list pagination, and public correlation fields are presentation only. */
 export async function currentIntegrationState(
   github: FugueGitHub,
   snapshot: EvaluationSnapshot,
@@ -1484,7 +1684,6 @@ export async function ensureIntegrationDispatch(
     ? afterElection?.request.request_id === predecessorRequestId && afterElection.terminal?.state === "aborted"
     : afterElection === undefined;
   if (afterElection && afterElection.request.request_id === authorized.request.request_id && !afterElection.terminal) {
-    // A concurrent protected writer already published the elected request; converge on it.
   } else if (!predecessorStillCurrent) {
     await abandonIntegrationAuthorization(github, authorized.electionName, authorized.request);
     return afterElection ? { request: afterElection.request, dispatch: false } : { dispatch: false };
@@ -1521,8 +1720,6 @@ async function revalidateExactIntegrationCommit(
 ): Promise<IntegrationRecord> {
   const latest = await getCurrentIntegrationRecord(github, snapshot.identity);
   if (!latest || latest.request.request_id !== requestId || latest.terminal || !latest.dispatch) {
-    // If cleanup already removed C, a stale binder may have recreated it after reading old state.
-    // Its post-C durable re-read makes that writer inert and reclaims only the redundant C slot.
     await releaseIntegrationCommit(github, requestId);
     throw new Error(`Integration run ${runId} ceased to be active after exact-run serialization for request ${requestId}.`);
   }
