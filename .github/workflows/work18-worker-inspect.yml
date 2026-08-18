@@ -6,7 +6,7 @@ on:
       - bootstrap/fugue-work18-validation
 
 permissions:
-  contents: read
+  contents: write
   issues: read
 
 jobs:
@@ -24,64 +24,76 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Compute current canonical work-spec digest
+      - name: Inspect current assignment and affected code
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          node <<'NODE'
-          const crypto = require('node:crypto');
-          const YAML = require('yaml');
-          const issue = await fetch('https://api.github.com/repos/JohnnyZLi/Fugue/issues/18', {
-            headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' }
-          }).then(async r => { if (!r.ok) throw new Error(`${r.status} ${await r.text()}`); return r.json(); });
-          const body = issue.body ?? '';
-          const START = '<!-- fugue-work\n';
-          const END = '-->';
-          const start = body.lastIndexOf(START);
-          const end = body.indexOf(END, start + START.length);
-          if (start < 0 || end < 0 || body.slice(end + END.length).trim()) throw new Error('bad work metadata block');
-          const metadata = YAML.parse(body.slice(start + START.length, end).trim());
-          const requirements = body.slice(0, start)
-            .replace(/\r\n?/g, '\n').split('\n').map(line => line.replace(/[ \t]+$/g, '')).join('\n').trim();
-          const canonical = { requirements, spec: metadata.spec };
-          const sortValue = value => Array.isArray(value) ? value.map(sortValue) : value && typeof value === 'object'
-            ? Object.fromEntries(Object.entries(value).sort(([a],[b]) => a.localeCompare(b)).map(([k,v]) => [k, sortValue(v)])) : value;
-          const stable = JSON.stringify(sortValue(canonical));
-          const digest = `sha256:${crypto.createHash('sha256').update(stable, 'utf8').digest('hex')}`;
-          console.log(`ISSUE_UPDATED_AT=${issue.updated_at}`);
-          console.log(`CURRENT_WORK_SPEC_DIGEST=${digest}`);
-          console.log(`WORKER_ID=${metadata.execution?.worker_id}`);
-          console.log(`WORKER_BRANCH=${metadata.execution?.branch}`);
-          console.log(`OWNED_HAS_STATE_AUTHORITY_TEST=${metadata.spec?.ownership?.owned?.includes('tests/state-authority-blockers.test.ts')}`);
-          NODE
-      - name: Print affected implementation contexts
+          {
+            node <<'NODE'
+            const crypto = require('node:crypto');
+            const YAML = require('yaml');
+            const issue = await fetch('https://api.github.com/repos/JohnnyZLi/Fugue/issues/18', {
+              headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' }
+            }).then(async r => { if (!r.ok) throw new Error(`${r.status} ${await r.text()}`); return r.json(); });
+            const body = issue.body ?? '';
+            const START = '<!-- fugue-work\n';
+            const END = '-->';
+            const start = body.lastIndexOf(START);
+            const end = body.indexOf(END, start + START.length);
+            if (start < 0 || end < 0 || body.slice(end + END.length).trim()) throw new Error('bad work metadata block');
+            const metadata = YAML.parse(body.slice(start + START.length, end).trim());
+            const requirements = body.slice(0, start)
+              .replace(/\r\n?/g, '\n').split('\n').map(line => line.replace(/[ \t]+$/g, '')).join('\n').trim();
+            const canonical = { requirements, spec: metadata.spec };
+            const sortValue = value => Array.isArray(value) ? value.map(sortValue) : value && typeof value === 'object'
+              ? Object.fromEntries(Object.entries(value).sort(([a],[b]) => a.localeCompare(b)).map(([k,v]) => [k, sortValue(v)])) : value;
+            const stable = JSON.stringify(sortValue(canonical));
+            const digest = `sha256:${crypto.createHash('sha256').update(stable, 'utf8').digest('hex')}`;
+            console.log(`ISSUE_UPDATED_AT=${issue.updated_at}`);
+            console.log(`CURRENT_WORK_SPEC_DIGEST=${digest}`);
+            console.log(`WORKER_ID=${metadata.execution?.worker_id}`);
+            console.log(`WORKER_BRANCH=${metadata.execution?.branch}`);
+            console.log(`OWNED_HAS_STATE_AUTHORITY_TEST=${metadata.spec?.ownership?.owned?.includes('tests/state-authority-blockers.test.ts')}`);
+            NODE
+            python3 <<'PY'
+            from pathlib import Path
+            targets = {
+              'src/core/reconcile.ts': ['ingestCoordinatorIssueEvent'],
+              'src/core/state.ts': ['createFugueAuthorityVariableAtRevision','replaceFugueAuthorityVariable','allocateRecoveryVariable','writeRecoveryCursor'],
+              'src/core/reviews.ts': ['beginReview','findCurrentReview','reviewStart'],
+              'src/core/submissions.ts': ['processCurrentSubmissions','processReviewSubmission','processHumanSubmission'],
+              'src/core/gates.ts': ['human','review'],
+              'src/core/integration-status.ts': ['sealIntegrationWorkflowRunEvent','ensureIntegrationDispatch','getIntegrationRunStartEvidence'],
+              '.github/workflows/fugue-integration.yml': ['Commit protected Integration run-start evidence','fugue-authority'],
+              'tests/state-authority-blockers.test.ts': ['describe','it('],
+              'tests/reconcile.test.ts': ['Coordinator','review-start','acknowledgement'],
+            }
+            for path, needles in targets.items():
+              p=Path(path)
+              if not p.exists(): continue
+              lines=p.read_text().splitlines()
+              print(f'===== {path} =====')
+              seen=[]
+              for needle in needles:
+                hits=[i for i,l in enumerate(lines) if needle in l]
+                for i in hits[:6]:
+                  lo=max(0,i-30); hi=min(len(lines),i+90)
+                  if any(not (hi<=a or lo>=b) for a,b in seen): continue
+                  seen.append((lo,hi))
+                  print(f'--- around line {i+1}: {needle} ---')
+                  for n in range(lo,hi): print(f'{n+1:05d}: {lines[n]}')
+            PY
+          } | tee /tmp/work18-inspect-output.txt
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/fugue-work18-validation
+          path: recorder
+      - name: Record inspection
         run: |
-          python3 <<'PY'
-          from pathlib import Path
-          targets = {
-            'src/core/reconcile.ts': ['ingestCoordinatorIssueEvent'],
-            'src/core/state.ts': ['createFugueAuthorityVariableAtRevision','replaceFugueAuthorityVariable','allocateRecoveryVariable','writeRecoveryCursor'],
-            'src/core/reviews.ts': ['beginReview','findCurrentReview','load'],
-            'src/core/submissions.ts': ['processCurrentSubmissions','processReviewSubmission','processHumanSubmission'],
-            'src/core/gates.ts': ['human','review'],
-            'src/core/integration-status.ts': ['sealIntegrationWorkflowRunEvent','ensureIntegrationDispatch','getIntegrationRunStartEvidence'],
-            '.github/workflows/fugue-integration.yml': ['Commit protected Integration run-start evidence','fugue-authority'],
-            'tests/state-authority-blockers.test.ts': ['describe','it('],
-            'tests/reconcile.test.ts': ['Coordinator','review-start','acknowledgement'],
-          }
-          for path, needles in targets.items():
-            p=Path(path)
-            if not p.exists(): continue
-            lines=p.read_text().splitlines()
-            print(f'===== {path} =====')
-            seen=[]
-            for needle in needles:
-              hits=[i for i,l in enumerate(lines) if needle in l]
-              for i in hits[:4]:
-                lo=max(0,i-25); hi=min(len(lines),i+70)
-                key=(lo,hi)
-                if any(not (hi<=a or lo>=b) for a,b in seen): continue
-                seen.append(key)
-                print(f'--- around line {i+1}: {needle} ---')
-                for n in range(lo,hi): print(f'{n+1:05d}: {lines[n]}')
-          PY
+          cp /tmp/work18-inspect-output.txt recorder/.github/work18-worker-inspect-output.txt
+          cd recorder
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-worker-inspect-output.txt
+          git commit -m 'Record work-18 worker inspection' || exit 0
+          git push origin HEAD:bootstrap/fugue-work18-validation
