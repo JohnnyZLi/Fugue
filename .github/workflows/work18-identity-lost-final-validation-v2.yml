@@ -17,28 +17,34 @@ jobs:
         with:
           ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fetch-depth: 1
-      - name: Fix monotonic crash-simulation authority order if needed
+      - name: Apply post-C durable revalidation if needed
         run: |
           set -euo pipefail
-          if grep -q 'const terminalAt = "2026-08-17T14:11:00.000Z";' tests/state-authority-blockers.test.ts; then
+          if ! grep -q 'async function revalidateExactIntegrationCommit' src/core/integration-status.ts; then
             python <<'PY'
           from pathlib import Path
-          path = Path('tests/state-authority-blockers.test.ts')
+
+          path = Path('src/core/integration-status.ts')
           text = path.read_text()
-          old = '      const terminalAt = "2026-08-17T14:11:00.000Z";'
-          new = '      const terminalAt = new Date(Date.parse(record.created_at) + 11 * 60 * 1000).toISOString();'
-          if old not in text:
-              raise SystemExit('terminal timestamp line not found')
-          path.write_text(text.replace(old, new, 1))
+          start = text.index('export async function bindIntegrationRun(')
+          end = text.index('export async function getBoundIntegrationWorkflowRun(', start)
+          replacement = '''async function revalidateExactIntegrationCommit(\n  github: FugueGitHub,\n  snapshot: EvaluationSnapshot,\n  requestId: string,\n  runId: number,\n): Promise<IntegrationRecord> {\n  const latest = await getCurrentIntegrationRecord(github, snapshot.identity);\n  if (!latest || latest.request.request_id !== requestId || latest.terminal || !latest.dispatch) {\n    // If cleanup already removed C, a stale binder may have recreated it after reading old state.\n    // Its post-C durable re-read makes that writer inert and reclaims only the redundant C slot.\n    await releaseIntegrationCommit(github, requestId);\n    throw new Error(`Integration run ${runId} ceased to be active after exact-run serialization for request ${requestId}.`);\n  }\n  if (latest.run && latest.run.id !== runId) {\n    await releaseIntegrationCommit(github, requestId);\n    throw new Error(`Integration request ${requestId} is already bound to protected run ${latest.run.id}.`);\n  }\n  return latest;\n}\n\nexport async function bindIntegrationRun(\n  github: FugueGitHub,\n  snapshot: EvaluationSnapshot,\n  requestId: string,\n  runId: number,\n): Promise<IntegrationRecord> {\n  const current = await getCurrentIntegrationRecord(github, snapshot.identity);\n  if (!current || current.request.request_id !== requestId || current.terminal || !current.dispatch) {\n    throw new Error(`Integration run ${runId} does not match an active durable request ${requestId}.`);\n  }\n  if (current.run) {\n    if (current.run.id !== runId) throw new Error(`Integration request ${requestId} is already bound to protected run ${current.run.id}.`);\n    await releaseIntegrationAuthorityVariable(github, current);\n    return current;\n  }\n  const evidence = await getIntegrationRunStartEvidence(github, current);\n  if (!evidence || evidence.run_id !== runId) {\n    throw new Error(`Integration run ${runId} does not match the one-use protected dispatch evidence for request ${requestId}.`);\n  }\n  const proposed = integrationRunBindingFromEvidence(github, evidence);\n  const winner = await claimExactIntegrationCommit(github, integrationCommitContext(current)!, {\n    runId: proposed.id,\n    createdAt: proposed.created_at,\n    htmlUrl: proposed.html_url,\n  });\n  const binding = integrationRunBindingFromCommit(github, winner);\n  const latest = await revalidateExactIntegrationCommit(github, snapshot, requestId, binding.id);\n  if (latest.run) {\n    await releaseIntegrationAuthorityVariable(github, latest);\n    return latest;\n  }\n  const bound = await publishIntegrationRecord(github, {\n    ...latest,\n    dispatch_started_at: latest.dispatch_started_at ?? binding.created_at,\n    run: binding,\n    created_at: binding.created_at,\n  });\n  await releaseIntegrationAuthorityVariable(github, bound);\n  return bound;\n}\n\nexport async function bindDispatchedIntegrationRun(\n  github: FugueGitHub,\n  snapshot: EvaluationSnapshot,\n  requestId: string,\n  runId: number,\n  htmlUrl: string,\n  createdAt = new Date().toISOString(),\n): Promise<IntegrationRecord> {\n  if (!Number.isInteger(runId) || runId <= 0 || !htmlUrl) throw new Error("Protected Integration dispatch did not return a valid run identity.");\n  const current = await getCurrentIntegrationRecord(github, snapshot.identity);\n  if (!current || current.request.request_id !== requestId || current.terminal || !current.dispatch) {\n    throw new Error(`Integration run ${runId} does not match an active authorized durable request ${requestId}.`);\n  }\n  if (current.run) {\n    if (current.run.id !== runId) throw new Error(`Integration request ${requestId} is already bound to protected run ${current.run.id}.`);\n    return current;\n  }\n  const winner = await claimExactIntegrationCommit(github, integrationCommitContext(current)!, { runId, createdAt, htmlUrl });\n  const binding = integrationRunBindingFromCommit(github, winner);\n  const latest = await revalidateExactIntegrationCommit(github, snapshot, requestId, binding.id);\n  if (latest.run) {\n    await releaseIntegrationAuthorityVariable(github, latest);\n    return latest;\n  }\n  const bound = await publishIntegrationRecord(github, {\n    ...latest,\n    dispatch_started_at: latest.dispatch_started_at ?? binding.created_at,\n    run: binding,\n    created_at: binding.created_at,\n  });\n  await releaseIntegrationAuthorityVariable(github, bound);\n  return bound;\n}\n\n'''
+          path.write_text(text[:start] + replacement + text[end:])
+
+          blockers = Path('tests/state-authority-blockers.test.ts')
+          tests = blockers.read_text()
+          tests = tests.replace('/^FUGUE_INT_[ABFS]_/.test(name)', '/^FUGUE_INT_[ABCFS]_/.test(name)')
+          blockers.write_text(tests)
           PY
             git config user.name Johnny
             git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-            git add tests/state-authority-blockers.test.ts
+            git add src/core/integration-status.ts tests/state-authority-blockers.test.ts
             git diff --cached --check
-            git commit -m 'Keep terminal cleanup crash simulation monotonic'
+            git commit -m 'Revalidate exact-run binding after serialization'
             git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fi
-          grep -q 'Date.parse(record.created_at) + 11 \* 60 \* 1000' tests/state-authority-blockers.test.ts
+          grep -q 'async function revalidateExactIntegrationCommit' src/core/integration-status.ts
+          grep -q 'FUGUE_INT_\[ABCFS\]' tests/state-authority-blockers.test.ts || grep -q '\[ABCFS\]' tests/state-authority-blockers.test.ts
       - id: head
         name: Resolve final exact head
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
