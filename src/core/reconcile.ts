@@ -137,6 +137,20 @@ export function protectedIntegrationRecoveryDecision(input: {
   return { kind: "pending" };
 }
 
+function currentIntegrationEvaluationIdentities(state: Awaited<ReturnType<typeof reconstructState>>) {
+  return state.works.flatMap((work) => work.pr ? [{
+    prNumber: work.pr.number,
+    headSha: work.pr.headSha,
+    baseBranch: state.policy.identity.baseBranch,
+    baseSha: state.policy.identity.baseSha,
+    policyDigest: state.policy.identity.policyDigest,
+    protocolVersion: state.policy.identity.protocolVersion,
+    issueNumber: work.issueNumber,
+    workId: work.metadata.work_id,
+    workSpecDigest: work.workSpecDigest,
+  }] : []);
+}
+
 export async function reconcileRepository(
   github: FugueGitHub,
   options: ReconcileOptions = {},
@@ -166,6 +180,7 @@ export async function reconcileRepository(
   await repairCanonicalMirrors(github, policy);
 
   const initial = await reconstructState(github);
+  await reclaimOrphanIntegrationAuthorityVariables(github, Date.now(), currentIntegrationEvaluationIdentities(initial));
   const selected = selectWorks(initial.works, options);
   const issueNumbers = selected.map((work) => work.issueNumber);
 
@@ -184,6 +199,7 @@ export async function reconcileWork(github: FugueGitHub, issueNumber: number): P
     await repairCanonicalMirrors(github, policy, issueNumber);
 
     const state = await reconstructState(github);
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.now(), currentIntegrationEvaluationIdentities(state));
     const work = state.works.find((candidate) => candidate.issueNumber === issueNumber);
     if (!work) return;
 

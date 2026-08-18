@@ -9,7 +9,7 @@ import { completeReview, currentReviewActivities } from "../src/core/reviews.js"
 import { hasCurrentHumanAcknowledgement, processCurrentSubmissions } from "../src/core/submissions.js";
 import { verifyHumanControlPlanePrerequisite } from "../src/core/integration.js";
 import { createIntegrationRecord, createIntegrationRequest, serializeIntegrationRecord, type IntegrationRecord } from "../src/core/integration-plan.js";
-import { authorizeIntegrationDispatch, bindDispatchedIntegrationRun, ensureIntegrationDispatch, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, integrationCommitVariableName, integrationDispatchRunToken, integrationRunStartVariableName, publishIntegrationRecord, sealIntegrationWorkflowRunEvent } from "../src/core/integration-status.js";
+import { authorizeIntegrationDispatch, bindDispatchedIntegrationRun, ensureIntegrationDispatch, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, integrationCommitVariableName, integrationDispatchRunToken, integrationRunStartVariableName, publishIntegrationRecord, reclaimOrphanIntegrationAuthorityVariables, sealIntegrationWorkflowRunEvent, serializeIntegrationRunStartEvidence } from "../src/core/integration-status.js";
 import { claimIdentityLostIntegrationCommit } from "../src/core/integration-status.js";
 import { humanControlPlaneAttestationSchema, qaAttestationSchema, reviewStartSchema, serializeAttestation } from "../src/core/attestations.js";
 import {
@@ -1429,4 +1429,221 @@ describe("durable known-run cleanup restart completeness", () => {
       expect(transient).toEqual([]);
     });
   }, 30000);
+});
+
+
+describe("historical Integration transient cleanup across evaluation drift", () => {
+  async function seedHistoricalBound(github: TestGithub, prNumber: number, headChar: string, nonce: string, runId: number) {
+    const identity = {
+      prNumber, headSha: headChar.length === 1 ? headChar.repeat(40) : headChar, baseBranch: "main", baseSha: BASE,
+      policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 7000 + prNumber,
+      workId: `work-${7000 + prNumber}`, workSpecDigest: `sha256:spec-${headChar}`,
+    };
+    const snapshot = { identity, pr: { number: prNumber } } as unknown as EvaluationSnapshot;
+    const request = createIntegrationRequest(identity, "2026-08-18T18:00:00.000Z", nonce);
+    const secret = runId.toString(16).padStart(64, "0");
+    const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-18T18:00:00.000Z", secret);
+    const anchorBody = github.__authorityVariables.get(authorized.authorization.anchor_name)!;
+    await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, {
+      dispatch: authorized.authorization, createdAt: "2026-08-18T18:00:00.000Z",
+    }));
+    github.__authorityVariables.delete(authorized.electionName);
+    const htmlUrl = `https://github.com/JohnnyZLi/Fugue/actions/runs/${runId}`;
+    const record = await bindDispatchedIntegrationRun(github, snapshot, request.request_id, runId, htmlUrl, "2026-08-18T18:00:02.000Z");
+    return { identity, snapshot, request, secret, anchorBody, record, runId, htmlUrl };
+  }
+
+  async function installValidHistoricalTransients(github: TestGithub, seeded: Awaited<ReturnType<typeof seedHistoricalBound>>) {
+    const { record, request, secret, runId, htmlUrl, anchorBody } = seeded;
+    const suffix = createHash("sha256").update(request.request_id, "utf8").digest("hex").slice(0, 32).toUpperCase();
+    const runToken = integrationDispatchRunToken(request.request_id, secret);
+    const fenceName = `FUGUE_INT_F_${suffix}`;
+    const bindingName = `FUGUE_INT_B_${suffix}`;
+    const commitName = integrationCommitVariableName(request.request_id);
+    const startName = integrationRunStartVariableName(request);
+    const fence = {
+      version: 1, kind: "integration_dispatch_fence", request_id: request.request_id,
+      pr_number: record.identity.prNumber, head_sha: record.identity.headSha, base_sha: record.identity.baseSha,
+      anchor_name: record.dispatch!.anchor_name, secret_digest: record.dispatch!.secret_digest,
+      run_token: runToken, authority_actor_id: 123456, created_at: "2026-08-18T18:00:01.000Z",
+    };
+    const binding = {
+      version: 1, kind: "integration_binding_witness", request_id: request.request_id,
+      pr_number: record.identity.prNumber, head_sha: record.identity.headSha, base_sha: record.identity.baseSha,
+      anchor_name: record.dispatch!.anchor_name, run_token: runToken, authority_actor_id: 123456,
+      run_id: runId, run_attempt: 1, run_created_at: record.run!.created_at, html_url: htmlUrl,
+    };
+    const start = await signProtocolBody(github, serializeIntegrationRunStartEvidence({
+      version: 1, kind: "integration_run_start", request_id: request.request_id,
+      pr_number: record.identity.prNumber, head_sha: record.identity.headSha, base_sha: record.identity.baseSha,
+      secret_digest: record.dispatch!.secret_digest, anchor_name: record.dispatch!.anchor_name,
+      run_id: runId, run_attempt: 1, created_at: record.run!.created_at,
+    }));
+    const commit = {
+      version: 1, kind: "integration_exact_run_commit", request_id: request.request_id,
+      pr_number: record.identity.prNumber, head_sha: record.identity.headSha, base_sha: record.identity.baseSha,
+      anchor_name: record.dispatch!.anchor_name, run_id: runId, run_attempt: 1,
+      run_created_at: record.run!.created_at, html_url: htmlUrl,
+    };
+    github.__authorityVariables.set(fenceName, JSON.stringify(fence));
+    github.__authorityVariables.set(record.dispatch!.anchor_name, anchorBody);
+    github.__authorityVariables.set(bindingName, JSON.stringify(binding));
+    github.__authorityVariables.set(startName, start);
+    github.__authorityVariables.set(commitName, JSON.stringify(commit));
+    return [fenceName, record.dispatch!.anchor_name, bindingName, startName, commitName];
+  }
+
+  function currentIdentityFor(seeded: Awaited<ReturnType<typeof seedHistoricalBound>>, headChar: string) {
+    return { ...seeded.identity, headSha: headChar.length === 1 ? headChar.repeat(40) : headChar, workSpecDigest: `sha256:spec-${headChar}` };
+  }
+
+  it("reclaims every H1 F/A/B/S-before-C crash cut after H2 drift while preserving H1 exact L", async () => {
+    await withHostedAuthority(async () => {
+      const github = makeGithub();
+      const seeded = await seedHistoricalBound(github, 501, "1", "0000000000000501", 120501);
+      const h2 = currentIdentityFor(seeded, "2");
+      const before = await getCurrentIntegrationRecord(github, seeded.identity);
+      for (const deletedPrefix of [1, 2, 3, 4]) {
+        const names = await installValidHistoricalTransients(github, seeded);
+        for (let index = 0; index < deletedPrefix; index += 1) github.__authorityVariables.delete(names[index]!);
+        github.__workflowRuns.splice(0);
+        github.__comments.splice(0);
+        await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T18:30:00.000Z"), [h2]);
+        expect(names.filter((name) => github.__authorityVariables.has(name))).toEqual([]);
+        expect(await getCurrentIntegrationRecord(github, seeded.identity)).toEqual(before);
+      }
+    });
+  });
+
+  it("reclaims historical known-L failure/error/cancelled-as-error and preserves terminal evidence", async () => {
+    await withHostedAuthority(async () => {
+      for (const [offset, state, detail] of [
+        [0, "failure", "known attempt failed"],
+        [1, "error", "known attempt errored"],
+        [2, "error", "Protected attempt 1 completed cancelled; a known attempt is never retryable transport."],
+      ] as const) {
+        const github = makeGithub();
+        const seeded = await seedHistoricalBound(github, 510 + offset, "3", `000000000000051${offset}`, 120510 + offset);
+        const terminalAt = "2026-08-18T18:10:00.000Z";
+        const terminal = await publishIntegrationRecord(github, {
+          ...seeded.record, terminal: { state, detail, created_at: terminalAt }, created_at: terminalAt,
+        });
+        const names = await installValidHistoricalTransients(github, { ...seeded, record: terminal });
+        github.__workflowRuns.splice(0);
+        github.__comments.splice(0);
+        github.__statuses.splice(0);
+        await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T18:30:00.000Z"), [currentIdentityFor(seeded, "4")]);
+        expect(names.filter((name) => github.__authorityVariables.has(name))).toEqual([]);
+        const durable = await getCurrentIntegrationRecord(github, seeded.identity);
+        expect(durable?.run?.id).toBe(seeded.runId);
+        expect(durable?.terminal).toEqual(terminal.terminal);
+      }
+    });
+  });
+
+  it("reclaims historical identity_lost without creating retryable aborted", async () => {
+    await withHostedAuthority(async () => {
+      const github = makeGithub();
+      const identity = {
+        prNumber: 520, headSha: "5".repeat(40), baseBranch: "main", baseSha: BASE,
+        policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 7520,
+        workId: "work-7520", workSpecDigest: "sha256:spec-5",
+      };
+      const snapshot = { identity, pr: { number: 520 } } as unknown as EvaluationSnapshot;
+      const request = createIntegrationRequest(identity, "2026-08-18T18:00:00.000Z", "0000000000000520");
+      const secret = "5".repeat(64);
+      const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-18T18:00:00.000Z", secret);
+      const anchorBody = github.__authorityVariables.get(authorized.authorization.anchor_name)!;
+      const record = await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, { dispatch: authorized.authorization, createdAt: "2026-08-18T18:00:00.000Z" }));
+      github.__authorityVariables.delete(authorized.electionName);
+      const fence = installProtectedFence(github, record, secret, "2026-08-18T18:00:01.000Z");
+      await recoverExistingProtectedIntegration(github, snapshot, Date.parse("2026-08-18T18:11:00.000Z"));
+      const terminal = (await getCurrentIntegrationRecord(github, identity))!;
+      expect(terminal.terminal?.state).toBe("identity_lost");
+      github.__authorityVariables.set(fence.names.fence, fence.raw);
+      github.__authorityVariables.set(authorized.authorization.anchor_name, anchorBody);
+      github.__authorityVariables.set(integrationCommitVariableName(request.request_id), JSON.stringify({
+        version: 1, kind: "integration_identity_lost_commit", request_id: request.request_id,
+        pr_number: identity.prNumber, head_sha: identity.headSha, base_sha: identity.baseSha,
+        anchor_name: authorized.authorization.anchor_name, attempt: 1,
+        boundary_created_at: terminal.terminal!.state === "identity_lost" ? terminal.terminal.boundary_created_at : "",
+        fence_digest: terminal.terminal!.state === "identity_lost" ? terminal.terminal.fence_digest : "",
+        created_at: terminal.terminal!.created_at,
+      }));
+      const names = [fence.names.fence, authorized.authorization.anchor_name, integrationCommitVariableName(request.request_id)];
+      await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T18:30:00.000Z"), [{ ...identity, headSha: "6".repeat(40), workSpecDigest: "sha256:spec-6" }]);
+      expect(names.filter((name) => github.__authorityVariables.has(name))).toEqual([]);
+      expect((await getCurrentIntegrationRecord(github, identity))?.terminal?.state).toBe("identity_lost");
+    });
+  });
+
+  it("reclaims late historical B/S on the next pass and never touches the current active request", async () => {
+    await withHostedAuthority(async () => {
+      const github = makeGithub();
+      const h1 = await seedHistoricalBound(github, 530, "7", "0000000000000530", 120530);
+      const h2Identity = currentIdentityFor(h1, "8");
+      const h2Request = createIntegrationRequest(h2Identity, "2026-08-18T18:20:00.000Z", "1000000000000530");
+      const h2Secret = "8".repeat(64);
+      const h2Authorized = await authorizeIntegrationDispatch(github, h2Request, "2026-08-18T18:20:00.000Z", h2Secret);
+      const h2Record = await publishIntegrationRecord(github, createIntegrationRecord(h2Authorized.request, { dispatch: h2Authorized.authorization, createdAt: "2026-08-18T18:20:00.000Z" }));
+      github.__authorityVariables.delete(h2Authorized.electionName);
+      const h2Anchor = h2Record.dispatch!.anchor_name;
+      const h2AnchorValue = github.__authorityVariables.get(h2Anchor);
+
+      await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T18:30:00.000Z"), [h2Identity]);
+      const h1Names = await installValidHistoricalTransients(github, h1);
+      // Simulate cleanup already passed F/A and a delayed B/S producer appearing afterward.
+      github.__authorityVariables.delete(h1Names[0]!);
+      github.__authorityVariables.delete(h1Names[1]!);
+      github.__authorityVariables.delete(h1Names[4]!);
+      await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T18:31:00.000Z"), [h2Identity]);
+      expect(github.__authorityVariables.has(h1Names[2]!)).toBe(false);
+      expect(github.__authorityVariables.has(h1Names[3]!)).toBe(false);
+      expect(github.__authorityVariables.get(h2Anchor)).toBe(h2AnchorValue);
+      expect((await getCurrentIntegrationRecord(github, h2Identity))?.request.request_id).toBe(h2Request.request_id);
+    });
+  });
+
+  it("does not exhaust transient capacity across more than 64 interrupted head-drift generations", async () => {
+    await withHostedAuthority(async () => {
+      const github = makeGithub();
+      const currentIdentity = {
+        prNumber: 540, headSha: "f".repeat(40), baseBranch: "main", baseSha: BASE,
+        policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 7540,
+        workId: "work-7540", workSpecDigest: "sha256:spec-current",
+      };
+      for (let index = 0; index < 65; index += 1) {
+        const headChar = index.toString(16).padStart(40, "0");
+        const seeded = await seedHistoricalBound(github, 540, headChar, index.toString(16).padStart(16, "0"), 121000 + index);
+        const names = await installValidHistoricalTransients(github, seeded);
+        github.__authorityVariables.delete(names[0]!);
+        github.__authorityVariables.delete(names[1]!);
+        github.__authorityVariables.delete(names[2]!);
+        await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T19:00:00.000Z") + index, [currentIdentity]);
+        expect(names.filter((name) => github.__authorityVariables.has(name))).toEqual([]);
+      }
+      expect([...github.__authorityVariables.keys()].filter((name) => /^FUGUE_INT_[ABCFS]_/.test(name))).toEqual([]);
+    });
+  }, 30000);
+
+  it("never turns a historical may-have-dispatched ambiguity into retryable aborted during scavenging", async () => {
+    await withHostedAuthority(async () => {
+      const github = makeGithub();
+      const identity = {
+        prNumber: 550, headSha: "9".repeat(40), baseBranch: "main", baseSha: BASE,
+        policyDigest: "sha256:policy", protocolVersion: 1 as const, issueNumber: 7550,
+        workId: "work-7550", workSpecDigest: "sha256:spec-9",
+      };
+      const request = createIntegrationRequest(identity, "2026-08-18T18:00:00.000Z", "0000000000000550");
+      const secret = "9".repeat(64);
+      const authorized = await authorizeIntegrationDispatch(github, request, "2026-08-18T18:00:00.000Z", secret);
+      const record = await publishIntegrationRecord(github, createIntegrationRecord(authorized.request, { dispatch: authorized.authorization, createdAt: "2026-08-18T18:00:00.000Z" }));
+      github.__authorityVariables.delete(authorized.electionName);
+      installProtectedFence(github, record, secret, "2026-08-18T18:00:01.000Z");
+      await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T18:30:00.000Z"), [{ ...identity, headSha: "a".repeat(40), workSpecDigest: "sha256:spec-a" }]);
+      const historical = await getCurrentIntegrationRecord(github, identity);
+      expect(historical?.terminal?.state).toBe("identity_lost");
+      expect(historical?.terminal?.state).not.toBe("aborted");
+    });
+  });
 });

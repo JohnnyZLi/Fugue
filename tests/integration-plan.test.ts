@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { reviewStartSchema } from "../src/core/attestations.js";
 import { describe, expect, it } from "vitest";
@@ -6,11 +7,13 @@ import { canonicalWorkSpecIdentity, workMetadataSchema, workSpecDigestFromRequir
 import { resolveQaRequirements } from "../src/core/qa.js";
 import {
   assertValidationMatchesPlan,
+  createIntegrationRecord,
   createIntegrationRequest,
   integrationPlanSchema,
   integrationValidationSchema,
 } from "../src/core/integration-plan.js";
 import { protectedIntegrationRecoveryDecision } from "../src/core/reconcile.js";
+import { matchesCleanupAwareDurableRunStartBinding } from "../src/core/integration-status.js";
 
 const CURRENT_WORK_SPEC_DIGEST = "sha256:a808b8ae2dbf920771f978dfb3c747d7372b24bf516e3d4d92b0d26afa55a15a";
 
@@ -145,6 +148,41 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow.indexOf("Commit protected Integration run-start evidence")).toBeLessThan(workflow.indexOf("actions/checkout@v4"));
     expect(workflow).toContain('--runtime-sha "$FUGUE_RUNTIME_SHA"');
     expect(workflow).not.toContain('integration-runtime prepare "${{ inputs.pr }}"');
+  });
+
+  it("allows cleanup-aware run-start no-op only for exact durable d3 request/evaluation/run/attempt", () => {
+    const request = createIntegrationRequest(identity, "2026-08-18T18:00:00.000Z", "1234567890abcdef");
+    const anchorName = `FUGUE_INT_A_${String(identity.prNumber).padStart(10, "0")}_${createHash("sha256").update(request.request_id, "utf8").digest("hex").slice(0, 16).toUpperCase()}`;
+    const record = createIntegrationRecord(request, {
+      dispatch: { secret_digest: "1".repeat(64), authorized_at: "2026-08-18T18:00:00.000Z", anchor_name: anchorName },
+      run: { id: 7001, attempt: 1, created_at: "2026-08-18T18:00:01.000Z", html_url: "https://github.com/JohnnyZLi/Fugue/actions/runs/7001" },
+      createdAt: "2026-08-18T18:00:01.000Z",
+    });
+    const context = { requestId: request.request_id, prNumber: identity.prNumber, baseSha: identity.baseSha, anchorName, runId: 7001, runAttempt: 1 };
+    expect(matchesCleanupAwareDurableRunStartBinding(record, context)).toBe(true);
+    expect(matchesCleanupAwareDurableRunStartBinding({ ...record, run: null }, context)).toBe(false);
+    expect(matchesCleanupAwareDurableRunStartBinding(record, { ...context, runId: 7002 })).toBe(false);
+    expect(matchesCleanupAwareDurableRunStartBinding(record, { ...context, requestId: request.request_id.replace(/.$/, "1") })).toBe(false);
+    const wrongEvaluation = { ...record, identity: { ...record.identity, headSha: "f".repeat(40) } } as typeof record;
+    expect(matchesCleanupAwareDurableRunStartBinding(wrongEvaluation, context)).toBe(false);
+    expect(matchesCleanupAwareDurableRunStartBinding(record, { ...context, runAttempt: 2 })).toBe(false);
+  });
+
+  it("uses only committed durable d3 Authority witnesses for cleanup-aware run-start fallback", async () => {
+    const workflow = await readFile(".github/workflows/fugue-integration.yml", "utf8");
+    expect(workflow).toContain("durableExactBindingAfterCleanup");
+    expect(workflow).toContain("FUGUE_D3_");
+    expect(workflow).toContain("FUGUE_D3P_");
+    expect(workflow).toContain("cursor.commit_witness !== true");
+    expect(workflow).toContain("cursor.best_manifest.status_ids.length !== cursor.best_manifest.chunk_count");
+    expect(workflow).toContain("canonicalRequestId !== requestId");
+    expect(workflow).toContain("record.run.id !== runId || record.run.attempt !== runAttempt");
+    expect(workflow).toContain("Protected Integration request anchor is missing without matching durable d3 exact-run authority");
+    expect(workflow).toContain("Protected Integration dispatch fence is missing without matching durable d3 exact-run authority");
+    const runStart = workflow.slice(workflow.indexOf("Commit protected Integration run-start evidence"), workflow.indexOf("- uses: actions/checkout@v4"));
+    expect(runStart).not.toContain("deployments");
+    expect(runStart).not.toContain("workflow-runs");
+    expect(runStart).not.toContain("issues/comments");
   });
 
   it("pins reconciliation to workflow_sha and prevents issue-event pending replacement", async () => {
