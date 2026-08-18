@@ -5,21 +5,84 @@ on:
     branches: [bootstrap/work18-identity-lost-20260818]
 
 jobs:
+  repair:
+    if: contains(github.event.head_commit.message, '[integration-final-v2]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+          fetch-depth: 1
+      - name: Apply minimal specialist interface adaptations
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "d7e95c75361533f93ab04160d18d1e5135ee9a41"
+          python <<'PY'
+          from pathlib import Path
+
+          path = Path('tests/workflow.test.ts')
+          text = path.read_text()
+          old = '''    const cursor = {\n      version: 1,\n      storage_sha: storageSha,\n'''
+          new = '''    const cursor = {\n      version: 1,\n      kind: "durable_recovery",\n      storage_sha: storageSha,\n'''
+          if text.count(old) != 1:
+              raise SystemExit('workflow cursor fixture anchor mismatch')
+          path.write_text(text.replace(old, new, 1))
+
+          path = Path('tests/integration-plan.test.ts')
+          text = path.read_text()
+          old = '''  it("uses only committed durable d3 Authority witnesses for cleanup-aware run-start fallback", async () => {\n    const workflow = await readFile(".github/workflows/fugue-integration.yml", "utf8");\n    expect(workflow).toContain("durableExactBindingAfterCleanup");\n    expect(workflow).toContain("FUGUE_D3_");\n    expect(workflow).toContain("FUGUE_D3P_");\n    expect(workflow).toContain("cursor.commit_witness !== true");\n    expect(workflow).toContain("cursor.best_manifest.status_ids.length !== cursor.best_manifest.chunk_count");\n    expect(workflow).toContain("canonicalRequestId !== requestId");\n    expect(workflow).toContain("record.run.id !== runId || record.run.attempt !== runAttempt");\n    expect(workflow).toContain("Protected Integration request anchor is missing without matching durable d3 exact-run authority");\n    expect(workflow).toContain("Protected Integration dispatch fence is missing without matching durable d3 exact-run authority");\n    const runStart = workflow.slice(workflow.indexOf("Commit protected Integration run-start evidence"), workflow.indexOf("- uses: actions/checkout@v4"));\n    expect(runStart).not.toContain("deployments");\n    expect(runStart).not.toContain("workflow-runs");\n    expect(runStart).not.toContain("issues/comments");\n  });\n'''
+          new = '''  it("uses only the canonical protected d3 reader for cleanup-aware run-start fallback", async () => {\n    const workflow = await readFile(".github/workflows/fugue-integration.yml", "utf8");\n    const cleanupStart = workflow.indexOf("Verify cleanup-aware run-start against canonical d3 authority");\n    const cleanupEnd = workflow.indexOf("- id: prepare", cleanupStart);\n    expect(cleanupStart).toBeGreaterThanOrEqual(0);\n    expect(cleanupEnd).toBeGreaterThan(cleanupStart);\n    const cleanup = workflow.slice(cleanupStart, cleanupEnd);\n    expect(cleanup).toContain("recoverDurableProtocolRecord");\n    expect(cleanup).toContain("matchesCleanupAwareDurableRunStartBinding");\n    expect(cleanup).toContain("listFugueAuthorityVariables(github, 'FUGUE_D3')");\n    expect(cleanup).not.toContain("deployments");\n    expect(cleanup).not.toContain("workflow-runs");\n    expect(cleanup).not.toContain("issues/comments");\n    expect(workflow).toContain("ref: ${{ github.sha }}");\n    expect(workflow).toContain("persist-credentials: false");\n    expect(workflow.indexOf("npm run build")).toBeLessThan(cleanupStart);\n  });\n'''
+          if text.count(old) != 1:
+              raise SystemExit('stale cleanup fallback regression anchor mismatch')
+          path.write_text(text.replace(old, new, 1))
+
+          path = Path('tests/state-authority-blockers.test.ts')
+          text = path.read_text()
+          old = '''  return {\n    ...actual,\n    assertRepositoryDefaultBranchRevision: vi.fn(async (github: FugueGitHub, expected: string) => {\n'''
+          new = '''  return {\n    ...actual,\n    readRepositoryDefaultBranchIdentity: vi.fn(async (github: FugueGitHub) => ({\n      branch: "main",\n      sha: (github as TestGithub).__baseSha,\n    })),\n    assertRepositoryDefaultBranchRevision: vi.fn(async (github: FugueGitHub, expected: string) => {\n'''
+          if text.count(old) != 1:
+              raise SystemExit('provenance mock anchor mismatch')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' 'tests/integration-plan.test.ts' 'tests/state-authority-blockers.test.ts' 'tests/workflow.test.ts' | sort)"
+          test "$changed" = "$expected"
+          ! git diff --name-only | grep -Fx package-lock.json
+          git diff --check
+          npm ci
+          npm run check
+          npm test
+          npm run build
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add tests/integration-plan.test.ts tests/state-authority-blockers.test.ts tests/workflow.test.ts
+          git diff --cached --check
+          git commit -m 'Adapt combined specialist regression interfaces'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+      - id: head
+        name: Resolve final exact head
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   test:
-    if: contains(github.event.head_commit.message, '[integration-final]')
+    needs: repair
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
       GITHUB_TOKEN: ""
       GH_TOKEN: ""
-      EXPECTED_SHA: d7e95c75361533f93ab04160d18d1e5135ee9a41
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: d7e95c75361533f93ab04160d18d1e5135ee9a41
+          ref: ${{ needs.repair.outputs.sha }}
           persist-credentials: false
       - name: Confirm detached exact head and credential isolation
+        env:
+          EXPECTED_SHA: ${{ needs.repair.outputs.sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
@@ -37,8 +100,8 @@ jobs:
       - run: npm run build
 
   record:
-    needs: test
-    if: always() && contains(github.event.head_commit.message, '[integration-final]')
+    needs: [repair, test]
+    if: always() && contains(github.event.head_commit.message, '[integration-final-v2]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -49,9 +112,9 @@ jobs:
       - name: Record exact-head validation
         run: |
           set -euo pipefail
-          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' 'd7e95c75361533f93ab04160d18d1e5135ee9a41' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-integration-final-result.txt
+          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '${{ needs.repair.outputs.sha }}' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-integration-final-result.txt
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
           git add .github/work18-integration-final-result.txt
-          git commit -m 'Record Work18 integration exact-head validation' || exit 0
+          git commit -m 'Record Work18 integration exact-head validation v2' || exit 0
           git push origin HEAD:bootstrap/work18-identity-lost-20260818
