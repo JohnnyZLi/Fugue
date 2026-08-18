@@ -39,6 +39,15 @@ jobs:
           Path('/tmp/work18-cleanup-lifecycle-v1.py').write_text(src)
           PY
           python /tmp/work18-cleanup-lifecycle-v1.py
+          python <<'PY'
+          from pathlib import Path
+          path = Path('tests/state-authority-blockers.test.ts')
+          text = path.read_text()
+          text = text.replace('''prNumber, headSha: headChar.repeat(40), baseBranch: "main", baseSha: BASE,''', '''prNumber, headSha: headChar.length === 1 ? headChar.repeat(40) : headChar, baseBranch: "main", baseSha: BASE,''')
+          text = text.replace('''return { ...seeded.identity, headSha: headChar.repeat(40), workSpecDigest: `sha256:spec-${headChar}` };''', '''return { ...seeded.identity, headSha: headChar.length === 1 ? headChar.repeat(40) : headChar, workSpecDigest: `sha256:spec-${headChar}` };''')
+          text = text.replace('''const headChar = (index % 15).toString(16);''', '''const headChar = index.toString(16).padStart(40, "0");''')
+          path.write_text(text)
+          PY
           changed="$(git diff --name-only | sort)"
           expected="$(printf '%s\n' '.github/workflows/fugue-integration.yml' 'AGENTS.md' 'src/core/integration-status.ts' 'src/core/reconcile.ts' 'tests/integration-plan.test.ts' 'tests/state-authority-blockers.test.ts' | sort)"
           test "$changed" = "$expected"
