@@ -1,0 +1,390 @@
+name: Fugue Integration
+run-name: "Fugue Integration PR #${{ inputs.pr }} ${{ inputs.request_id }} ${{ inputs.run_token }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to integrate
+        required: true
+        type: number
+      request_id:
+        description: Durable Fugue Integration request ID
+        required: true
+        type: string
+      dispatch_secret:
+        description: One-use protected dispatch capability
+        required: true
+        type: string
+      authority_anchor:
+        description: Exact immutable Fugue Authority request anchor
+        required: true
+        type: string
+      run_token:
+        description: Secret-derived one-run correlation token
+        required: true
+        type: string
+
+concurrency:
+  group: fugue-integration-${{ github.repository }}-${{ inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    # SECURITY INVARIANT (external): configure the restrictive default-branch-only deployment
+    # policy before installing the Authority App key. The in-job audit is drift detection only.
+    environment: fugue-authority
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      id-token: write
+      issues: write
+      pull-requests: read
+      statuses: write
+    outputs:
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+    steps:
+      - name: Audit external Fugue Authority environment invariant
+        env:
+          FUGUE_PROTECTED_BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+          const branch = process.env.FUGUE_PROTECTED_BRANCH;
+          if (!branch) throw new Error('Repository default branch is unavailable.');
+          const headers = {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+          };
+          const base = `https://api.github.com/repos/${owner}/${repo}/environments/fugue-authority`;
+          const environmentResponse = await fetch(base, { headers });
+          if (!environmentResponse.ok) {
+            throw new Error(`fugue-authority environment is unavailable (${environmentResponse.status}); authority remains fail-closed.`);
+          }
+          const environment = await environmentResponse.json();
+          const deployment = environment.deployment_branch_policy;
+          if (!deployment || deployment.protected_branches !== false || deployment.custom_branch_policies !== true) {
+            throw new Error('fugue-authority must use an explicit custom deployment branch policy.');
+          }
+          const policiesResponse = await fetch(`${base}/deployment-branch-policies?per_page=100`, { headers });
+          if (!policiesResponse.ok) throw new Error(`Unable to verify fugue-authority branch policy (${policiesResponse.status}).`);
+          const policies = await policiesResponse.json();
+          const names = (policies.branch_policies ?? []).map((policy) => policy.name).sort();
+          if (names.length !== 1 || names[0] !== branch) {
+            throw new Error(`fugue-authority must allow exactly protected branch ${branch}; found ${names.join(', ') || 'none'}.`);
+          }
+          NODE
+      - name: Mint narrow Fugue Authority token
+        id: fugue-authority
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FUGUE_AUTHORITY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FUGUE_AUTHORITY_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-variables: write
+      - name: Commit protected Integration run-start evidence
+        env:
+          FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash, createHmac } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+
+          const repository = process.env.GITHUB_REPOSITORY;
+          const [owner, repo] = repository.split('/');
+          const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          const inputs = event.inputs ?? {};
+          const requestId = String(inputs.request_id ?? '');
+          const prNumber = Number(inputs.pr);
+          const secret = String(inputs.dispatch_secret ?? '');
+          const anchorName = String(inputs.authority_anchor ?? '');
+          const runToken = String(inputs.run_token ?? '');
+          const runId = Number(process.env.GITHUB_RUN_ID);
+          const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
+          const baseSha = process.env.GITHUB_SHA;
+          if (!/^int-[0-9a-f]{16}-[0-9a-f]{16}$/.test(requestId) || !Number.isInteger(prNumber) || prNumber <= 0 ||
+              !/^[0-9a-f]{64}$/i.test(secret) || !/^FUGUE_INT_A_\d{10}_[0-9A-F]{16}$/.test(anchorName) ||
+              !/^[0-9a-f]{24}$/.test(runToken) || !Number.isInteger(runId) || runId <= 0 || runAttempt !== 1 ||
+              !/^[0-9a-f]{40}$/i.test(baseSha)) {
+            throw new Error('Invalid protected Integration dispatch context.');
+          }
+          process.stdout.write('::add-mask::' + secret + '\n');
+          const digest = createHash('sha256').update(secret, 'utf8').digest('hex');
+          const expectedRunToken = createHmac('sha256', Buffer.from(secret, 'hex'))
+            .update(`fugue-integration-run\0${requestId}`, 'utf8').digest('hex').slice(0, 24);
+          if (runToken !== expectedRunToken) throw new Error('Protected Integration run token does not match its one-use dispatch capability.');
+          const requestToken = createHash('sha256').update(requestId, 'utf8').digest('hex').slice(0, 16).toUpperCase();
+          const startName = `FUGUE_INT_S_${String(prNumber).padStart(10, '0')}_${requestToken}`;
+          const apiBase = `https://api.github.com/repos/${owner}/${repo}`;
+          const headers = {
+            Authorization: `Bearer ${process.env.FUGUE_AUTHORITY_TOKEN}`,
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+          };
+          async function request(path, init = {}) {
+            return fetch(`${apiBase}${path}`, { ...init, headers: { ...headers, ...(init.headers ?? {}) } });
+          }
+          async function read(path, allow404 = false) {
+            const response = await request(path);
+            if (allow404 && response.status === 404) return null;
+            const body = await response.text();
+            if (!response.ok) throw new Error(`Fugue Authority API ${response.status} for ${path}: ${body.slice(0, 300)}`);
+            return body ? JSON.parse(body) : {};
+          }
+          function parseBlock(body, marker) {
+            const start = body.indexOf(marker);
+            if (start < 0) return null;
+            const end = body.indexOf('-->', start + marker.length);
+            if (end < 0) throw new Error(`Unterminated ${marker} evidence.`);
+            const block = body.slice(start + marker.length, end).trim();
+            const match = block.match(/^version: 1\npayload: ([A-Za-z0-9_-]+)$/);
+            if (!match) throw new Error(`Malformed ${marker} evidence.`);
+            return JSON.parse(Buffer.from(match[1], 'base64url').toString('utf8'));
+          }
+          function evidenceBody(marker, value, label) {
+            const payload = Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+            return `${marker}\nversion: 1\npayload: ${payload}\n-->\n\n${label}`;
+          }
+
+          const variable = await read(`/actions/variables/${anchorName}`);
+          const anchor = parseBlock(String(variable.value ?? ''), '<!-- fugue-integration-dispatch-anchor');
+          if (!anchor || anchor.kind !== 'integration_dispatch_anchor' || anchor.anchor_name !== anchorName ||
+              anchor.request?.request_id !== requestId || anchor.request?.identity?.prNumber !== prNumber ||
+              anchor.request?.identity?.baseSha !== baseSha || anchor.secret_digest !== digest ||
+              anchor.dispatch_secret !== secret || !/^[0-9a-f]{40}$/i.test(anchor.request?.identity?.headSha ?? '')) {
+            throw new Error('Workflow dispatch does not match its immutable protected Integration request anchor.');
+          }
+
+          const existing = await read(`/actions/variables/${startName}`, true);
+          if (existing) {
+            const winner = parseBlock(String(existing.value ?? ''), '<!-- fugue-integration-run-start');
+            if (winner?.run_id === runId && winner?.run_attempt === 1 && winner?.secret_digest === digest && winner?.anchor_name === anchorName) process.exit(0);
+            throw new Error('Protected Integration dispatch capability was already consumed by another run.');
+          }
+
+          const createdAt = new Date().toISOString();
+          const startEvidence = {
+            version: 1,
+            kind: 'integration_run_start',
+            request_id: requestId,
+            pr_number: prNumber,
+            head_sha: anchor.request.identity.headSha,
+            base_sha: baseSha,
+            secret_digest: digest,
+            anchor_name: anchorName,
+            run_id: runId,
+            run_attempt: 1,
+            created_at: createdAt,
+          };
+          const canonical = evidenceBody('<!-- fugue-integration-run-start', startEvidence, 'INTEGRATION RUN — STARTED');
+          const bodyDigest = createHash('sha256').update(canonical, 'utf8').digest('hex');
+          const audience = `fugue:v1:${repository}:comment:${bodyDigest}`;
+          const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+          oidcUrl.searchParams.set('audience', audience);
+          const oidcResponse = await fetch(oidcUrl, {
+            headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+          });
+          if (!oidcResponse.ok) throw new Error(`Unable to mint protected Integration OIDC proof (${oidcResponse.status}).`);
+          const oidc = await oidcResponse.json();
+          if (typeof oidc.value !== 'string' || !oidc.value) throw new Error('GitHub OIDC response did not contain a token.');
+          const signed = `${canonical}\n\n<!-- fugue-publisher-proof\nversion: 1\ntoken: ${oidc.value}\n-->`;
+          const createResponse = await request('/actions/variables', {
+            method: 'POST',
+            body: JSON.stringify({ name: startName, value: signed }),
+          });
+          if (createResponse.status !== 201 && createResponse.status !== 409 && createResponse.status !== 422) {
+            throw new Error(`Unable to create protected Integration run-start (${createResponse.status}).`);
+          }
+          const committed = await read(`/actions/variables/${startName}`);
+          if (committed.value !== signed) {
+            const winner = parseBlock(String(committed.value ?? ''), '<!-- fugue-integration-run-start');
+            if (winner?.run_id !== runId || winner?.run_attempt !== 1 || winner?.secret_digest !== digest || winner?.anchor_name !== anchorName) {
+              throw new Error('Protected Integration dispatch capability was consumed by another attempt-1 run.');
+            }
+          }
+          NODE
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - id: prepare
+        name: Prepare immutable Integration plan
+        env:
+          FUGUE_PR: ${{ inputs.pr }}
+          FUGUE_REQUEST_ID: ${{ inputs.request_id }}
+          FUGUE_RUNTIME_SHA: ${{ github.sha }}
+          FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node dist/cli.js integration-runtime prepare "$FUGUE_PR"
+          --request-id "$FUGUE_REQUEST_ID"
+          --out "$RUNNER_TEMP/fugue-plan.json"
+          --runtime-sha "$FUGUE_RUNTIME_SHA"
+          --github-output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fugue-plan
+          path: ${{ runner.temp }}/fugue-plan.json
+          if-no-files-found: error
+
+  validate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted Fugue runtime
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: _fugue
+          persist-credentials: false
+      - name: Checkout exact candidate head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+          path: _candidate
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: _fugue/package-lock.json
+      - working-directory: _fugue
+        run: npm ci
+      - working-directory: _fugue
+        run: npm run build
+      - uses: actions/download-artifact@v4
+        with:
+          name: fugue-plan
+          path: _plan
+      - name: Run protected-base validation commands against exact head
+        env:
+          GITHUB_TOKEN: ""
+          GH_TOKEN: ""
+        run: >-
+          node _fugue/dist/cli.js integration-runtime validate
+          --plan _plan/fugue-plan.json
+          --cwd _candidate
+          --out "$RUNNER_TEMP/fugue-validation.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fugue-validation
+          path: ${{ runner.temp }}/fugue-validation.json
+          if-no-files-found: error
+
+  finalize:
+    if: always() && needs.prepare.result == 'success'
+    needs: [prepare, validate]
+    runs-on: ubuntu-latest
+    # SECURITY INVARIANT (external): configure the restrictive default-branch-only deployment
+    # policy before installing the Authority App key. The in-job audit is drift detection only.
+    environment: fugue-authority
+    permissions:
+      actions: write
+      checks: read
+      contents: read
+      id-token: write
+      issues: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: Audit external Fugue Authority environment invariant
+        env:
+          FUGUE_PROTECTED_BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+          const branch = process.env.FUGUE_PROTECTED_BRANCH;
+          if (!branch) throw new Error('Repository default branch is unavailable.');
+          const headers = {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+          };
+          const base = `https://api.github.com/repos/${owner}/${repo}/environments/fugue-authority`;
+          const environmentResponse = await fetch(base, { headers });
+          if (!environmentResponse.ok) {
+            throw new Error(`fugue-authority environment is unavailable (${environmentResponse.status}); authority remains fail-closed.`);
+          }
+          const environment = await environmentResponse.json();
+          const deployment = environment.deployment_branch_policy;
+          if (!deployment || deployment.protected_branches !== false || deployment.custom_branch_policies !== true) {
+            throw new Error('fugue-authority must use an explicit custom deployment branch policy.');
+          }
+          const policiesResponse = await fetch(`${base}/deployment-branch-policies?per_page=100`, { headers });
+          if (!policiesResponse.ok) throw new Error(`Unable to verify fugue-authority branch policy (${policiesResponse.status}).`);
+          const policies = await policiesResponse.json();
+          const names = (policies.branch_policies ?? []).map((policy) => policy.name).sort();
+          if (names.length !== 1 || names[0] !== branch) {
+            throw new Error(`fugue-authority must allow exactly protected branch ${branch}; found ${names.join(', ') || 'none'}.`);
+          }
+          NODE
+      - name: Mint narrow Fugue Authority token
+        id: fugue-authority
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FUGUE_AUTHORITY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FUGUE_AUTHORITY_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-variables: write
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/download-artifact@v4
+        with:
+          name: fugue-plan
+          path: _plan
+      - if: needs.validate.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: fugue-validation
+          path: _validation
+      - name: Finalize successful Integration
+        if: needs.validate.result == 'success'
+        env:
+          FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node dist/cli.js integration-runtime finalize
+          --plan _plan/fugue-plan.json
+          --validation-result success
+          --validation _validation/fugue-validation.json
+      - name: Publish failed candidate validation
+        if: needs.validate.result != 'success'
+        env:
+          FUGUE_VALIDATION_RESULT: ${{ needs.validate.result }}
+          FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node dist/cli.js integration-runtime finalize
+          --plan _plan/fugue-plan.json
+          --validation-result "$FUGUE_VALIDATION_RESULT"
+      - name: Refresh durable Fugue state comment
+        if: always()
+        env:
+          FUGUE_PR: ${{ inputs.pr }}
+          FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node dist/cli.js reconcile --pr "$FUGUE_PR"
