@@ -1,4 +1,4 @@
-name: Work 18 Identity Lost Exact Head Validation v2
+name: Work 18 Ownership Fold Exact Head Validation
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
 
 jobs:
   repair:
-    if: contains(github.event.head_commit.message, '[identity-lost-final-v2]')
+    if: contains(github.event.head_commit.message, '[ownership-fold-v1]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,35 +17,80 @@ jobs:
         with:
           ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
           fetch-depth: 1
-      - name: Add focused delayed-d3 race regressions if needed
+      - name: Fold unassigned Integration implementation and tests
         run: |
           set -euo pipefail
-          if ! grep -q 'delayed d3 exact binding cannot reopen identity_lost' tests/state-authority-blockers.test.ts; then
-            python <<'PY'
+          test "$(git rev-parse HEAD)" = "d90d511d671930837d4bf5a2c8741822cb82670a"
+          python <<'PY'
           from pathlib import Path
-          path = Path('tests/state-authority-blockers.test.ts')
-          text = path.read_text()
-          first = '''      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);\n      expect(github.__authorityVariables.has(protectedFence.names.binding)).toBe(false);\n\n      github.__comments.splice(0);'''
-          first_replacement = '''      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);\n      expect(github.__authorityVariables.has(protectedFence.names.binding)).toBe(false);\n\n      // delayed d3 exact binding cannot reopen identity_lost after terminal cleanup.\n      await expect(bindDispatchedIntegrationRun(\n        github, snapshot, request.request_id, 99003,\n        "https://github.com/JohnnyZLi/Fugue/actions/runs/99003", "2026-08-17T10:20:01.000Z",\n      )).rejects.toThrow(/active authorized durable request/);\n      expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_INT_C_"))).toBe(false);\n      expect((await getCurrentIntegrationRecord(github, identity))?.terminal?.state).toBe("identity_lost");\n\n      github.__comments.splice(0);'''
-          if first not in text:
-              raise SystemExit('identity_lost delayed-d3 insertion point missing')
-          text = text.replace(first, first_replacement, 1)
+          import re
 
-          second = '''      const bound = await getCurrentIntegrationRecord(github, identity);\n      expect(bound?.run).toMatchObject({ id: 99101, attempt: 1, html_url: htmlUrl });\n      expect(bound?.terminal).toBeNull();\n      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);'''
-          second_replacement = '''      const bound = await getCurrentIntegrationRecord(github, identity);\n      expect(bound?.run).toMatchObject({ id: 99101, attempt: 1, html_url: htmlUrl });\n      expect(bound?.terminal).toBeNull();\n\n      // W bound exact L into d3 first; a stale T proposal with run:null can never clear it.\n      const staleTerminalAt = new Date(Date.parse(bound!.created_at) + 1).toISOString();\n      await expect(publishIntegrationRecord(github, {\n        ...(bound!),\n        run: null,\n        terminal: {\n          state: "identity_lost", attempt: 1,\n          boundary_created_at: protectedFence.fence.created_at as string,\n          fence_digest: `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`,\n          detail: "stale terminalizer must not clear exact L", created_at: staleTerminalAt,\n        },\n        created_at: staleTerminalAt,\n      } as IntegrationRecord)).rejects.toThrow(/cannot clear protected run/);\n      expect((await getCurrentIntegrationRecord(github, identity))?.run?.id).toBe(99101);\n      expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_INT_C_"))).toBe(false);\n      expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);'''
-          if second not in text:
-              raise SystemExit('known-L stale-terminal insertion point missing')
-          path.write_text(text.replace(second, second_replacement, 1))
+          status_path = Path('src/core/integration-status.ts')
+          commit_path = Path('src/core/integration-commit.ts')
+          target_test_path = Path('tests/integration-plan.test.ts')
+          source_test_path = Path('tests/integration-terminal-serialization.test.ts')
+          blockers_path = Path('tests/state-authority-blockers.test.ts')
+
+          if not commit_path.exists() or not source_test_path.exists():
+              raise SystemExit('expected unassigned ownership paths are missing')
+
+          status = status_path.read_text()
+          commit_text = commit_path.read_text()
+          body_marker = 'const INTEGRATION_COMMIT_PREFIX = "FUGUE_INT_C_";'
+          if body_marker not in commit_text:
+              raise SystemExit('integration commit body marker missing')
+          commit_body = commit_text[commit_text.index(body_marker):].rstrip() + '\n\n'
+
+          status, count = re.subn(
+              r'import \{\n.*?\} from "\./integration-commit\.js";\n',
+              '',
+              status,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit('integration-status import fold point missing')
+          insertion = 'export type IntegrationState ='
+          if insertion not in status:
+              raise SystemExit('integration-status insertion point missing')
+          status = status.replace(insertion, commit_body + insertion, 1)
+          if 'integration-commit.js' in status:
+              raise SystemExit('integration-status still references deleted module')
+          status_path.write_text(status)
+
+          focused = source_test_path.read_text()
+          focused = focused.replace('import { describe, expect, it } from "vitest";\n', '', 1)
+          focused = focused.replace('../src/core/integration-commit.js', '../src/core/integration-status.js')
+          target = target_test_path.read_text()
+          suite_marker = 'describe("request-local Integration terminal serialization"'
+          if suite_marker in target:
+              raise SystemExit('focused terminal serialization suite already folded')
+          target_test_path.write_text(
+              target.rstrip() + '\n\n// Focused request-local Integration terminal serialization regressions.\n' + focused
+          )
+
+          blockers = blockers_path.read_text()
+          old = 'import { claimIdentityLostIntegrationCommit } from "../src/core/integration-commit.js";'
+          new = 'import { claimIdentityLostIntegrationCommit } from "../src/core/integration-status.js";'
+          if old not in blockers:
+              raise SystemExit('state-authority integration-commit import missing')
+          blockers_path.write_text(blockers.replace(old, new, 1))
+
+          commit_path.unlink()
+          source_test_path.unlink()
           PY
-            git config user.name Johnny
-            git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-            git add tests/state-authority-blockers.test.ts
-            git diff --cached --check
-            git commit -m 'Regress delayed d3 terminal serialization races'
-            git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
-          fi
-          grep -q 'delayed d3 exact binding cannot reopen identity_lost' tests/state-authority-blockers.test.ts
-          grep -q 'stale T proposal with run:null can never clear it' tests/state-authority-blockers.test.ts
+          test ! -e src/core/integration-commit.ts
+          test ! -e tests/integration-terminal-serialization.test.ts
+          ! grep -R --line-number --fixed-strings 'integration-commit.js' src tests
+          ! git diff --name-only | grep -Fx package-lock.json
+          git diff --check
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add src/core/integration-status.ts tests/integration-plan.test.ts tests/state-authority-blockers.test.ts
+          git rm src/core/integration-commit.ts tests/integration-terminal-serialization.test.ts
+          git diff --cached --check
+          git commit -m 'Fold Integration terminal serialization into assigned paths'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
       - id: head
         name: Resolve final exact head
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -73,6 +118,9 @@ jobs:
           test -z "$(git config --local --get-regexp 'http.*extraheader' || true)"
           test -z "$GITHUB_TOKEN"
           test -z "$GH_TOKEN"
+          test ! -e src/core/integration-commit.ts
+          test ! -e tests/integration-terminal-serialization.test.ts
+          ! git diff-tree --no-commit-id --name-only -r "$EXPECTED_SHA" | grep -Fx package-lock.json
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -84,7 +132,7 @@ jobs:
 
   record:
     needs: [repair, test]
-    if: always() && contains(github.event.head_commit.message, '[identity-lost-final-v2]')
+    if: always() && contains(github.event.head_commit.message, '[ownership-fold-v1]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -95,9 +143,9 @@ jobs:
       - name: Record result
         run: |
           set -euo pipefail
-          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '${{ needs.repair.outputs.sha }}' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-identity-lost-final-validation-v2-result.txt
+          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '${{ needs.repair.outputs.sha }}' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-ownership-fold-result.txt
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
-          git add .github/work18-identity-lost-final-validation-v2-result.txt
-          git commit -m 'Record final identity-lost exact-head validation' || exit 0
+          git add .github/work18-ownership-fold-result.txt
+          git commit -m 'Record work18 ownership fold validation' || exit 0
           git push origin HEAD:bootstrap/work18-identity-lost-20260818
