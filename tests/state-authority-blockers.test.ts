@@ -8,8 +8,9 @@ import { cleanupTerminalProtectedIntegrationRecovery, ingestCoordinatorIssueEven
 import { completeReview, currentReviewActivities } from "../src/core/reviews.js";
 import { hasCurrentHumanAcknowledgement, processCurrentSubmissions } from "../src/core/submissions.js";
 import { verifyHumanControlPlanePrerequisite } from "../src/core/integration.js";
-import { createIntegrationRecord, createIntegrationRequest, type IntegrationRecord } from "../src/core/integration-plan.js";
+import { createIntegrationRecord, createIntegrationRequest, serializeIntegrationRecord, type IntegrationRecord } from "../src/core/integration-plan.js";
 import { authorizeIntegrationDispatch, bindDispatchedIntegrationRun, ensureIntegrationDispatch, getCurrentIntegrationRecord, getIntegrationRunStartEvidence, integrationDispatchRunToken, publishIntegrationRecord, sealIntegrationWorkflowRunEvent } from "../src/core/integration-status.js";
+import { claimIdentityLostIntegrationCommit } from "../src/core/integration-commit.js";
 import { humanControlPlaneAttestationSchema, qaAttestationSchema, reviewStartSchema, serializeAttestation } from "../src/core/attestations.js";
 import {
   assertRepositoryDefaultBranchRevision,
@@ -1199,20 +1200,42 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
       github.__authorityVariables.delete(authorized.electionName);
       const protectedFence = installProtectedFence(github, record, secret, "2026-08-17T14:00:01.000Z");
 
-      // Simulate a crash immediately after durable terminal commit, before F/B cleanup.
+      // Simulate the exact crash boundary: request-local identity_lost serialization and d3
+      // terminal authority have committed, but none of the transient F/A/B/S/C cleanup has run.
       const terminalAt = "2026-08-17T14:11:00.000Z";
-      record = await publishIntegrationRecord(github, {
+      const fenceDigest = `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`;
+      const terminalRecord: IntegrationRecord = {
         ...record,
         dispatch_started_at: protectedFence.fence.created_at as string,
         run: null,
         terminal: {
           state: "identity_lost", attempt: 1,
           boundary_created_at: protectedFence.fence.created_at as string,
-          fence_digest: `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`,
+          fence_digest: fenceDigest,
           detail: "simulated post-commit cleanup crash", created_at: terminalAt,
         },
         created_at: terminalAt,
+      };
+      await claimIdentityLostIntegrationCommit(github, {
+        requestId: record.request.request_id,
+        prNumber: identity.prNumber,
+        headSha: identity.headSha,
+        baseSha: identity.baseSha,
+        anchorName: authorized.authorization.anchor_name,
+      }, {
+        boundaryCreatedAt: protectedFence.fence.created_at as string,
+        fenceDigest,
+        createdAt: terminalAt,
       });
+      await publishDurableProtocolRecord(github, {
+        storageSha: identity.headSha,
+        publisherSha: identity.baseSha,
+        scope: `integration/${identity.prNumber}`,
+        unsignedBody: `${serializeIntegrationRecord(terminalRecord)}\n\nINTEGRATION RECORD — CANONICAL`,
+        publicationTimestamp: Date.parse(terminalAt),
+        authorityOrder: terminalAt,
+      });
+      record = terminalRecord;
       expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(true);
       const durableBefore = await getCurrentIntegrationRecord(github, identity);
 
