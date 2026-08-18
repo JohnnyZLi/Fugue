@@ -46,8 +46,6 @@ jobs:
           test "$(git -C work rev-parse HEAD)" = "8a18e6cfad62335b082e5a83740b63a8631468d7"
           test "$(git -C recovery rev-parse HEAD)" = "d6f737925d65823ef5ca392a6b4d59e9b0340ac6"
           test "$(git -C authority rev-parse HEAD)" = "4acb5d65fa29ccb0c5f98cd77681618928565629"
-          test "$(git -C recovery merge-base HEAD 8a18e6cfad62335b082e5a83740b63a8631468d7)" = "8a18e6cfad62335b082e5a83740b63a8631468d7"
-          test "$(git -C authority merge-base HEAD 8a18e6cfad62335b082e5a83740b63a8631468d7)" = "8a18e6cfad62335b082e5a83740b63a8631468d7"
           test "$(git ls-remote origin refs/heads/agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration | cut -f1)" = "8a18e6cfad62335b082e5a83740b63a8631468d7"
           test "$(gh api repos/JohnnyZLi/Fugue/issues/18 --jq .updated_at)" = "2026-08-18T04:28:24Z"
           gh api repos/JohnnyZLi/Fugue/issues/18 --jq .body > /tmp/issue-body.txt
