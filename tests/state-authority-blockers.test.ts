@@ -1062,6 +1062,14 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
       expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);
       expect(github.__authorityVariables.has(protectedFence.names.binding)).toBe(false);
 
+      // delayed d3 exact binding cannot reopen identity_lost after terminal cleanup.
+      await expect(bindDispatchedIntegrationRun(
+        github, snapshot, request.request_id, 99003,
+        "https://github.com/JohnnyZLi/Fugue/actions/runs/99003", "2026-08-17T10:20:01.000Z",
+      )).rejects.toThrow(/active authorized durable request/);
+      expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_INT_C_"))).toBe(false);
+      expect((await getCurrentIntegrationRecord(github, identity))?.terminal?.state).toBe("identity_lost");
+
       github.__comments.splice(0);
       github.__statuses.splice(0);
       github.__workflowRuns.splice(0);
@@ -1110,6 +1118,22 @@ describe("absorbed Code QA / Security QA authority blockers", () => {
       const bound = await getCurrentIntegrationRecord(github, identity);
       expect(bound?.run).toMatchObject({ id: 99101, attempt: 1, html_url: htmlUrl });
       expect(bound?.terminal).toBeNull();
+
+      // W bound exact L into d3 first; a stale T proposal with run:null can never clear it.
+      const staleTerminalAt = new Date(Date.parse(bound!.created_at) + 1).toISOString();
+      await expect(publishIntegrationRecord(github, {
+        ...(bound!),
+        run: null,
+        terminal: {
+          state: "identity_lost", attempt: 1,
+          boundary_created_at: protectedFence.fence.created_at as string,
+          fence_digest: `sha256:${createHash("sha256").update(protectedFence.raw, "utf8").digest("hex")}`,
+          detail: "stale terminalizer must not clear exact L", created_at: staleTerminalAt,
+        },
+        created_at: staleTerminalAt,
+      } as IntegrationRecord)).rejects.toThrow(/cannot clear protected run/);
+      expect((await getCurrentIntegrationRecord(github, identity))?.run?.id).toBe(99101);
+      expect([...github.__authorityVariables.keys()].some((name) => name.startsWith("FUGUE_INT_C_"))).toBe(false);
       expect(github.__authorityVariables.has(protectedFence.names.fence)).toBe(false);
       expect(github.__authorityVariables.has(protectedFence.names.binding)).toBe(false);
     });
