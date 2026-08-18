@@ -4,6 +4,19 @@ import { type IntegrationAttestation } from "./attestations.js";
 import { sameEvaluationIdentity, type EvaluationSnapshot } from "./evaluation.js";
 import type { FugueGitHub } from "./github.js";
 import {
+  createIntegrationRecord,
+  createIntegrationRequest,
+  integrationDispatchAuthorizationSchema,
+  integrationRunTitle,
+  integrationRequestSchema,
+  parseIntegrationRecord,
+  serializeIntegrationRecord,
+  type IntegrationDispatchAuthorization,
+  type IntegrationRecord,
+  type IntegrationRequest,
+  type IntegrationRunBinding,
+} from "./integration-plan.js";
+import {
   assertRepositoryDefaultBranchRevision,
   createProtocolComment,
   isTrustedProtocolComment,
