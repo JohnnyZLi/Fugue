@@ -1,0 +1,117 @@
+name: Work 18 Identity Lost Abort Preservation
+
+on:
+  push:
+    branches: [bootstrap/work18-identity-lost-20260818]
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  repair:
+    if: contains(github.event.head_commit.message, '[identity-lost-abort-fix]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-identity-lost-20260818
+          path: control
+      - uses: actions/checkout@v4
+        with:
+          ref: 163ec2f7c5576e1fc39c918eb2d1aee2de679a62
+          path: work
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: work/package-lock.json
+      - name: Gate live revised Worker identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git -C work rev-parse HEAD)" = "163ec2f7c5576e1fc39c918eb2d1aee2de679a62"
+          test "$(git -C work ls-remote origin refs/heads/agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration | cut -f1)" = "163ec2f7c5576e1fc39c918eb2d1aee2de679a62"
+          test "$(gh api repos/JohnnyZLi/Fugue/issues/18 --jq .updated_at)" = "2026-08-18T11:12:38Z"
+          gh api repos/JohnnyZLi/Fugue/issues/18 --jq .body > /tmp/issue-body.txt
+      - working-directory: work
+        run: npm ci
+      - name: Verify revised work-spec digest
+        working-directory: work
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs'; import crypto from 'node:crypto'; import { parse as parseYaml } from 'yaml';
+          const body=fs.readFileSync('/tmp/issue-body.txt','utf8'), sm='<!-- fugue-work', em='-->';
+          const s=body.indexOf(sm), e=body.indexOf(em,s+sm.length); const m=parseYaml(body.slice(s+sm.length,e).trim());
+          if(m.execution?.worker_id!=='wkr-b0057a9e'||m.execution?.branch!=='agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration') throw new Error('assignment drift');
+          if(!(m.spec?.ownership?.owned??[]).includes('src/core/reconcile.ts')||!(m.spec?.ownership?.owned??[]).includes('tests/state-authority-blockers.test.ts')||(m.spec?.ownership?.forbidden??[]).includes('src/core/reconcile.ts')) throw new Error('scope drift');
+          if(!(m.spec?.ownership?.forbidden??[]).includes('package-lock.json')) throw new Error('package-lock not forbidden');
+          const req=`${body.slice(0,s)}${body.slice(e+em.length)}`.replace(/\r\n?/g,'\n').split('\n').map(x=>x.replace(/[ \t]+$/g,'')).join('\n').trim();
+          const sort=v=>Array.isArray(v)?v.map(sort):v&&typeof v==='object'?Object.fromEntries(Object.entries(v).sort(([a],[b])=>a.localeCompare(b)).map(([k,x])=>[k,sort(x)])):v;
+          const digest='sha256:'+crypto.createHash('sha256').update(JSON.stringify(sort({requirements:req,spec:m.spec})),'utf8').digest('hex');
+          if(digest!=='sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985') throw new Error(`digest drift ${digest}`);
+          NODE
+      - name: Apply abort preservation fix
+        run: python3 control/.github/work18-identity-lost-abort-fix.py
+      - name: Audit narrow follow-up scope
+        run: |
+          set -euo pipefail
+          cd work
+          git diff --check
+          test -z "$(git diff --name-only -- package-lock.json)"
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' src/core/reconcile.ts tests/state-authority-blockers.test.ts | sort)"
+          test "$changed" = "$expected"
+          grep -q 'return current.terminal.state !== "aborted"' src/core/reconcile.ts
+          grep -q 'identity_lost' src/core/reconcile.ts
+          ! grep -q 'kind: "unresolved"' src/core/reconcile.ts
+          ! grep -q 'listWorkflowRuns' src/core/integration-status.ts
+          ! grep -q 'GET /repos/{owner}/{repo}/deployments' src/core/integration-status.ts
+      - working-directory: work
+        run: npm run check
+      - working-directory: work
+        run: npm test
+      - working-directory: work
+        run: npm run build
+      - name: Publish green follow-up
+        run: |
+          set -euo pipefail
+          cd work
+          test "$(git ls-remote origin refs/heads/agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration | cut -f1)" = "163ec2f7c5576e1fc39c918eb2d1aee2de679a62"
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add src/core/reconcile.ts tests/state-authority-blockers.test.ts
+          git diff --cached --check
+          git commit -m 'Preserve retry for provably aborted Integration transport'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+          echo "REPAIRED_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Record result
+        run: |
+          set -euo pipefail
+          cd control
+          git pull --ff-only origin bootstrap/work18-identity-lost-20260818
+          printf 'run_id=%s\nstatus=success\nrepaired_head=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' "$REPAIRED_HEAD" 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-identity-lost-abort-fix-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-identity-lost-abort-fix-result.txt
+          git commit -m 'Record aborted recovery preservation result'
+          git push origin HEAD:bootstrap/work18-identity-lost-20260818
+
+  record-failure:
+    needs: repair
+    if: always() && needs.repair.result == 'failure' && contains(github.event.head_commit.message, '[identity-lost-abort-fix]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-identity-lost-20260818
+      - run: |
+          printf 'run_id=%s\nstatus=failure\n' '${{ github.run_id }}' > .github/work18-identity-lost-abort-fix-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-identity-lost-abort-fix-result.txt
+          git commit -m 'Record failed abort preservation gate' || exit 0
+          git push origin HEAD:bootstrap/work18-identity-lost-20260818
