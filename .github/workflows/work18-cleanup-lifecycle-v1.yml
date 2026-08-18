@@ -1,0 +1,116 @@
+name: Work18 Cleanup Lifecycle Exact Head
+
+on:
+  push:
+    branches: [bootstrap/work18-identity-lost-20260818]
+
+jobs:
+  repair:
+    if: contains(github.event.head_commit.message, '[cleanup-lifecycle-v1]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+          path: work
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-identity-lost-20260818
+          path: helper
+          fetch-depth: 1
+      - name: Apply exact-head cleanup lifecycle repair
+        working-directory: work
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "e8ebca4f528c7e8657e6418448f551004e77fbaa"
+          python <<'PY'
+          from pathlib import Path
+          src = Path('../helper/.github/work18-cleanup-lifecycle-v1.py').read_text()
+          src = src.replace('''  const expectedUrl = `https://github.com/${record.identity.prNumber ? "" : ""}`; // keep URL validation below repository-aware\n  void expectedUrl;\n''', '')
+          src = src.replace('''currentRequests.set(`${identity.prNumber}:${identity.headSha}:${identity.baseSha}:${identity.workSpecDigest}`, current.request.request_id);''', '''currentRequests.set(JSON.stringify([identity.prNumber, identity.headSha.toLowerCase(), identity.baseBranch, identity.baseSha.toLowerCase(), identity.policyDigest, identity.protocolVersion, identity.issueNumber, identity.workId, identity.workSpecDigest]), current.request.request_id);''')
+          src = src.replace('''currentRequests.get(`${currentIdentity.prNumber}:${currentIdentity.headSha}:${currentIdentity.baseSha}:${currentIdentity.workSpecDigest}`)''', '''currentRequests.get(JSON.stringify([currentIdentity.prNumber, currentIdentity.headSha.toLowerCase(), currentIdentity.baseBranch, currentIdentity.baseSha.toLowerCase(), currentIdentity.policyDigest, currentIdentity.protocolVersion, currentIdentity.issueNumber, currentIdentity.workId, currentIdentity.workSpecDigest]))''')
+          src = src.replace('''s = replace_once(s, old, new, "work historical reclaim")''', '''\nif old not in s:\n    raise SystemExit("missing anchor: work historical reclaim")\ns = s.replace(old, new, 1)''')
+          Path('/tmp/work18-cleanup-lifecycle-v1.py').write_text(src)
+          PY
+          python /tmp/work18-cleanup-lifecycle-v1.py
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' '.github/workflows/fugue-integration.yml' 'AGENTS.md' 'src/core/integration-status.ts' 'src/core/reconcile.ts' 'tests/integration-plan.test.ts' 'tests/state-authority-blockers.test.ts' | sort)"
+          test "$changed" = "$expected"
+          ! git diff --name-only | grep -Fx package-lock.json
+          test ! -e src/core/integration-commit.ts
+          test ! -e tests/integration-terminal-serialization.test.ts
+          git diff --check
+          npm ci
+          npm run check
+          npm test
+          npm run build
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/workflows/fugue-integration.yml AGENTS.md src/core/integration-status.ts src/core/reconcile.ts tests/integration-plan.test.ts tests/state-authority-blockers.test.ts
+          git diff --cached --check
+          git commit -m 'Repair Integration cleanup lifecycle'
+          git push origin HEAD:agent/18-migrate-fugue-to-chat-first-github-hosted-orchestration
+      - id: head
+        name: Resolve final exact head
+        working-directory: work
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: repair
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ""
+      GH_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.repair.outputs.sha }}
+          persist-credentials: false
+      - name: Confirm detached exact head and no publication credential
+        env:
+          EXPECTED_SHA: ${{ needs.repair.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git symbolic-ref -q HEAD || true)"
+          test -z "$(git config --local --get-regexp 'http.*extraheader' || true)"
+          test -z "$GITHUB_TOKEN"
+          test -z "$GH_TOKEN"
+          ! git diff --name-only HEAD^ HEAD | grep -Fx package-lock.json
+          test ! -e src/core/integration-commit.ts
+          test ! -e tests/integration-terminal-serialization.test.ts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  record:
+    needs: [repair, test]
+    if: always() && contains(github.event.head_commit.message, '[cleanup-lifecycle-v1]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/work18-identity-lost-20260818
+      - name: Record result
+        run: |
+          set -euo pipefail
+          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '${{ needs.repair.outputs.sha }}' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-cleanup-lifecycle-result.txt
+          git config user.name Johnny
+          git config user.email 92900710+JohnnyZLi@users.noreply.github.com
+          git add .github/work18-cleanup-lifecycle-result.txt
+          git commit -m 'Record cleanup lifecycle validation' || exit 0
+          git push origin HEAD:bootstrap/work18-identity-lost-20260818
