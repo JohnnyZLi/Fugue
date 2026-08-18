@@ -1,0 +1,4 @@
+run_id=32197672542
+test_result=success
+validated_sha=6df9420df4fca60bb1d25d81cef3a0f943f37041
+work_spec_digest=sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985
