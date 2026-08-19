@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseConfig } from "../src/core/config.js";
 import { findDependencyCycle } from "../src/core/dependencies.js";
@@ -20,11 +22,21 @@ import {
   createFugueAuthorityVariable,
   deleteFugueAuthorityVariable,
   listFugueAuthorityVariables,
+  loadReusableCanonicalWorkState,
   parseCanonicalWorkState,
   recoverDurableProtocolRecord,
   serializeCanonicalWorkState,
 } from "../src/core/state.js";
 import { claimWorker, slugify } from "../src/core/worker.js";
+
+vi.mock("../src/core/provenance.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/core/provenance.js")>();
+  return {
+    ...actual,
+    verifyProtocolPublicationBodyAtRevision: vi.fn(async () => true),
+    verifyDurableManifestProof: vi.fn(async () => true),
+  };
+});
 
 const ORIGINAL_AUTHORITY_TOKEN = process.env.FUGUE_AUTHORITY_TOKEN;
 const RECOVERY_IDLE = "FUGUE_D3GI_00";
@@ -76,6 +88,70 @@ class RotateEpochOnSnapshotMap extends CountingAuthorityMap {
     }
     return super.entries();
   }
+}
+
+function seedHistoricalWorkRecovery(
+  variables: Map<string, string>,
+  issueNumber: number,
+  historicalSha: string,
+) {
+  const metadata = workMetadataSchema.parse({
+    version: 1,
+    work_id: `work-${issueNumber}`,
+    spec: {},
+    execution: {},
+  });
+  const state = createCanonicalWorkState({
+    issue: issueNumber,
+    title: "Historical work",
+    state: "state:ready",
+    agentReady: true,
+    requirements: "## Outcome\nRecover the historical root.",
+    metadata,
+    baseSha: historicalSha,
+    createdAt: "2026-08-18T00:00:00.000Z",
+    logicalRoot: true,
+  });
+  const key = "1".repeat(32);
+  const nonce = "2".repeat(32);
+  const signedBody = `${serializeCanonicalWorkState(state)}\n\nFUGUE WORK STATE — CANONICAL\n\nFugue-Authority-Key: ${key}\nFugue-Authority-Commit: ${nonce}`;
+  const authorityOrder = `work-v2:${String(0).padStart(20, "0")}`;
+  const manifestId = 101;
+  const cursor = {
+    version: 1,
+    kind: "durable_recovery",
+    scope: `work/${issueNumber}`,
+    storage_sha: historicalSha,
+    publisher_sha: historicalSha,
+    checkpoint_at: "2026-08-18T00:00:01.000Z",
+    complete_top_id: manifestId,
+    scan_top_id: manifestId,
+    scan_floor_id: manifestId,
+    before_id: manifestId + 1,
+    page: 1,
+    phase: "discover",
+    commit_witness: true,
+    best_body_b64: Buffer.from(signedBody, "utf8").toString("base64url"),
+    best_manifest: {
+      id: manifestId,
+      key,
+      nonce,
+      body_digest: createHash("sha256").update(signedBody, "utf8").digest("hex"),
+      authority_order_b64: Buffer.from(authorityOrder, "utf8").toString("base64url"),
+      first_status_id: 100,
+      last_status_id: 100,
+      chunk_count: 1,
+      status_ids: [100],
+      proof: "manifest-proof",
+      created_at: "2026-08-18T00:00:00.500Z",
+    },
+  };
+  const payload = Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+  const cursorBody = `<!-- fugue-durable-recovery\nversion: 1\npayload: ${payload}\n-->`;
+  const identity = `${historicalSha.toLowerCase()}\0${historicalSha.toLowerCase()}\0work/${issueNumber}`;
+  const digest = createHash("sha256").update(identity, "utf8").digest("hex").slice(0, 16).toUpperCase();
+  variables.set(`FUGUE_D3_${digest}_DEADBEEFDEADBEEF`, cursorBody);
+  return state;
 }
 
 describe("canonical digests", () => {
@@ -278,6 +354,51 @@ describe("bounded Fugue Authority reads", () => {
     )));
     await expect(listFugueAuthorityVariables(recoveryGithub(), "FUGUE_D3"))
       .rejects.toThrow(/permissions \(403: Resource not accessible by integration\)/i);
+  });
+});
+
+describe("bounded historical work rollover", () => {
+  it("examines one exact protected-base commit page per reusable-state lookup and can resume on the next page", async () => {
+    const historicalSha = "a".repeat(40);
+    const currentSha = "b".repeat(40);
+    const variables = new Map<string, string>([
+      [RECOVERY_IDLE, `${RECOVERY_IDLE_PREFIX}:${"3".repeat(32)}`],
+    ]);
+    const expected = seedHistoricalWorkRecovery(variables, 24, historicalSha);
+    const listCommits = vi.fn(async ({ page }: { page: number; per_page: number; sha: string }) => ({
+      data: page === 1
+        ? Array.from({ length: 100 }, (_, index) => ({ sha: index.toString(16).padStart(40, "0") }))
+        : [{ sha: historicalSha }],
+    }));
+    const github = {
+      repository: { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      __authorityVariables: variables,
+      octokit: { rest: { repos: { listCommits } } },
+    } as unknown as FugueGitHub;
+
+    await expect(loadReusableCanonicalWorkState(github, 24, currentSha, "main", 1)).resolves.toBeUndefined();
+    expect(listCommits).toHaveBeenCalledTimes(1);
+    expect(listCommits).toHaveBeenLastCalledWith(expect.objectContaining({ sha: currentSha, per_page: 100, page: 1 }));
+
+    await expect(loadReusableCanonicalWorkState(github, 24, currentSha, "main", 2)).resolves.toEqual(expected);
+    expect(listCommits).toHaveBeenCalledTimes(2);
+    expect(listCommits).toHaveBeenLastCalledWith(expect.objectContaining({ sha: currentSha, per_page: 100, page: 2 }));
+  });
+
+  it("keeps repository-wide rollover outside the deterministic per-work transition loop", () => {
+    const source = readFileSync("src/core/reconcile.ts", "utf8");
+    const publicStart = source.indexOf("export async function reconcileWork(");
+    const transitionStart = source.indexOf("async function reconcileWorkTransitions(", publicStart);
+    const transitionEnd = source.indexOf("export function assertProtectedWorkflowRuntimeCurrent", transitionStart);
+    expect(publicStart).toBeGreaterThanOrEqual(0);
+    expect(transitionStart).toBeGreaterThan(publicStart);
+    expect(transitionEnd).toBeGreaterThan(transitionStart);
+
+    const publicWrapper = source.slice(publicStart, transitionStart);
+    const transitionLoop = source.slice(transitionStart, transitionEnd);
+    expect(publicWrapper.match(/rollCanonicalWorkStatesToCurrentBase\(/g)).toHaveLength(1);
+    expect(transitionLoop).not.toContain("rollCanonicalWorkStatesToCurrentBase(");
+    expect(transitionLoop).not.toContain("repairCanonicalWorkStateComments(");
   });
 });
 
