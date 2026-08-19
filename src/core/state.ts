@@ -1650,7 +1650,7 @@ async function captureRecoveryReadSession(github: FugueGitHub): Promise<Recovery
     try {
       const epoch = await ensureRecoveryMutationGuardIdle(github);
       if (!epoch) {
-        throw new DurableProtocolRecoveryPendingError(
+        throw new RecoveryReadEpochChangedError(
           "Protected recovery mutation is still provisional; committed authority remains fenced.",
         );
       }
