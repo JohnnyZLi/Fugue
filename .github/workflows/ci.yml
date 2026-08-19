@@ -1,11 +1,13 @@
 name: CI
+run-name: "CI PR #${{ github.event.pull_request.number }} @ ${{ github.event.pull_request.head.sha }}"
 
 on:
   push:
     branches:
       - main
       - bootstrap/fugue-foundation
-  pull_request:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: read
@@ -13,8 +15,15 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ""
+      GH_TOKEN: ""
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22

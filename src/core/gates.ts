@@ -1,5 +1,6 @@
 import type { FugueGitHub } from "./github.js";
-import { parsePrMetadata } from "./pr-metadata.js";
+import { resolveActivePolicy } from "./policy.js";
+import { loadCurrentCanonicalWorkState } from "./state.js";
 
 export class IntegrationGateFailure extends Error {
   readonly gate: string;
@@ -31,45 +32,50 @@ export async function verifyBaseCurrent(
   }
 }
 
+/**
+ * Dependency completion is derived from protected canonical work/PR linkage plus GitHub's merged
+ * state for that exact PR. Issue lifecycle labels, issue closed state, and fugue-pr body mirrors
+ * are presentation only and cannot satisfy this gate.
+ */
 export async function verifyDependenciesSatisfied(
   github: FugueGitHub,
   dependencies: readonly number[],
+  baseSha?: string,
 ): Promise<void> {
   if (!dependencies.length) return;
+  const protectedBaseSha = baseSha ?? (await resolveActivePolicy(github)).identity.baseSha;
   const { owner, repo } = github.repository;
 
-  const pulls = await github.octokit.paginate(github.octokit.rest.pulls.list, {
-    owner,
-    repo,
-    state: "all",
-    per_page: 100,
-  });
-
-  const linkedByIssue = new Map<number, typeof pulls>();
-  for (const pull of pulls) {
-    let metadata;
-    try {
-      metadata = parsePrMetadata(pull.body);
-    } catch {
-      continue;
-    }
-    if (!metadata) continue;
-    const list = linkedByIssue.get(metadata.issue) ?? [];
-    list.push(pull);
-    linkedByIssue.set(metadata.issue, list);
-  }
-
   for (const dependency of dependencies) {
-    const issue = await github.octokit.rest.issues.get({ owner, repo, issue_number: dependency });
-    if (issue.data.state !== "closed") {
-      throw new IntegrationGateFailure("dependencies", `Dependency #${dependency} is not satisfied; the issue is still open.`);
-    }
-
-    const linked = linkedByIssue.get(dependency) ?? [];
-    if (linked.length && !linked.some((pull) => pull.merged_at !== null)) {
+    const canonical = await loadCurrentCanonicalWorkState(github, dependency, protectedBaseSha);
+    if (!canonical) {
       throw new IntegrationGateFailure(
         "dependencies",
-        `Dependency #${dependency} has Fugue-linked PRs but none are merged.`,
+        `Dependency #${dependency} has no current protected canonical Fugue work state.`,
+      );
+    }
+    if (!canonical.pr) {
+      throw new IntegrationGateFailure(
+        "dependencies",
+        `Dependency #${dependency} has no protected canonical PR linkage.`,
+      );
+    }
+
+    const pull = await github.octokit.rest.pulls.get({
+      owner,
+      repo,
+      pull_number: canonical.pr.number,
+    });
+    if (pull.data.head.ref !== canonical.pr.metadata.branch) {
+      throw new IntegrationGateFailure(
+        "dependencies",
+        `Dependency #${dependency} canonical PR #${canonical.pr.number} no longer matches its protected branch identity.`,
+      );
+    }
+    if (!pull.data.merged) {
+      throw new IntegrationGateFailure(
+        "dependencies",
+        `Dependency #${dependency} canonical PR #${canonical.pr.number} is not merged.`,
       );
     }
   }

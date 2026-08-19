@@ -1,14 +1,10 @@
 import type { FugueGitHub } from "./github.js";
-import {
-  assertWorkMetadataForIssue,
-  parseWorkMetadata,
-  workSpecDigest,
-  type WorkMetadata,
-} from "./metadata.js";
-import { parsePrMetadata, type PrMetadata } from "./pr-metadata.js";
-import { resolveActivePolicy, type ActivePolicy } from "./policy.js";
+import { upsertWorkMetadata, type WorkMetadata } from "./metadata.js";
+import type { PrMetadata } from "./pr-metadata.js";
+import type { ActivePolicy } from "./policy.js";
 import { resolveQaRequirements, type QaResolution } from "./qa.js";
 import type { EvaluationIdentity } from "./protocol.js";
+import { reconstructState } from "./state.js";
 
 export interface EvaluationSnapshot {
   identity: EvaluationIdentity;
@@ -33,7 +29,13 @@ export async function captureEvaluation(
   github: FugueGitHub,
   prNumber: number,
 ): Promise<EvaluationSnapshot> {
-  const policy = await resolveActivePolicy(github);
+  const state = await reconstructState(github);
+  const policy = state.policy;
+  const work = state.works.find((candidate) => candidate.pr?.number === prNumber);
+  if (!work?.pr) {
+    throw new Error(`PR #${prNumber} is not linked by current protected Fugue work-state evidence.`);
+  }
+
   const { owner, repo } = github.repository;
   const prResponse = await github.octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
   const pr = prResponse.data;
@@ -44,27 +46,16 @@ export async function captureEvaluation(
     );
   }
 
-  const prMetadata = parsePrMetadata(pr.body);
-  if (!prMetadata) throw new Error(`PR #${prNumber} is missing fugue-pr metadata.`);
-
-  const issueResponse = await github.octokit.rest.issues.get({
-    owner,
-    repo,
-    issue_number: prMetadata.issue,
-  });
-  const issueBody = issueResponse.data.body ?? "";
-  const workMetadata = parseWorkMetadata(issueBody);
-  if (!workMetadata) throw new Error(`Issue #${prMetadata.issue} is missing fugue-work metadata.`);
-  assertWorkMetadataForIssue(workMetadata, prMetadata.issue);
-
-  if (workMetadata.work_id !== prMetadata.work_id) {
-    throw new Error(`PR #${prNumber} work_id does not match Issue #${prMetadata.issue}.`);
+  const prMetadata = work.pr.metadata;
+  const workMetadata = work.metadata;
+  if (workMetadata.work_id !== prMetadata.work_id || work.issueNumber !== prMetadata.issue) {
+    throw new Error(`PR #${prNumber} canonical work linkage is internally inconsistent.`);
   }
   if (workMetadata.execution.worker_id !== prMetadata.worker_id) {
-    throw new Error(`PR #${prNumber} Worker ID does not match Issue #${prMetadata.issue}.`);
+    throw new Error(`PR #${prNumber} Worker ID does not match canonical work state.`);
   }
   if (workMetadata.execution.branch !== prMetadata.branch || pr.head.ref !== prMetadata.branch) {
-    throw new Error(`PR #${prNumber} branch identity does not match Issue #${prMetadata.issue}.`);
+    throw new Error(`PR #${prNumber} branch identity does not match canonical work state.`);
   }
 
   const files = await github.octokit.paginate(github.octokit.rest.pulls.listFiles, {
@@ -75,6 +66,7 @@ export async function captureEvaluation(
   });
   const changedFiles = files.map((file) => file.filename);
   const qa = resolveQaRequirements(policy.config, changedFiles, workMetadata.spec.qa.force);
+  const issueBody = upsertWorkMetadata(work.requirements, workMetadata);
 
   return {
     identity: {
@@ -84,9 +76,9 @@ export async function captureEvaluation(
       baseSha: policy.identity.baseSha,
       policyDigest: policy.identity.policyDigest,
       protocolVersion: policy.identity.protocolVersion,
-      issueNumber: prMetadata.issue,
+      issueNumber: work.issueNumber,
       workId: workMetadata.work_id,
-      workSpecDigest: workSpecDigest(issueBody, workMetadata),
+      workSpecDigest: work.workSpecDigest,
     },
     policy,
     pr: {
@@ -96,7 +88,7 @@ export async function captureEvaluation(
       headSha: pr.head.sha,
       headBranch: pr.head.ref,
       baseBranch: pr.base.ref,
-      draft: pr.draft ?? false,
+      draft: work.pr.draft,
     },
     prMetadata,
     workMetadata,
