@@ -12,16 +12,20 @@ permissions:
 
 jobs:
   monitor:
-    if: github.event.head_commit.message == '[bootstrap] expose helper run ids'
+    if: github.event.head_commit.message == '[bootstrap] expose exact helper run ids'
     runs-on: ubuntu-latest
     steps:
-      - name: Publish latest helper run identities
+      - name: Publish exact helper run identities
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           node --input-type=module <<'NODE'
           const repo = process.env.GITHUB_REPOSITORY;
           const sha = process.env.GITHUB_SHA;
+          const wanted = new Map([
+            ['Work 20 Branch Patcher', 'e3f630da88b6957fb89c1150715f75f38c3f7358'],
+            ['Work 20 Checkout Patcher', '2482817f9cb8d44ab1c1c999d79a769d9e9a927c'],
+          ]);
           const headers = {
             Accept: 'application/vnd.github+json',
             Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
@@ -31,21 +35,16 @@ jobs:
           const r = await fetch(`https://api.github.com/repos/${repo}/actions/runs?branch=${encodeURIComponent('bootstrap/work18-status-bridge-20260819')}&per_page=100`, { headers });
           const body = await r.json();
           if (!r.ok) throw new Error(`list runs failed ${r.status}`);
-          const names = new Set(['Work 20 Branch Patcher', 'Work 20 Checkout Patcher']);
-          const selected = [];
-          for (const run of body.workflow_runs ?? []) {
-            if (!names.has(run.name)) continue;
-            if (selected.some(x => x.name === run.name)) continue;
-            selected.push(run);
-          }
-          for (const run of selected) {
-            const slug = run.name.includes('Checkout') ? 'checkout' : 'api';
+          for (const [name, headSha] of wanted) {
+            const run = (body.workflow_runs ?? []).find(x => x.name === name && x.head_sha === headSha);
+            if (!run) continue;
+            const slug = name.includes('Checkout') ? 'checkout-attempt' : 'api-attempt';
             const state = run.status === 'completed' && run.conclusion === 'success' ? 'success' : run.status === 'completed' ? 'failure' : 'pending';
             const s = await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
               method: 'POST', headers,
               body: JSON.stringify({
                 state,
-                context: `fugue/bootstrap-helper-${slug}/${run.id}`,
+                context: `fugue/bootstrap-${slug}/${run.id}`,
                 description: `${run.status}/${run.conclusion ?? 'none'}`,
                 target_url: run.html_url,
               }),
