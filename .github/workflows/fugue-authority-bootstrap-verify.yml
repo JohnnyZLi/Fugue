@@ -1,0 +1,65 @@
+name: Fugue Authority Bootstrap Verify
+
+on:
+  push:
+    branches:
+      - bootstrap/work18-status-bridge-20260819
+
+permissions:
+  contents: read
+  statuses: write
+
+env:
+  EXPECTED_COMMIT_MESSAGE: "[bootstrap] verify Fugue Authority environment policy"
+
+jobs:
+  verify:
+    if: github.event.head_commit.message == env.EXPECTED_COMMIT_MESSAGE
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify main-only environment policy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          const repo = process.env.GITHUB_REPOSITORY;
+          const sha = process.env.GITHUB_SHA;
+          const headers = {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+          };
+          const base = `https://api.github.com/repos/${repo}/environments/fugue-authority`;
+          async function get(url) {
+            const r = await fetch(url, { headers });
+            const text = await r.text();
+            let body = null;
+            try { body = text ? JSON.parse(text) : null; } catch {}
+            return { status: r.status, body };
+          }
+          const env = await get(base);
+          let state = 'failure';
+          let description = `environment read failed (${env.status})`;
+          if (env.status === 200) {
+            const d = env.body?.deployment_branch_policy;
+            if (d?.protected_branches === false && d?.custom_branch_policies === true) {
+              const policies = await get(`${base}/deployment-branch-policies?per_page=100`);
+              if (policies.status === 200) {
+                const names = (policies.body?.branch_policies ?? []).map(p => p.name).sort();
+                if (names.length === 1 && names[0] === 'main') {
+                  state = 'success';
+                  description = 'fugue-authority restricted exactly to main';
+                } else {
+                  description = `branch policy is ${names.join(',') || 'empty'}, expected main only`;
+                }
+              } else description = `branch-policy read failed (${policies.status})`;
+            } else description = 'custom deployment branch policy not enabled';
+          }
+          const r = await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ state, context: 'fugue/bootstrap-authority-policy', description }),
+          });
+          if (!r.ok) throw new Error(`status publish failed: ${r.status}`);
+          if (state !== 'success') process.exitCode = 1;
+          NODE
