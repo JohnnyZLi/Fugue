@@ -36,25 +36,32 @@ jobs:
           }
           const env = await get('/environments/fugue-authority');
           let state = 'failure';
+          let category = 'unknown';
           let description;
           if (env.status === 404) {
+            category = 'missing';
             description = 'fugue-authority environment missing';
           } else if (env.status !== 200) {
+            category = `read-${env.status}`;
             description = `environment read failed (${env.status})`;
           } else {
             const d = env.body?.deployment_branch_policy;
             if (!d || d.protected_branches !== false || d.custom_branch_policies !== true) {
+              category = 'broad';
               description = 'environment exists but custom branch policy is not enabled';
             } else {
               const policies = await get('/environments/fugue-authority/deployment-branch-policies?per_page=100');
               if (policies.status !== 200) {
+                category = `policy-read-${policies.status}`;
                 description = `branch-policy read failed (${policies.status})`;
               } else {
                 const names = (policies.body?.branch_policies ?? []).map(p => p.name).sort();
                 if (names.length === 1 && names[0] === 'main') {
                   state = 'success';
+                  category = 'main-only';
                   description = 'fugue-authority restricted exactly to main';
                 } else {
+                  category = names.length ? `branches-${names.join('-')}` : 'branches-empty';
                   description = `branch policy is ${names.join(',') || 'empty'}, expected main only`;
                 }
               }
@@ -65,7 +72,7 @@ jobs:
             headers: { ...headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({
               state,
-              context: 'fugue/bootstrap-authority-env',
+              context: `fugue/bootstrap-authority-env/${category}`.slice(0, 100),
               description: description.slice(0, 140),
             }),
           });
