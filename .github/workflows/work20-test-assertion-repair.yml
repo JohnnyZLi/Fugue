@@ -1,0 +1,68 @@
+name: Work 20 Stale Test Assertion Repair
+
+on:
+  push:
+    branches:
+      - bootstrap/work18-status-bridge-20260819
+
+permissions:
+  contents: write
+  statuses: write
+
+jobs:
+  repair:
+    if: github.event.head_commit.message == '[bootstrap] repair work-20 stale test assertions'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Patch only stale integration-plan workflow assertions
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: agent/20-fix-fugue-authority-token-bootstrap
+        run: |
+          node --input-type=module <<'NODE'
+          const repo = process.env.GITHUB_REPOSITORY;
+          const branch = process.env.TARGET_BRANCH;
+          const path = 'tests/integration-plan.test.ts';
+          const headers = {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+          };
+          const base = `https://api.github.com/repos/${repo}`;
+          const get = await fetch(`${base}/contents/${path}?ref=${encodeURIComponent(branch)}`, { headers });
+          const body = await get.json();
+          if (!get.ok) throw new Error(`read failed ${get.status}: ${JSON.stringify(body).slice(0,300)}`);
+          let text = Buffer.from(String(body.content).replace(/\n/g, ''), 'base64').toString('utf8');
+          const oldVariables = 'expect(workflow).toContain("permission-variables: write");';
+          const oldActions = 'expect(workflow).toContain("permission-actions: write");';
+          const variablesCount = text.split(oldVariables).length - 1;
+          const actionsCount = text.split(oldActions).length - 1;
+          if (variablesCount !== 2 || actionsCount !== 1) {
+            throw new Error(`unexpected stale assertion counts: variables=${variablesCount}, actions=${actionsCount}`);
+          }
+          text = text.replaceAll(oldVariables, 'expect(workflow).not.toContain("permission-variables:");');
+          text = text.replace(oldActions, 'expect(workflow).not.toContain("permission-actions:");');
+          const put = await fetch(`${base}/contents/${path}`, {
+            method: 'PUT', headers,
+            body: JSON.stringify({
+              message: '[work-20] Align Integration plan tests with Authority App permission inheritance',
+              content: Buffer.from(text, 'utf8').toString('base64'),
+              sha: body.sha,
+              branch,
+            }),
+          });
+          const result = await put.json();
+          if (!put.ok) throw new Error(`write failed ${put.status}: ${JSON.stringify(result).slice(0,300)}`);
+          const commitSha = result.commit?.sha;
+          const s = await fetch(`${base}/statuses/${process.env.GITHUB_SHA}`, {
+            method: 'POST', headers,
+            body: JSON.stringify({
+              state: 'success',
+              context: `fugue/bootstrap-work20-tests/${String(commitSha).slice(0,12)}`,
+              description: `stale assertions repaired at ${String(commitSha).slice(0,12)}`,
+              target_url: `https://github.com/${repo}/commit/${commitSha}`,
+            }),
+          });
+          if (!s.ok) throw new Error(`status publish failed ${s.status}`);
+          NODE
