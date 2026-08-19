@@ -9,12 +9,8 @@ permissions:
   contents: read
   statuses: write
 
-env:
-  EXPECTED_COMMIT_MESSAGE: "[bootstrap] verify Fugue Authority environment policy"
-
 jobs:
   verify:
-    if: github.event.head_commit.message == env.EXPECTED_COMMIT_MESSAGE
     runs-on: ubuntu-latest
     steps:
       - name: Verify main-only environment policy
