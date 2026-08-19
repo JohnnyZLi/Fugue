@@ -1,0 +1,53 @@
+name: Fugue Control Plane Bootstrap Dispatch
+
+on:
+  push:
+    branches:
+      - bootstrap/work18-status-bridge-20260819
+
+permissions:
+  actions: write
+  contents: read
+  statuses: write
+
+jobs:
+  dispatch:
+    if: github.event.head_commit.message == '[bootstrap] dispatch protected Fugue control plane'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch protected main control plane and publish run identity
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          const repo = process.env.GITHUB_REPOSITORY;
+          const sha = process.env.GITHUB_SHA;
+          const headers = {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            'X-GitHub-Api-Version': '2026-03-10',
+            'Content-Type': 'application/json',
+          };
+          const r = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/fugue-control-plane.yml/dispatches`, {
+            method: 'POST', headers,
+            body: JSON.stringify({ ref: 'main', return_run_details: true }),
+          });
+          const text = await r.text();
+          let body = null;
+          try { body = text ? JSON.parse(text) : null; } catch {}
+          if (!r.ok) throw new Error(`dispatch failed ${r.status}: ${text.slice(0,300)}`);
+          const runId = Number(body?.workflow_run_id ?? body?.id ?? body?.workflow_run?.id);
+          const runUrl = body?.html_url ?? body?.workflow_run?.html_url ?? (Number.isSafeInteger(runId) ? `https://github.com/${repo}/actions/runs/${runId}` : null);
+          const context = Number.isSafeInteger(runId) ? `fugue/bootstrap-control-plane/${runId}` : 'fugue/bootstrap-control-plane/dispatched';
+          const s = await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
+            method: 'POST', headers,
+            body: JSON.stringify({
+              state: 'success',
+              context,
+              description: Number.isSafeInteger(runId) ? `Protected control-plane run ${runId}` : 'Protected control plane dispatched',
+              ...(runUrl ? { target_url: runUrl } : {}),
+            }),
+          });
+          if (!s.ok) throw new Error(`status publish failed ${s.status}`);
+          console.log(JSON.stringify({ runId, runUrl, body }));
+          NODE
