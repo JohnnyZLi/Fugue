@@ -267,6 +267,7 @@ export const INTEGRATION_REQUEST_RECOVERY_GRACE_MS = 10 * 60 * 1000;
 const INTEGRATION_DISPATCH_ANCHOR_START = "<!-- fugue-integration-dispatch-anchor";
 const INTEGRATION_RUN_START = "<!-- fugue-integration-run-start";
 const HISTORICAL_INTEGRATION_IDENTITY_LOST_START = "<!-- fugue-historical-integration-identity-lost";
+const HISTORICAL_INTEGRATION_EXACT_RUN_START = "<!-- fugue-historical-integration-exact-run";
 const DURABLE_RECOVERY_START = "<!-- fugue-durable-recovery";
 const PROTOCOL_END = "-->";
 const INTEGRATION_ELECTION_PREFIX = "FUGUE_INT_E_";
@@ -367,9 +368,21 @@ const historicalIntegrationIdentityLostTombstoneSchema = z.object({
   created_at: z.string().min(1),
 });
 
+const historicalIntegrationExactRunBridgeSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("historical_integration_exact_run"),
+  request: integrationRequestSchema,
+  dispatch: integrationDispatchAuthorizationSchema,
+  commit: integrationExactRunCommitSchema,
+  historical_record_digest: z.string().regex(/^sha256:[0-9a-f]{64}$/i),
+  recovery_base_sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  created_at: z.string().min(1),
+});
+
 type HistoricalIntegrationFence = z.infer<typeof historicalIntegrationFenceSchema>;
 type HistoricalIntegrationBindingWitness = z.infer<typeof historicalIntegrationBindingWitnessSchema>;
 type HistoricalIntegrationIdentityLostTombstone = z.infer<typeof historicalIntegrationIdentityLostTombstoneSchema>;
+type HistoricalIntegrationExactRunBridge = z.infer<typeof historicalIntegrationExactRunBridgeSchema>;
 
 type HistoricalIntegrationHintKind = "anchor" | "fence" | "binding" | "start" | "commit_exact" | "commit_identity_lost";
 interface HistoricalIntegrationAuthorityHint {
@@ -449,6 +462,10 @@ function historicalIdentityLostScope(request: IntegrationRequest): string {
   return `int-hist/${request.identity.prNumber}/${integrationRequestToken(request.request_id)}`;
 }
 
+function historicalExactRunScope(request: IntegrationRequest): string {
+  return `int-hist-run/${request.identity.prNumber}/${integrationRequestToken(request.request_id)}`;
+}
+
 function historicalRecordDigest(body: string): string {
   return `sha256:${createHash("sha256").update(body, "utf8").digest("hex")}`;
 }
@@ -465,6 +482,21 @@ function parseHistoricalIntegrationIdentityLostTombstone(body: string): Historic
     body,
     HISTORICAL_INTEGRATION_IDENTITY_LOST_START,
     historicalIntegrationIdentityLostTombstoneSchema,
+  );
+}
+
+function serializeHistoricalIntegrationExactRunBridge(value: HistoricalIntegrationExactRunBridge): string {
+  return `${encodeIntegrationEvidence(
+    HISTORICAL_INTEGRATION_EXACT_RUN_START,
+    historicalIntegrationExactRunBridgeSchema.parse(value),
+  )}\n\nHISTORICAL INTEGRATION — EXACT RUN`;
+}
+
+function parseHistoricalIntegrationExactRunBridge(body: string): HistoricalIntegrationExactRunBridge | null {
+  return parseIntegrationEvidence(
+    body,
+    HISTORICAL_INTEGRATION_EXACT_RUN_START,
+    historicalIntegrationExactRunBridgeSchema,
   );
 }
 
@@ -854,11 +886,32 @@ function historicalBindingMatchesRequest(
   record: IntegrationRecord,
 ): boolean {
   if (!record.dispatch) return false;
+  const requestCreatedAt = Date.parse(record.request.created_at);
+  const runCreatedAt = Date.parse(witness.run_created_at);
   return witness.request_id === record.request.request_id && witness.pr_number === record.identity.prNumber &&
     witness.head_sha.toLowerCase() === record.identity.headSha.toLowerCase() &&
     witness.base_sha.toLowerCase() === record.identity.baseSha.toLowerCase() && witness.anchor_name === record.dispatch.anchor_name &&
-    witness.run_attempt === 1 && Number.isFinite(Date.parse(witness.run_created_at)) &&
+    witness.run_attempt === 1 && Number.isFinite(runCreatedAt) && Number.isFinite(requestCreatedAt) && runCreatedAt >= requestCreatedAt &&
     witness.html_url === `https://github.com/${github.repository.fullName}/actions/runs/${witness.run_id}`;
+}
+
+async function historicalRunStartMatchesRequest(
+  github: FugueGitHub,
+  start: IntegrationRunStartEvidence,
+  raw: string,
+  record: IntegrationRecord,
+): Promise<boolean> {
+  if (!record.dispatch) return false;
+  const timestamp = Date.parse(start.created_at);
+  const requestCreatedAt = Date.parse(record.request.created_at);
+  if (start.request_id !== record.request.request_id || start.pr_number !== record.identity.prNumber ||
+      start.head_sha.toLowerCase() !== record.identity.headSha.toLowerCase() ||
+      start.base_sha.toLowerCase() !== record.identity.baseSha.toLowerCase() ||
+      start.secret_digest.toLowerCase() !== record.dispatch.secret_digest.toLowerCase() ||
+      start.anchor_name !== record.dispatch.anchor_name || start.run_attempt !== 1 ||
+      !Number.isFinite(timestamp) || !Number.isFinite(requestCreatedAt) || timestamp < requestCreatedAt) return false;
+  try { return await verifyProtocolPublicationBodyAtRevision(github, raw, record.identity.baseSha, timestamp); }
+  catch { return false; }
 }
 
 function recoveryAuthorityBodies(value: string): string[] {
@@ -914,11 +967,34 @@ function historicalIdentityLostTombstoneMatches(
     Number.isFinite(Date.parse(tombstone.created_at)) && Date.parse(tombstone.created_at) >= Date.parse(commit.created_at);
 }
 
-async function recoverHistoricalIdentityLostTombstone(
+function historicalExactRunBridgeMatches(
+  github: FugueGitHub,
+  bridge: HistoricalIntegrationExactRunBridge,
+  historical: RecoveredHistoricalIntegrationRecord,
+  publisherSha: string,
+): boolean {
+  const { record, body } = historical;
+  if (!record.dispatch || record.run || record.terminal) return false;
+  const commit = bridge.commit;
+  const expectedUrl = `https://github.com/${github.repository.fullName}/actions/runs/${commit.run_id}`;
+  return bridge.recovery_base_sha.toLowerCase() === publisherSha.toLowerCase() &&
+    bridge.historical_record_digest.toLowerCase() === historicalRecordDigest(body).toLowerCase() &&
+    JSON.stringify(bridge.request) === JSON.stringify(record.request) &&
+    JSON.stringify(bridge.dispatch) === JSON.stringify(record.dispatch) &&
+    sameEvaluationIdentity(bridge.request.identity, record.identity) &&
+    commit.request_id === record.request.request_id && commit.pr_number === record.identity.prNumber &&
+    commit.head_sha.toLowerCase() === record.identity.headSha.toLowerCase() &&
+    commit.base_sha.toLowerCase() === record.identity.baseSha.toLowerCase() &&
+    commit.anchor_name === record.dispatch.anchor_name && commit.run_attempt === 1 && commit.html_url === expectedUrl &&
+    Number.isFinite(Date.parse(commit.run_created_at)) && Number.isFinite(Date.parse(bridge.created_at)) &&
+    Date.parse(bridge.created_at) >= Date.parse(commit.run_created_at);
+}
+
+async function historicalRecoveryPublishers(
   github: FugueGitHub,
   historical: RecoveredHistoricalIntegrationRecord,
-): Promise<HistoricalIntegrationIdentityLostTombstone | undefined> {
-  const scope = historicalIdentityLostScope(historical.record.request);
+  scope: string,
+): Promise<string[]> {
   const publishers = new Set<string>();
   for (const variable of await listFugueAuthorityVariables(github, "FUGUE_D3")) {
     for (const body of recoveryAuthorityBodies(variable.value)) {
@@ -926,10 +1002,18 @@ async function recoverHistoricalIdentityLostTombstone(
       if (publisher) publishers.add(publisher);
     }
   }
+  return [...publishers].sort();
+}
 
+async function recoverHistoricalIdentityLostTombstone(
+  github: FugueGitHub,
+  historical: RecoveredHistoricalIntegrationRecord,
+): Promise<HistoricalIntegrationIdentityLostTombstone | undefined> {
+  const scope = historicalIdentityLostScope(historical.record.request);
+  const publishers = await historicalRecoveryPublishers(github, historical, scope);
   let winner: HistoricalIntegrationIdentityLostTombstone | undefined;
   let pending = false;
-  for (const publisherSha of [...publishers].sort()) {
+  for (const publisherSha of publishers) {
     try {
       const recovered = await recoverDurableProtocolRecord(github, {
         storageSha: historical.record.identity.headSha,
@@ -959,6 +1043,49 @@ async function recoverHistoricalIdentityLostTombstone(
   if (pending) {
     throw new DurableProtocolRecoveryPendingError(
       `Historical Integration identity_lost tombstone for ${historical.record.request.request_id} exists but is not currently verifiable.`,
+    );
+  }
+  return undefined;
+}
+
+async function recoverHistoricalExactRunBridge(
+  github: FugueGitHub,
+  historical: RecoveredHistoricalIntegrationRecord,
+): Promise<HistoricalIntegrationExactRunBridge | undefined> {
+  const scope = historicalExactRunScope(historical.record.request);
+  const publishers = await historicalRecoveryPublishers(github, historical, scope);
+  let winner: HistoricalIntegrationExactRunBridge | undefined;
+  let pending = false;
+  for (const publisherSha of publishers) {
+    try {
+      const recovered = await recoverDurableProtocolRecord(github, {
+        storageSha: historical.record.identity.headSha,
+        publisherSha,
+        scope,
+        issueNumber: historical.record.identity.prNumber,
+        parse: parseHistoricalIntegrationExactRunBridge,
+        timestamp: (value) => Date.parse(value.created_at),
+        order: (value) => value.created_at,
+        validate: (value) => historicalExactRunBridgeMatches(github, value, historical, publisherSha),
+      });
+      if (!recovered.record) continue;
+      const candidate = recovered.record.value;
+      if (winner && JSON.stringify(winner.commit) !== JSON.stringify(candidate.commit)) {
+        throw new Error(`Historical Integration request ${historical.record.request.request_id} has conflicting protected exact-run bridges.`);
+      }
+      winner = candidate;
+    } catch (error) {
+      if (error instanceof DurableProtocolRecoveryPendingError) {
+        pending = true;
+        continue;
+      }
+      throw error;
+    }
+  }
+  if (winner) return winner;
+  if (pending) {
+    throw new DurableProtocolRecoveryPendingError(
+      `Historical Integration exact-run bridge for ${historical.record.request.request_id} exists but is not currently verifiable.`,
     );
   }
   return undefined;
@@ -1005,6 +1132,53 @@ async function ensureHistoricalIdentityLostTombstone(
   }
 }
 
+async function ensureHistoricalExactRunBridge(
+  github: FugueGitHub,
+  historical: RecoveredHistoricalIntegrationRecord,
+  commit: IntegrationExactRunCommit,
+  now: number,
+): Promise<HistoricalIntegrationExactRunBridge | undefined> {
+  const existing = await recoverHistoricalExactRunBridge(github, historical);
+  if (existing) {
+    if (JSON.stringify(existing.commit) !== JSON.stringify(commit)) {
+      throw new Error(`Historical Integration request ${historical.record.request.request_id} already has another exact-run bridge.`);
+    }
+    return existing;
+  }
+  const protectedBase = await readRepositoryDefaultBranchIdentity(github);
+  const createdAt = new Date(Math.max(Date.now(), now, Date.parse(commit.run_created_at))).toISOString();
+  const bridge = historicalIntegrationExactRunBridgeSchema.parse({
+    version: 1,
+    kind: "historical_integration_exact_run",
+    request: historical.record.request,
+    dispatch: historical.record.dispatch,
+    commit,
+    historical_record_digest: historicalRecordDigest(historical.body),
+    recovery_base_sha: protectedBase.sha,
+    created_at: createdAt,
+  });
+  try {
+    const committedBody = await publishDurableProtocolRecord(github, {
+      storageSha: historical.record.identity.headSha,
+      publisherSha: protectedBase.sha,
+      scope: historicalExactRunScope(historical.record.request),
+      unsignedBody: serializeHistoricalIntegrationExactRunBridge(bridge),
+      publicationTimestamp: Date.parse(createdAt),
+      authorityOrder: createdAt,
+    });
+    const committed = parseHistoricalIntegrationExactRunBridge(committedBody);
+    if (!committed || !historicalExactRunBridgeMatches(github, committed, historical, protectedBase.sha) ||
+        JSON.stringify(committed.commit) !== JSON.stringify(commit)) {
+      throw new Error(`Historical Integration exact-run bridge for ${historical.record.request.request_id} returned another identity.`);
+    }
+    return committed;
+  } catch (error) {
+    const latest = await readRepositoryDefaultBranchIdentity(github);
+    if (latest.sha.toLowerCase() !== protectedBase.sha.toLowerCase()) return undefined;
+    throw error;
+  }
+}
+
 function historicalIdentityLostRecord(
   historical: RecoveredHistoricalIntegrationRecord,
   tombstone: HistoricalIntegrationIdentityLostTombstone,
@@ -1024,6 +1198,69 @@ function historicalIdentityLostRecord(
     },
     created_at: commit.created_at,
   };
+}
+
+function historicalExactRunRecord(
+  github: FugueGitHub,
+  historical: RecoveredHistoricalIntegrationRecord,
+  bridge: HistoricalIntegrationExactRunBridge,
+): IntegrationRecord {
+  const binding = integrationRunBindingFromCommit(github, bridge.commit);
+  return {
+    ...historical.record,
+    dispatch_started_at: historical.record.dispatch_started_at ?? binding.created_at,
+    run: binding,
+    terminal: null,
+    created_at: binding.created_at,
+  };
+}
+
+async function historicalExactCandidateFromHint(
+  github: FugueGitHub,
+  historical: RecoveredHistoricalIntegrationRecord,
+  hint: HistoricalIntegrationAuthorityHint,
+): Promise<IntegrationExactRunCandidate | undefined> {
+  const record = historical.record;
+  if (!record.dispatch || hint.requestId !== record.request.request_id || hint.prNumber !== record.identity.prNumber ||
+      hint.headSha.toLowerCase() !== record.identity.headSha.toLowerCase() ||
+      hint.baseSha.toLowerCase() !== record.identity.baseSha.toLowerCase() || hint.anchorName !== record.dispatch.anchor_name) return undefined;
+  if (hint.kind === "binding") {
+    const witness = parseHistoricalJson(hint.raw, historicalIntegrationBindingWitnessSchema);
+    if (!witness || !historicalBindingMatchesRequest(github, witness, record)) return undefined;
+    return { runId: witness.run_id, createdAt: witness.run_created_at, htmlUrl: witness.html_url };
+  }
+  if (hint.kind === "start") {
+    let start: IntegrationRunStartEvidence | null;
+    try { start = parseIntegrationRunStart(hint.raw); } catch { start = null; }
+    if (!start || !(await historicalRunStartMatchesRequest(github, start, hint.raw, record))) return undefined;
+    return {
+      runId: start.run_id,
+      createdAt: start.created_at,
+      htmlUrl: `https://github.com/${github.repository.fullName}/actions/runs/${start.run_id}`,
+    };
+  }
+  return undefined;
+}
+
+async function historicalExactCandidateFromHints(
+  github: FugueGitHub,
+  historical: RecoveredHistoricalIntegrationRecord,
+  group: HistoricalIntegrationAuthorityHint[],
+): Promise<IntegrationExactRunCandidate | undefined> {
+  const candidates: IntegrationExactRunCandidate[] = [];
+  for (const hint of group) {
+    const candidate = await historicalExactCandidateFromHint(github, historical, hint);
+    if (candidate) candidates.push(candidate);
+  }
+  if (!candidates.length) return undefined;
+  const first = candidates[0]!;
+  if (candidates.some((candidate) => candidate.runId !== first.runId || candidate.htmlUrl !== first.htmlUrl)) {
+    throw new Error(`Historical Integration request ${historical.record.request.request_id} has conflicting protected exact-run evidence.`);
+  }
+  return [...candidates].sort((left, right) => {
+    const timestampOrder = Date.parse(left.createdAt) - Date.parse(right.createdAt);
+    return timestampOrder !== 0 ? timestampOrder : left.createdAt.localeCompare(right.createdAt);
+  })[0]!;
 }
 
 async function historicalTransientMatchesRecord(
@@ -1049,16 +1286,7 @@ async function historicalTransientMatchesRecord(
   if (name === integrationRunStartVariableName(record.request)) {
     let start: IntegrationRunStartEvidence | null;
     try { start = parseIntegrationRunStart(value); } catch { start = null; }
-    if (!start || start.request_id !== record.request.request_id || start.pr_number !== record.identity.prNumber ||
-        start.head_sha.toLowerCase() !== record.identity.headSha.toLowerCase() ||
-        start.base_sha.toLowerCase() !== record.identity.baseSha.toLowerCase() ||
-        start.secret_digest.toLowerCase() !== record.dispatch.secret_digest.toLowerCase() ||
-        start.anchor_name !== record.dispatch.anchor_name || start.run_attempt !== 1) return false;
-    const timestamp = Date.parse(start.created_at);
-    if (!Number.isFinite(timestamp)) return false;
-    try {
-      if (!(await verifyProtocolPublicationBodyAtRevision(github, value, record.identity.baseSha, timestamp))) return false;
-    } catch { return false; }
+    if (!start || !(await historicalRunStartMatchesRequest(github, start, value, record))) return false;
     return record.terminal?.state === "identity_lost" || Boolean(record.run && start.run_id === record.run.id);
   }
   if (name === integrationCommitVariableName(record.request.request_id)) {
@@ -1129,38 +1357,67 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
       continue;
     }
 
-    const existingTombstone = await recoverHistoricalIdentityLostTombstone(github, historical);
+    const [existingExactBridge, existingTombstone] = await Promise.all([
+      recoverHistoricalExactRunBridge(github, historical),
+      recoverHistoricalIdentityLostTombstone(github, historical),
+    ]);
+    if (existingExactBridge && existingTombstone) {
+      throw new Error(`Historical Integration request ${record.request.request_id} has conflicting exact-run and identity_lost bridge authority.`);
+    }
+    if (existingExactBridge) {
+      await releaseVerifiedHistoricalIntegrationAuthority(github, historicalExactRunRecord(github, historical, existingExactBridge));
+      continue;
+    }
     if (existingTombstone) {
       await releaseVerifiedHistoricalIntegrationAuthority(github, historicalIdentityLostRecord(historical, existingTombstone));
       continue;
     }
 
-    const exactHints = group.filter((candidate) => candidate.runId !== undefined);
-    const exactRunIds = new Set(exactHints.map((candidate) => candidate.runId!));
-    if (exactRunIds.size === 1) {
+    const context = integrationCommitContext(record)!;
+    let commit = await readIntegrationCommit(github, context);
+    if (!commit) {
+      const candidate = await historicalExactCandidateFromHints(github, historical, group);
+      if (candidate) {
+        commit = await claimIntegrationCommit(github, context, integrationExactRunCommitSchema.parse({
+          version: 1,
+          kind: "integration_exact_run_commit",
+          request_id: context.requestId,
+          pr_number: context.prNumber,
+          head_sha: context.headSha,
+          base_sha: context.baseSha,
+          anchor_name: context.anchorName,
+          run_id: candidate.runId,
+          run_attempt: 1,
+          run_created_at: candidate.createdAt,
+          html_url: candidate.htmlUrl,
+        }));
+      }
+    }
+
+    if (commit?.kind === "integration_exact_run_commit") {
+      const binding = integrationRunBindingFromCommit(github, commit);
+      const exactEvidence = await historicalExactCandidateFromHints(github, historical, group);
+      if (exactEvidence && (exactEvidence.runId !== binding.id || exactEvidence.htmlUrl !== binding.html_url)) {
+        throw new Error(`Historical Integration request ${record.request.request_id} has protected exact-run evidence conflicting with C.`);
+      }
       const protectedBase = await readRepositoryDefaultBranchIdentity(github);
-      // Exact L already won request-local authority. Never replace it with identity_lost, and never
-      // weaken the revision fence by trying to mint fresh d3 under a now-obsolete protected base.
-      if (protectedBase.sha.toLowerCase() !== record.identity.baseSha.toLowerCase()) continue;
-      const exact = exactHints.find((candidate) => candidate.runId !== undefined)!;
-      const expectedUrl = `https://github.com/${github.repository.fullName}/actions/runs/${exact.runId}`;
-      if ((!exact.htmlUrl || exact.htmlUrl === expectedUrl) && exact.createdAt && Number.isFinite(Date.parse(exact.createdAt))) {
+      if (protectedBase.sha.toLowerCase() === record.identity.baseSha.toLowerCase()) {
         await bindDispatchedIntegrationRun(
           github,
           { identity: record.identity } as EvaluationSnapshot,
           record.request.request_id,
-          exact.runId!,
-          expectedUrl,
-          exact.createdAt,
+          binding.id,
+          binding.html_url,
+          binding.created_at,
         );
         continue;
       }
+      const bridge = await ensureHistoricalExactRunBridge(github, historical, commit, now);
+      if (!bridge) continue;
+      await releaseVerifiedHistoricalIntegrationAuthority(github, historicalExactRunRecord(github, historical, bridge));
+      continue;
     }
-    if (exactRunIds.size > 1) continue;
 
-    const context = integrationCommitContext(record)!;
-    let commit = await readIntegrationCommit(github, context);
-    if (commit?.kind === "integration_exact_run_commit") continue;
     const fenceHint = group.find((candidate) => candidate.kind === "fence");
     if (!commit && fenceHint?.createdAt && now - Date.parse(fenceHint.createdAt) >= INTEGRATION_REQUEST_RECOVERY_GRACE_MS) {
       const fence = parseHistoricalJson(fenceHint.raw, historicalIntegrationFenceSchema);
@@ -1174,7 +1431,14 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
       }
     }
 
-    if (commit?.kind === "integration_exact_run_commit") continue;
+    if (commit?.kind === "integration_exact_run_commit") {
+      const protectedBase = await readRepositoryDefaultBranchIdentity(github);
+      if (protectedBase.sha.toLowerCase() === record.identity.baseSha.toLowerCase()) continue;
+      const bridge = await ensureHistoricalExactRunBridge(github, historical, commit, now);
+      if (!bridge) continue;
+      await releaseVerifiedHistoricalIntegrationAuthority(github, historicalExactRunRecord(github, historical, bridge));
+      continue;
+    }
     if (commit?.kind === "integration_identity_lost_commit") {
       const protectedBase = await readRepositoryDefaultBranchIdentity(github);
       if (protectedBase.sha.toLowerCase() === record.identity.baseSha.toLowerCase()) {
