@@ -12,10 +12,10 @@ permissions:
 
 jobs:
   monitor:
-    if: github.event.head_commit.message == '[bootstrap] inspect post-merge control queue'
+    if: github.event.head_commit.message == '[bootstrap] inspect PR25 protected CI'
     runs-on: ubuntu-latest
     steps:
-      - name: Publish recent post-merge control-plane runs
+      - name: Publish exact PR25 protected CI identity
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -28,19 +28,26 @@ jobs:
             'X-GitHub-Api-Version': '2022-11-28',
             'Content-Type': 'application/json',
           };
-          const r = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/fugue-control-plane.yml/runs?per_page=30`, { headers });
-          const body = await r.json();
-          if (!r.ok) throw new Error(`list control-plane runs failed ${r.status}`);
-          const runs = (body.workflow_runs ?? []).filter(x => x.head_branch === 'main' && Date.parse(x.created_at) >= Date.parse('2026-08-19T18:57:00Z')).slice(0, 10);
-          if (!runs.length) throw new Error('No post-merge control-plane runs found.');
-          for (const run of runs) {
-            const state = run.status === 'completed' && run.conclusion === 'success' ? 'success' : run.status === 'completed' ? 'failure' : 'pending';
-            const context = `fugue/bootstrap-control-queue/${run.id}`;
-            const desc = `${run.event} ${run.status}/${run.conclusion ?? 'none'} ${run.created_at}`.slice(0, 140);
-            const s = await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
-              method: 'POST', headers,
-              body: JSON.stringify({ state, context, description: desc, target_url: run.html_url }),
-            });
-            if (!s.ok) throw new Error(`status publish failed ${s.status}`);
-          }
+          const runsResponse = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/ci.yml/runs?event=pull_request_target&per_page=50`, { headers });
+          const runsBody = await runsResponse.json();
+          if (!runsResponse.ok) throw new Error(`list CI runs failed ${runsResponse.status}`);
+          const run = (runsBody.workflow_runs ?? []).find((candidate) =>
+            (candidate.pull_requests ?? []).some((pr) => pr.number === 25) ||
+            String(candidate.display_title ?? '').includes('Bound Fugue Authority recovery API usage')
+          );
+          if (!run) throw new Error('No pull_request_target CI run found for PR #25.');
+          const jobsResponse = await fetch(`https://api.github.com/repos/${repo}/actions/runs/${run.id}/jobs?per_page=100`, { headers });
+          const jobsBody = await jobsResponse.json();
+          if (!jobsResponse.ok) throw new Error(`list CI jobs failed ${jobsResponse.status}`);
+          const job = (jobsBody.jobs ?? []).find((candidate) => candidate.name === 'test') ?? (jobsBody.jobs ?? [])[0];
+          if (!job) throw new Error('No CI job found for PR #25 run.');
+          const success = run.status === 'completed' && run.conclusion === 'success' && job.status === 'completed' && job.conclusion === 'success';
+          const state = success ? 'success' : run.status === 'completed' ? 'failure' : 'pending';
+          const context = `fugue/bootstrap-pr25-ci/${run.id}-${job.id}`;
+          const desc = `${run.event} ${run.status}/${run.conclusion ?? 'none'} job ${job.status}/${job.conclusion ?? 'none'}`.slice(0, 140);
+          const statusResponse = await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
+            method: 'POST', headers,
+            body: JSON.stringify({ state, context, description: desc, target_url: run.html_url }),
+          });
+          if (!statusResponse.ok) throw new Error(`status publish failed ${statusResponse.status}`);
           NODE
