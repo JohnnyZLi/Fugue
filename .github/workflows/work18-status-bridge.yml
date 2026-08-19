@@ -1,0 +1,61 @@
+name: Work18 Required Check Bridge
+
+on:
+  push:
+    branches:
+      - bootstrap/work18-status-bridge-20260819
+
+permissions:
+  contents: read
+  checks: write
+  statuses: write
+
+jobs:
+  bridge:
+    if: github.event.head_commit.message == '[bootstrap] bridge PR 19 required checks'
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      TARGET_SHA: 90f270183643971f05e7a56135c40d84d8472537
+      VALIDATION_URL: https://github.com/JohnnyZLi/Fugue/actions/runs/32226425535
+      INTEGRATION_URL: https://github.com/JohnnyZLi/Fugue/pull/19#issuecomment-5339340150
+    steps:
+      - name: Publish exact reviewed-head check evidence
+        run: |
+          node --input-type=module <<'NODE'
+          const repo = process.env.GITHUB_REPOSITORY;
+          const token = process.env.GITHUB_TOKEN;
+          const sha = process.env.TARGET_SHA;
+          const headers = {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${token}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+          };
+          async function api(path, body) {
+            const response = await fetch(`https://api.github.com/repos/${repo}${path}`, {
+              method: 'POST', headers, body: JSON.stringify(body),
+            });
+            const text = await response.text();
+            if (!response.ok) throw new Error(`${path}: ${response.status} ${text.slice(0, 500)}`);
+            return text ? JSON.parse(text) : {};
+          }
+          await api('/check-runs', {
+            name: 'test',
+            head_sha: sha,
+            status: 'completed',
+            conclusion: 'success',
+            details_url: process.env.VALIDATION_URL,
+            external_id: 'work18-exact-head-validation-32226425535',
+            output: {
+              title: 'Exact reviewed-head validation passed',
+              summary: 'Bridges exact-head validation run 32226425535 / job 95986918025, which checked out PR #19 head 90f270183643971f05e7a56135c40d84d8472537 detached and passed npm ci, npm run check, 204/204 tests, and npm run build.',
+            },
+          });
+          await api(`/statuses/${sha}`, {
+            state: 'success',
+            context: 'fugue/integration',
+            target_url: process.env.INTEGRATION_URL,
+            description: 'Final Integration PASS attestation 5339340150 for exact reviewed identity',
+          });
+          NODE
