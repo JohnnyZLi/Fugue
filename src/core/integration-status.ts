@@ -426,6 +426,7 @@ interface RecoveredHistoricalIntegrationRecord {
 const HISTORICAL_INTEGRATION_CLEANUP_BUDGET = 16;
 const HISTORICAL_INTEGRATION_RECOVERY_SLICES = 4;
 const HISTORICAL_INTEGRATION_WINNER_CLAIM_CLEANUP_BUDGET = 4;
+export const HISTORICAL_INTEGRATION_H_ONLY_CLEANUP_BUDGET = 16;
 
 export interface CleanupAwareRunStartContext {
   requestId: string;
@@ -1041,6 +1042,36 @@ function historicalWinnerClaimMatches(
   return Number.isFinite(Date.parse(claim.commit.boundary_created_at)) && Number.isFinite(Date.parse(claim.commit.created_at));
 }
 
+function sameHistoricalIntegrationCommit(left: IntegrationCommit, right: IntegrationCommit): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+export function historicalIntegrationWinnerClaimCanBeReclaimed(input: {
+  repositoryFullName: string;
+  variableName: string;
+  rawClaim: string;
+  historicalRecord: IntegrationRecord;
+  historicalBody: string;
+  durableWinnerCommit: IntegrationCommit;
+}): boolean {
+  const claim = parseHistoricalJson(input.rawClaim, historicalIntegrationWinnerClaimSchema);
+  if (!claim || !input.historicalRecord.dispatch) return false;
+  if (input.variableName !== historicalIntegrationWinnerClaimName(claim.request_id, claim.recovery_base_sha)) return false;
+  if (claim.recovery_base_sha.toLowerCase() === input.historicalRecord.identity.baseSha.toLowerCase()) return false;
+  const historical: RecoveredHistoricalIntegrationRecord = { record: input.historicalRecord, body: input.historicalBody };
+  const github = { repository: { fullName: input.repositoryFullName } } as FugueGitHub;
+  if (!historicalWinnerClaimMatches(github, claim, historical)) return false;
+  const durable = integrationCommitSchema.safeParse(input.durableWinnerCommit);
+  if (!durable.success) return false;
+  try { assertCommitIdentity(durable.data, integrationCommitContext(input.historicalRecord)!); }
+  catch { return false; }
+  const selectedAt = claim.commit.kind === "integration_exact_run_commit"
+    ? Date.parse(claim.commit.run_created_at)
+    : Date.parse(claim.commit.created_at);
+  if (!Number.isFinite(selectedAt) || Date.parse(claim.created_at) < selectedAt) return false;
+  return sameHistoricalIntegrationCommit(claim.commit, durable.data);
+}
+
 async function historicalRecoveryPublishers(
   github: FugueGitHub,
   historical: RecoveredHistoricalIntegrationRecord,
@@ -1476,6 +1507,69 @@ async function releaseVerifiedHistoricalIntegrationAuthority(
   }
 }
 
+async function reclaimHistoricalIntegrationWinnerClaimOrphans(
+  github: FugueGitHub,
+  variables: Array<{ name: string; value: string }>,
+  currentIdentities: IntegrationRequest["identity"][],
+): Promise<void> {
+  let budget = HISTORICAL_INTEGRATION_H_ONLY_CLEANUP_BUDGET;
+  const claims = variables
+    .filter((variable) => variable.name.startsWith(INTEGRATION_HISTORICAL_WINNER_PREFIX))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  for (const variable of claims) {
+    if (budget <= 0) break;
+    const claim = parseHistoricalJson(variable.value, historicalIntegrationWinnerClaimSchema);
+    if (!claim || variable.name !== historicalIntegrationWinnerClaimName(claim.request_id, claim.recovery_base_sha)) continue;
+    budget -= 1;
+    const hint: HistoricalIntegrationAuthorityHint = claim.commit.kind === "integration_exact_run_commit"
+      ? {
+          kind: "commit_exact",
+          variableName: variable.name,
+          raw: variable.value,
+          requestId: claim.request_id,
+          prNumber: claim.pr_number,
+          headSha: claim.head_sha,
+          baseSha: claim.base_sha,
+          anchorName: claim.anchor_name,
+          runId: claim.commit.run_id,
+          createdAt: claim.commit.run_created_at,
+          htmlUrl: claim.commit.html_url,
+        }
+      : {
+          kind: "commit_identity_lost",
+          variableName: variable.name,
+          raw: variable.value,
+          requestId: claim.request_id,
+          prNumber: claim.pr_number,
+          headSha: claim.head_sha,
+          baseSha: claim.base_sha,
+          anchorName: claim.anchor_name,
+          boundaryCreatedAt: claim.commit.boundary_created_at,
+          fenceDigest: claim.commit.fence_digest,
+          createdAt: claim.commit.created_at,
+        };
+    const historical = await recoverHistoricalIntegrationRecord(github, hint);
+    if (!historical) continue;
+    if (currentIdentities.some((candidate) => sameEvaluationIdentity(candidate, historical.record.identity))) continue;
+    let winner: HistoricalIntegrationWinner | undefined;
+    try { winner = await recoverHistoricalIntegrationWinner(github, historical); }
+    catch (error) {
+      if (error instanceof DurableProtocolRecoveryPendingError) continue;
+      throw error;
+    }
+    if (!winner || !historicalIntegrationWinnerClaimCanBeReclaimed({
+      repositoryFullName: github.repository.fullName,
+      variableName: variable.name,
+      rawClaim: variable.value,
+      historicalRecord: historical.record,
+      historicalBody: historical.body,
+      durableWinnerCommit: winner.commit,
+    })) continue;
+    if (await getFugueAuthorityVariable(github, variable.name) !== variable.value) continue;
+    await deleteFugueAuthorityVariable(github, variable.name);
+  }
+}
+
 async function reclaimHistoricalIntegrationAuthorityVariables(
   github: FugueGitHub,
   variables: Array<{ name: string; value: string }>,
@@ -1675,7 +1769,10 @@ export async function reclaimOrphanIntegrationAuthorityVariables(
     await deleteFugueAuthorityVariable(github, name);
   }
 
-  if (currentIdentities !== undefined) await reclaimHistoricalIntegrationAuthorityVariables(github, variables, now, currentIdentities);
+  if (currentIdentities !== undefined) {
+    await reclaimHistoricalIntegrationAuthorityVariables(github, variables, now, currentIdentities);
+    await reclaimHistoricalIntegrationWinnerClaimOrphans(github, variables, currentIdentities);
+  }
 }
 
 function integrationRunBindingFromEvidence(github: FugueGitHub, evidence: IntegrationRunStartEvidence): IntegrationRunBinding {
