@@ -12,10 +12,10 @@ permissions:
 
 jobs:
   monitor:
-    if: github.event.head_commit.message == '[bootstrap] monitor PR23 ack control plane'
+    if: github.event.head_commit.message == '[bootstrap] verify installed Authority App via protected control plane'
     runs-on: ubuntu-latest
     steps:
-      - name: Publish recent protected control-plane runs
+      - name: Publish newest protected control-plane run
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -31,17 +31,17 @@ jobs:
           const r = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/fugue-control-plane.yml/runs?event=issue_comment&per_page=10`, { headers });
           const body = await r.json();
           if (!r.ok) throw new Error(`list control-plane runs failed ${r.status}`);
-          for (const run of (body.workflow_runs ?? []).filter(x => x.head_branch === 'main').slice(0, 5)) {
-            const state = run.status === 'completed' && run.conclusion === 'success' ? 'success' : run.status === 'completed' ? 'failure' : 'pending';
-            const s = await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
-              method: 'POST', headers,
-              body: JSON.stringify({
-                state,
-                context: `fugue/bootstrap-pr23-ack-control/${run.id}`,
-                description: `${run.status}/${run.conclusion ?? 'none'} ${run.created_at}`.slice(0, 140),
-                target_url: run.html_url,
-              }),
-            });
-            if (!s.ok) throw new Error(`status publish failed ${s.status}`);
-          }
+          const run = (body.workflow_runs ?? []).find(x => x.head_branch === 'main');
+          if (!run) throw new Error('No issue_comment control-plane run found.');
+          const state = run.status === 'completed' && run.conclusion === 'success' ? 'success' : run.status === 'completed' ? 'failure' : 'pending';
+          const s = await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
+            method: 'POST', headers,
+            body: JSON.stringify({
+              state,
+              context: `fugue/bootstrap-install-recheck/${run.id}`,
+              description: `${run.status}/${run.conclusion ?? 'none'} attempt ${run.run_attempt}`,
+              target_url: run.html_url,
+            }),
+          });
+          if (!s.ok) throw new Error(`status publish failed ${s.status}`);
           NODE
