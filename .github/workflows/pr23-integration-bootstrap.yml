@@ -6,40 +6,8 @@ on:
       - bootstrap/work18-status-bridge-20260819
 
 jobs:
-  validate:
-    if: github.event.head_commit.message == '[bootstrap] validate PR23 integration bridge'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: 3bfce4146a16e0e33bd423f9c2d18a03a81e134d
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-        env:
-          GITHUB_TOKEN: ''
-          GH_TOKEN: ''
-      - run: npm run check
-        env:
-          GITHUB_TOKEN: ''
-          GH_TOKEN: ''
-      - run: npm test
-        env:
-          GITHUB_TOKEN: ''
-          GH_TOKEN: ''
-      - run: npm run build
-        env:
-          GITHUB_TOKEN: ''
-          GH_TOKEN: ''
-
   publish:
-    if: github.event.head_commit.message == '[bootstrap] validate PR23 integration bridge'
-    needs: validate
+    if: github.event.head_commit.message == '[bootstrap] publish PR23 integration bridge'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -47,7 +15,7 @@ jobs:
       pull-requests: read
       statuses: write
     steps:
-      - name: Revalidate exact reviewed identity and publish bootstrap Integration PASS
+      - name: Revalidate exact reviewed identity and prior isolated validation
         env:
           GITHUB_TOKEN: ${{ github.token }}
           HEAD_SHA: 3bfce4146a16e0e33bd423f9c2d18a03a81e134d
@@ -55,11 +23,13 @@ jobs:
           PR_NUMBER: '23'
           CODE_COMMENT: '5346139453'
           SECURITY_COMMENT: '5346317125'
-          HUMAN_ACK_COMMENT: '5346391286'
+          HUMAN_ACK_COMMENT: '5346663778'
+          VALIDATION_RUN: '32289874159'
+          VALIDATION_JOB: '96187961244'
+          VALIDATION_TRIGGER_SHA: dd9cf59d57c3e7b8f0c6382dea8051a5bdc65bb0
         run: |
           node --input-type=module <<'NODE'
           const repo = process.env.GITHUB_REPOSITORY;
-          const [owner, name] = repo.split('/');
           const headers = {
             Accept: 'application/vnd.github+json',
             Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
@@ -72,10 +42,22 @@ jobs:
             if (!r.ok) throw new Error(`GET ${path} failed ${r.status}: ${text.slice(0,300)}`);
             return text ? JSON.parse(text) : null;
           }
+
           const pr = await get(`/pulls/${process.env.PR_NUMBER}`);
           if (pr.state !== 'open' || pr.head?.sha !== process.env.HEAD_SHA || pr.base?.ref !== 'main' || pr.base?.sha !== process.env.BASE_SHA) {
             throw new Error('PR #23 exact reviewed identity changed; refusing bootstrap publication.');
           }
+
+          const run = await get(`/actions/runs/${process.env.VALIDATION_RUN}`);
+          if (String(run.id) !== process.env.VALIDATION_RUN || run.event !== 'push' || run.head_sha !== process.env.VALIDATION_TRIGGER_SHA || run.run_attempt !== 1) {
+            throw new Error('Bootstrap validation run identity does not match the recorded isolated validation.');
+          }
+          const jobs = await get(`/actions/runs/${process.env.VALIDATION_RUN}/jobs?filter=latest&per_page=100`);
+          const validationJob = (jobs.jobs ?? []).find(j => String(j.id) === process.env.VALIDATION_JOB);
+          if (!validationJob || validationJob.name !== 'validate' || validationJob.status !== 'completed' || validationJob.conclusion !== 'success') {
+            throw new Error('Recorded isolated exact-head validation job is not successful.');
+          }
+
           const comments = await get(`/issues/${process.env.PR_NUMBER}/comments?per_page=100`);
           const byId = new Map(comments.map(c => [String(c.id), String(c.body ?? '')]));
           const code = byId.get(process.env.CODE_COMMENT) ?? '';
@@ -83,7 +65,9 @@ jobs:
           const ack = byId.get(process.env.HUMAN_ACK_COMMENT) ?? '';
           if (!code.includes('session_id: rev-code-1977c891') || !code.includes('verdict: approved')) throw new Error('Exact Code QA approval missing.');
           if (!security.includes('session_id: rev-security-8f42c1d7') || !security.includes('verdict: approved')) throw new Error('Exact Security QA approval missing.');
-          if (!ack.includes(process.env.HEAD_SHA) || !ack.includes('Human merge decision: APPROVED')) throw new Error('Exact Human control-plane acknowledgement/merge decision missing.');
+          if (!ack.includes(process.env.HEAD_SHA) || !ack.includes(process.env.BASE_SHA) || !ack.includes('Human merge decision: APPROVED')) {
+            throw new Error('Exact immutable Human acknowledgement/merge decision missing.');
+          }
 
           const runUrl = `https://github.com/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
           const r = await fetch(`https://api.github.com/repos/${repo}/statuses/${process.env.HEAD_SHA}`, {
