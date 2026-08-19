@@ -1,0 +1,76 @@
+name: Work 20 Review Identity Digest
+
+on:
+  push:
+    branches:
+      - bootstrap/work18-status-bridge-20260819
+
+permissions:
+  contents: read
+  issues: read
+  statuses: write
+
+jobs:
+  digest:
+    if: github.event.head_commit.message == '[bootstrap] compute work-20 review identity'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Compute canonical policy and work-spec digests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          import { digestCanonical } from './dist/core/hash.js';
+          import { parseWorkMetadata, workSpecDigest } from './dist/core/metadata.js';
+          import { parseVersionFile } from './dist/core/policy.js';
+
+          const normalize = value => value.replace(/\r\n?/g, '\n').trim();
+          const versionRaw = readFileSync('.fugue/VERSION', 'utf8');
+          const configRaw = readFileSync('.fugue/config.yml', 'utf8');
+          const agentsRaw = readFileSync('AGENTS.md', 'utf8');
+          const version = parseVersionFile(versionRaw);
+          const policyDigest = digestCanonical({
+            protocol: version.protocol,
+            version: normalize(versionRaw),
+            config: normalize(configRaw),
+            agents: normalize(agentsRaw),
+          });
+
+          const headers = {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+          };
+          const issueResponse = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/issues/20`, { headers });
+          const issue = await issueResponse.json();
+          if (!issueResponse.ok) throw new Error(`issue read failed ${issueResponse.status}`);
+          const metadata = parseWorkMetadata(String(issue.body ?? ''));
+          if (!metadata) throw new Error('Issue #20 has no canonical fugue-work metadata');
+          const specDigest = workSpecDigest(String(issue.body ?? ''), metadata);
+
+          for (const [kind, digest] of [['policy', policyDigest], ['spec', specDigest]]) {
+            const hex = digest.replace(/^sha256:/, '');
+            if (!/^[0-9a-f]{64}$/.test(hex)) throw new Error(`invalid ${kind} digest`);
+            const s = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/statuses/${process.env.GITHUB_SHA}`, {
+              method: 'POST', headers,
+              body: JSON.stringify({
+                state: 'success',
+                context: `fugue/bootstrap-work20-${kind}/${hex}`,
+                description: `canonical work-20 ${kind} digest`,
+              }),
+            });
+            if (!s.ok) throw new Error(`${kind} status failed ${s.status}`);
+          }
+          NODE
