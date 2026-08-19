@@ -184,16 +184,27 @@ export async function reconcileRepository(
   const selected = selectWorks(initial.works, options);
   const issueNumbers = selected.map((work) => work.issueNumber);
 
-  for (const issueNumber of issueNumbers) await reconcileWork(github, issueNumber);
+  // Repository-wide rollover/locator repair is maintenance, not a deterministic work transition.
+  // The repository entry point already performed it exactly once above, so selected works enter the
+  // bounded transition loop directly instead of amplifying global scans up to 12x per work.
+  for (const issueNumber of issueNumbers) await reconcileWorkTransitions(github, issueNumber);
   return { processed: issueNumbers };
 }
 
 export async function reconcileWork(github: FugueGitHub, issueNumber: number): Promise<void> {
+  // Standalone issue reconciliation still gets one maintenance pass. It is deliberately outside the
+  // transition loop: advancing a deterministic work state must never restart repository-wide rollover.
+  const policy = await resolveActivePolicy(github);
+  assertProtectedWorkflowRuntimeCurrent(policy);
+  await rollCanonicalWorkStatesToCurrentBase(github, policy);
+  await repairCanonicalWorkStateComments(github, policy);
+  await reconcileWorkTransitions(github, issueNumber);
+}
+
+async function reconcileWorkTransitions(github: FugueGitHub, issueNumber: number): Promise<void> {
   for (let transition = 0; transition < MAX_TRANSITIONS_PER_WORK; transition += 1) {
     const policy = await resolveActivePolicy(github);
     assertProtectedWorkflowRuntimeCurrent(policy);
-    await rollCanonicalWorkStatesToCurrentBase(github, policy);
-    await repairCanonicalWorkStateComments(github, policy);
     await replayCoordinatorSnapshots(github, policy, issueNumber);
     await adoptAssignedPullRequests(github, policy);
     await repairCanonicalMirrors(github, policy, issueNumber);
