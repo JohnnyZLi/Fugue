@@ -13,11 +13,11 @@ jobs:
     env:
       GITHUB_TOKEN: ""
       GH_TOKEN: ""
-      EXPECTED_SHA: e6fb8d544682340c9819b5f816c324a81238d9d5
+      EXPECTED_SHA: 6df9420df4fca60bb1d25d81cef3a0f943f37041
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: e6fb8d544682340c9819b5f816c324a81238d9d5
+          ref: 6df9420df4fca60bb1d25d81cef3a0f943f37041
           persist-credentials: false
       - name: Confirm detached exact head and credential isolation
         run: |
@@ -49,7 +49,7 @@ jobs:
       - name: Record exact-head validation
         run: |
           set -euo pipefail
-          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' 'e6fb8d544682340c9819b5f816c324a81238d9d5' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-integration-exact-final-result.txt
+          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '6df9420df4fca60bb1d25d81cef3a0f943f37041' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-integration-exact-final-result.txt
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
           git add .github/work18-integration-exact-final-result.txt
