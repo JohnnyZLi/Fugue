@@ -132,7 +132,7 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).toContain("deployment-branch-policies?per_page=100");
     expect(workflow).toContain("names.length !== 1 || names[0] !== branch");
     expect(workflow).toContain("actions/create-github-app-token@v3");
-    expect(workflow).toContain("permission-variables: write");
+    expect(workflow).not.toContain("permission-variables:");
     expect(workflow).toContain("FUGUE_AUTHORITY_APP_PRIVATE_KEY");
     expect(workflow).toContain("FUGUE_AUTHORITY_TOKEN");
     expect(workflow).toContain("Commit protected Integration run-start evidence");
@@ -196,8 +196,8 @@ describe("GitHub-hosted Integration plan", () => {
     expect(workflow).toContain("deployment-branch-policies?per_page=100");
     expect(workflow).toContain("names.length !== 1 || names[0] !== branch");
     expect(workflow).toContain("actions/create-github-app-token@v3");
-    expect(workflow).toContain("permission-actions: write");
-    expect(workflow).toContain("permission-variables: write");
+    expect(workflow).not.toContain("permission-actions:");
+    expect(workflow).not.toContain("permission-variables:");
     expect(workflow).toContain("FUGUE_AUTHORITY_TOKEN: ${{ steps.fugue-authority.outputs.token }}");
     expect(workflow).toContain("FUGUE_AUTHORITY_ACTOR_ID: ${{ steps.fugue-authority-actor.outputs.id }}");
     expect(workflow).toContain("github.event_name == 'issues'");
