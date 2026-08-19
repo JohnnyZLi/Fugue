@@ -126,11 +126,11 @@ function historicalHFixture(kind: "exact" | "lost", recoveryBaseSha = HISTORICAL
     headSha: "a".repeat(40),
     baseBranch: "main",
     baseSha: HISTORICAL_B1,
-    policyDigest: "sha256:historical-policy",
+    policyDigest: `sha256:${"a".repeat(64)}`,
     protocolVersion: 1 as const,
     issueNumber: 18,
     workId: "work-18",
-    workSpecDigest: "sha256:historical-spec",
+    workSpecDigest: `sha256:${"b".repeat(64)}`,
   };
   const request = createIntegrationRequest(identity, "2026-08-18T20:00:00.000Z", "1234567890abcdef");
   const requestToken = createHash("sha256").update(request.request_id, "utf8").digest("hex").slice(0, 16).toUpperCase();
@@ -229,7 +229,8 @@ describe("historical H-only restart cleanup", () => {
     const foreign = { ...exact.claim, head_sha: "9".repeat(40) };
     expect(hReclaimable(exact, JSON.stringify(foreign))).toBe(false);
 
-    const wrongAnchor = { ...exact.claim, anchor_name: exact.claim.anchor_name.replace(/.$/, "0") };
+    const lastAnchorChar = exact.claim.anchor_name.at(-1)!;
+    const wrongAnchor = { ...exact.claim, anchor_name: `${exact.claim.anchor_name.slice(0, -1)}${lastAnchorChar === "0" ? "1" : "0"}` };
     expect(hReclaimable(exact, JSON.stringify(wrongAnchor))).toBe(false);
 
     const wrongDigest = { ...exact.claim, historical_record_digest: `sha256:${"0".repeat(64)}` };
