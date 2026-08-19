@@ -190,6 +190,13 @@ class RecoveryReadEpochChangedError extends DurableProtocolRecoveryPendingError 
   }
 }
 
+class LocalRecoveryMutationReadError extends DurableProtocolRecoveryPendingError {
+  constructor(message: string) {
+    super(message);
+    this.name = "LocalRecoveryMutationReadError";
+  }
+}
+
 export interface WorkPrState {
   number: number;
   url: string;
@@ -535,7 +542,7 @@ export async function publishDurableProtocolRecord(
         publisherSha: input.publisherSha,
         scope: input.scope,
       };
-      const previous = await findRecoveryCursorForPublisher(github, recoveryIdentityOptions);
+      const previous = await findRecoveryCursorForPublisher(github, recoveryIdentityOptions, true);
       let bestManifest = committedManifest;
       let bestSignedBody = signedBody;
       if (previous?.cursor.commit_witness && previous.cursor.best_manifest && previous.cursor.best_body_b64) {
@@ -571,7 +578,7 @@ export async function publishDurableProtocolRecord(
         best_body_b64: Buffer.from(bestSignedBody, "utf8").toString("base64url"),
         best_manifest: bestManifest,
       }));
-      const durable = await findRecoveryCursorForPublisher(github, recoveryIdentityOptions);
+      const durable = await findRecoveryCursorForPublisher(github, recoveryIdentityOptions, true);
       if (!durable?.cursor.commit_witness || !durable.cursor.best_body_b64) {
         throw new CanonicalWorkStateIntegrityError(`Protected durable witness for ${input.scope} did not become readable.`);
       }
@@ -1676,10 +1683,17 @@ async function getRecoveryReadSession(github: FugueGitHub): Promise<RecoveryRead
 }
 
 async function assertRecoveryReadEpoch(github: FugueGitHub, epoch: string): Promise<void> {
+  const localGeneration = localRecoveryMutationGeneration(github);
   const current = await getFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_IDLE);
   if (current === epoch) return;
   invalidateRecoveryReadSession(github);
   if (current === undefined) {
+    if (localRecoveryMutationSettlements.has(github) ||
+        localRecoveryMutationGeneration(github) !== localGeneration) {
+      throw new LocalRecoveryMutationReadError(
+        "A local protected recovery mutation became active during the read; committed authority remains fenced.",
+      );
+    }
     throw new DurableProtocolRecoveryPendingError(
       "Protected recovery mutation became active during the read; committed authority remains fenced.",
     );
@@ -1692,6 +1706,7 @@ async function assertRecoveryReadEpoch(github: FugueGitHub, epoch: string): Prom
 async function withRecoveryReadSession<T>(
   github: FugueGitHub,
   operation: (session: RecoveryReadSession) => Promise<T>,
+  allowLocalMutationRecapture = false,
 ): Promise<T> {
   let lastChanged: RecoveryReadEpochChangedError | undefined;
   for (let attempt = 0; attempt < RECOVERY_READ_BUILD_ATTEMPTS; attempt += 1) {
@@ -1700,6 +1715,10 @@ async function withRecoveryReadSession<T>(
       return await operation(session);
     } catch (error) {
       invalidateRecoveryReadSession(github);
+      if (allowLocalMutationRecapture && error instanceof LocalRecoveryMutationReadError) {
+        lastChanged = new RecoveryReadEpochChangedError(error.message);
+        continue;
+      }
       if (!(error instanceof RecoveryReadEpochChangedError)) throw error;
       lastChanged = error;
     }
@@ -1761,6 +1780,7 @@ async function inspectRecoveryIdentity(
 async function findRecoveryCursorForPublisher(
   github: FugueGitHub,
   options: RecoveryIdentityOptions,
+  allowLocalMutationRecapture = false,
 ): Promise<{ variableName: string; cursor: RecoveryCursor } | undefined> {
   return withRecoveryReadSession(github, async (session) => {
     const inspected = await inspectRecoveryIdentity(github, options, session);
@@ -1772,7 +1792,7 @@ async function findRecoveryCursorForPublisher(
       );
     }
     return inspected.best ? { variableName: inspected.best.sourceVariableName, cursor: inspected.best.cursor } : undefined;
-  });
+  }, allowLocalMutationRecapture);
 }
 
 async function findRecoveryCursor(
@@ -2137,7 +2157,7 @@ async function writeRecoveryCursor(
   await assertRepositoryDefaultBranchRevision(github, options.publisherSha);
   const identity = recoveryOptionsIdentity(options);
   await compactFugueRecoveryAuthorityVariables(github, identity);
-  const current = await findRecoveryCursorForPublisher(github, options);
+  const current = await findRecoveryCursorForPublisher(github, options, true);
   if (current && recoveryAuthorityConflict(current.cursor, supplied)) return;
   if (current && compareRecoveryProgress(current.cursor, supplied) >= 0) return;
   await assertRepositoryDefaultBranchRevision(github, options.publisherSha);
@@ -2149,7 +2169,7 @@ async function writeRecoveryCursor(
   if (!(await verifyProtocolPublicationBodyAtRevision(github, signed, options.publisherSha, timestamp))) {
     throw new CanonicalWorkStateIntegrityError("Durable recovery checkpoint failed protected provenance self-check.");
   }
-  const latest = await findRecoveryCursorForPublisher(github, options);
+  const latest = await findRecoveryCursorForPublisher(github, options, true);
   if (latest && recoveryAuthorityConflict(latest.cursor, cursor)) return;
   if (latest && compareRecoveryProgress(latest.cursor, cursor) >= 0) return;
   await assertRepositoryDefaultBranchRevision(github, options.publisherSha);
@@ -2159,7 +2179,7 @@ async function writeRecoveryCursor(
       "Protected Fugue Authority-variable namespace cannot represent the required immutable checkpoint after redundant-source, reserve-transfer, and partial-pack allocation; refusing to delete any sole-greatest cursor or unrelated repository variable.",
     );
   }
-  const durable = await findRecoveryCursorForPublisher(github, options);
+  const durable = await findRecoveryCursorForPublisher(github, options, true);
   if (!durable || compareRecoveryProgress(durable.cursor, cursor) < 0) {
     throw new CanonicalWorkStateIntegrityError("Protected Fugue recovery progress did not become durable.");
   }
