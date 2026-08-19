@@ -1750,7 +1750,7 @@ async function inspectRecoveryIdentity(
       best = entry;
     }
   }
-  return { best, structural, uncertain };
+  return best ? { best, structural, uncertain } : { structural, uncertain };
 }
 
 async function findRecoveryCursorForPublisher(
