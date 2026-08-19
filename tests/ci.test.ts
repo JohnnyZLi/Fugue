@@ -299,3 +299,19 @@ describe("historical H-only restart cleanup", () => {
     );
   });
 });
+
+describe("Fugue Authority App token workflow configuration", () => {
+  it("inherits the deliberately narrow App installation permissions instead of using unsupported permission selectors", async () => {
+    for (const path of [
+      ".github/workflows/fugue-control-plane.yml",
+      ".github/workflows/fugue-integration.yml",
+    ]) {
+      const workflow = await readFile(path, "utf8");
+      expect(workflow).toContain("actions/create-github-app-token@v3");
+      expect(workflow).toContain("FUGUE_AUTHORITY_APP_CLIENT_ID");
+      expect(workflow).toContain("FUGUE_AUTHORITY_APP_PRIVATE_KEY");
+      expect(workflow).not.toContain("permission-variables:");
+      expect(workflow).not.toContain("permission-actions:");
+    }
+  });
+});

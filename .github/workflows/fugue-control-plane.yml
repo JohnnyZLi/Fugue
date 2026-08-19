@@ -81,8 +81,6 @@ jobs:
           private-key: ${{ secrets.FUGUE_AUTHORITY_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-          permission-actions: write
-          permission-variables: write
       - name: Resolve Fugue Authority bot identity
         id: fugue-authority-actor
         env:

@@ -86,7 +86,6 @@ jobs:
           private-key: ${{ secrets.FUGUE_AUTHORITY_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-          permission-variables: write
       - name: Commit protected Integration run-start evidence
         id: run-start
         env:
@@ -533,7 +532,6 @@ jobs:
           private-key: ${{ secrets.FUGUE_AUTHORITY_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-          permission-variables: write
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
