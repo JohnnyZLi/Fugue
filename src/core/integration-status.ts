@@ -1263,6 +1263,10 @@ async function historicalExactCandidateFromHints(
   })[0]!;
 }
 
+function historicalRecordHasPermanentCommitWinner(record: IntegrationRecord): boolean {
+  return Boolean(record.run) || record.terminal?.state === "identity_lost";
+}
+
 async function historicalTransientMatchesRecord(
   github: FugueGitHub,
   name: string,
@@ -1270,6 +1274,7 @@ async function historicalTransientMatchesRecord(
   record: IntegrationRecord,
 ): Promise<boolean> {
   if (!record.dispatch) return false;
+  const permanentWinner = historicalRecordHasPermanentCommitWinner(record);
   if (name === integrationDispatchFenceName(record.request.request_id)) {
     const fence = parseHistoricalJson(value, historicalIntegrationFenceSchema);
     return Boolean(fence && historicalFenceMatchesRecord(fence, record));
@@ -1281,24 +1286,18 @@ async function historicalTransientMatchesRecord(
   if (name === integrationBindingWitnessName(record.request.request_id)) {
     const witness = parseHistoricalJson(value, historicalIntegrationBindingWitnessSchema);
     if (!witness || !historicalBindingMatchesRequest(github, witness, record)) return false;
-    return record.terminal?.state === "identity_lost" || Boolean(record.run && witness.run_id === record.run.id);
+    return permanentWinner;
   }
   if (name === integrationRunStartVariableName(record.request)) {
     let start: IntegrationRunStartEvidence | null;
     try { start = parseIntegrationRunStart(value); } catch { start = null; }
     if (!start || !(await historicalRunStartMatchesRequest(github, start, value, record))) return false;
-    return record.terminal?.state === "identity_lost" || Boolean(record.run && start.run_id === record.run.id);
+    return permanentWinner;
   }
   if (name === integrationCommitVariableName(record.request.request_id)) {
     const context = integrationCommitContext(record)!;
-    let commit: IntegrationCommit;
-    try { commit = parseIntegrationCommit(value, context); } catch { return false; }
-    if (commit.kind === "integration_exact_run_commit") {
-      return record.terminal?.state === "identity_lost" || Boolean(record.run && commit.run_id === record.run.id);
-    }
-    return record.terminal?.state === "identity_lost" &&
-      commit.boundary_created_at === record.terminal.boundary_created_at &&
-      commit.fence_digest.toLowerCase() === record.terminal.fence_digest.toLowerCase();
+    try { parseIntegrationCommit(value, context); } catch { return false; }
+    return permanentWinner;
   }
   return false;
 }

@@ -1127,3 +1127,184 @@ describe("cross-protected-base historical exact-L bridge", () => {
     expect([...github.__authorityVariables.keys()].filter((name) => /^FUGUE_INT_[ABCFS]_/.test(name))).toEqual([]);
   }, 30000);
 });
+
+describe("historical bridge permanent C winner", () => {
+  it("reclaims delayed opposite-kind identity_lost C after exact-L bridge cleanup and stale B1 publication failure", async () => {
+    const github = makeHistoricalGithub();
+    const seeded = await seedHistoricalAmbiguity(github, 770, "0000000000000770");
+    const exactC = await claimHistoricalExactC(github, seeded, 177001);
+    const oldBefore = await getCurrentIntegrationRecord(github, seeded.oldIdentity);
+    github.__baseSha = HIST_B2;
+    const b2 = currentDriftIdentity(seeded.oldIdentity, HIST_B2, "f");
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T20:30:00.000Z"), [b2]);
+    expect(historicalExactBridges(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toHaveLength(1);
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(false);
+
+    const staleLostAt = "2026-08-18T21:00:00.000Z";
+    const fenceDigest = `sha256:${createHash("sha256").update(seeded.fenceRaw, "utf8").digest("hex")}`;
+    await claimIdentityLostIntegrationCommit(github, {
+      requestId: seeded.request.request_id,
+      prNumber: seeded.oldIdentity.prNumber,
+      headSha: seeded.oldIdentity.headSha,
+      baseSha: seeded.oldIdentity.baseSha,
+      anchorName: seeded.authorized.authorization.anchor_name,
+    }, { boundaryCreatedAt: seeded.fence.created_at, fenceDigest, createdAt: staleLostAt });
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(true);
+
+    await expect(publishIntegrationRecord(github, {
+      ...seeded.record,
+      dispatch_started_at: seeded.fence.created_at,
+      run: null,
+      terminal: {
+        state: "identity_lost",
+        attempt: 1,
+        boundary_created_at: seeded.fence.created_at,
+        fence_digest: fenceDigest,
+        detail: "stale old-base identity_lost publisher",
+        created_at: staleLostAt,
+      },
+      created_at: staleLostAt,
+    })).rejects.toThrow(/stale protected revision/);
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(true);
+
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T21:00:01.000Z"), [b2]);
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(false);
+    const bridges = historicalExactBridges(github, seeded.request.request_id, seeded.oldIdentity.prNumber);
+    expect(bridges).toHaveLength(1);
+    expect((bridges[0]?.commit as { run_id?: number }).run_id).toBe(exactC.runId);
+    expect(historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toEqual([]);
+    expect(await getCurrentIntegrationRecord(github, seeded.oldIdentity)).toEqual(oldBefore);
+  });
+
+  it("is restart-complete when a delayed opposite-kind C recreates after bridge cleanup and the publisher crashes", async () => {
+    const github = makeHistoricalGithub();
+    const seeded = await seedHistoricalAmbiguity(github, 771, "0000000000000771");
+    const exactC = await claimHistoricalExactC(github, seeded, 177101);
+    github.__baseSha = HIST_B2;
+    const b2 = currentDriftIdentity(seeded.oldIdentity, HIST_B2, "a");
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T20:30:00.000Z"), [b2]);
+    const fenceDigest = `sha256:${createHash("sha256").update(seeded.fenceRaw, "utf8").digest("hex")}`;
+    await claimIdentityLostIntegrationCommit(github, {
+      requestId: seeded.request.request_id,
+      prNumber: seeded.oldIdentity.prNumber,
+      headSha: seeded.oldIdentity.headSha,
+      baseSha: seeded.oldIdentity.baseSha,
+      anchorName: seeded.authorized.authorization.anchor_name,
+    }, { boundaryCreatedAt: seeded.fence.created_at, fenceDigest, createdAt: "2026-08-18T21:01:00.000Z" });
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(true);
+
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T21:02:00.000Z"), [b2]);
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(false);
+    const bridges = historicalExactBridges(github, seeded.request.request_id, seeded.oldIdentity.prNumber);
+    expect(bridges).toHaveLength(1);
+    expect((bridges[0]?.commit as { run_id?: number }).run_id).toBe(exactC.runId);
+    expect(historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toEqual([]);
+  });
+
+  it("keeps a historical identity_lost tombstone permanent when delayed exact C/B/S recreate", async () => {
+    const github = makeHistoricalGithub();
+    const seeded = await seedHistoricalAmbiguity(github, 772, "0000000000000772");
+    const lostC = await claimHistoricalLostC(github, seeded);
+    github.__baseSha = HIST_B2;
+    const b2 = currentDriftIdentity(seeded.oldIdentity, HIST_B2, "b");
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse(lostC.createdAt) + 60_000, [b2]);
+    expect(historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toHaveLength(1);
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(false);
+
+    const lateRun = 177201;
+    const lateAt = "2026-08-18T21:03:00.000Z";
+    await claimExactIntegrationCommit(github, {
+      requestId: seeded.request.request_id,
+      prNumber: seeded.oldIdentity.prNumber,
+      headSha: seeded.oldIdentity.headSha,
+      baseSha: seeded.oldIdentity.baseSha,
+      anchorName: seeded.authorized.authorization.anchor_name,
+    }, { runId: lateRun, createdAt: lateAt, htmlUrl: `https://github.com/JohnnyZLi/Fugue/actions/runs/${lateRun}` });
+    installHistoricalExactBindingAndStart(github, seeded, lateRun, lateAt);
+
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T21:04:00.000Z"), [b2]);
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(false);
+    expect(github.__authorityVariables.has(seeded.names.binding)).toBe(false);
+    expect(github.__authorityVariables.has(integrationRunStartVariableName(seeded.request))).toBe(false);
+    expect(historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toHaveLength(1);
+    expect(historicalExactBridges(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toEqual([]);
+    expect((await getCurrentIntegrationRecord(github, seeded.oldIdentity))?.run).toBeNull();
+  });
+
+  it("never preserves or bridges later L2 over durable historical exact L and keeps the bridge non-current", async () => {
+    const github = makeHistoricalGithub();
+    const seeded = await seedHistoricalAmbiguity(github, 773, "0000000000000773");
+    const exactC = await claimHistoricalExactC(github, seeded, 177301);
+    github.__baseSha = HIST_B2;
+    const b2 = currentDriftIdentity(seeded.oldIdentity, HIST_B2, "c");
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T20:30:00.000Z"), [b2]);
+
+    const laterRun = exactC.runId + 1;
+    const laterAt = "2026-08-18T21:05:00.000Z";
+    await claimExactIntegrationCommit(github, {
+      requestId: seeded.request.request_id,
+      prNumber: seeded.oldIdentity.prNumber,
+      headSha: seeded.oldIdentity.headSha,
+      baseSha: seeded.oldIdentity.baseSha,
+      anchorName: seeded.authorized.authorization.anchor_name,
+    }, { runId: laterRun, createdAt: laterAt, htmlUrl: `https://github.com/JohnnyZLi/Fugue/actions/runs/${laterRun}` });
+    installHistoricalExactBindingAndStart(github, seeded, laterRun, laterAt);
+    await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T21:06:00.000Z"), [b2]);
+
+    expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(false);
+    expect(github.__authorityVariables.has(seeded.names.binding)).toBe(false);
+    expect(github.__authorityVariables.has(integrationRunStartVariableName(seeded.request))).toBe(false);
+    const bridges = historicalExactBridges(github, seeded.request.request_id, seeded.oldIdentity.prNumber);
+    expect(bridges).toHaveLength(1);
+    expect((bridges[0]?.commit as { run_id?: number }).run_id).toBe(exactC.runId);
+    expect((bridges[0]?.commit as { run_id?: number }).run_id).not.toBe(laterRun);
+    const oldRecord = await getCurrentIntegrationRecord(github, seeded.oldIdentity);
+    expect(oldRecord?.run).toBeNull();
+    expect(matchesCleanupAwareDurableRunStartBinding(oldRecord!, {
+      requestId: seeded.request.request_id,
+      prNumber: seeded.oldIdentity.prNumber,
+      baseSha: seeded.oldIdentity.baseSha,
+      anchorName: seeded.authorized.authorization.anchor_name,
+      runId: exactC.runId,
+      runAttempt: 1,
+    })).toBe(false);
+    await expect(currentIntegrationState(github, { identity: b2, pr: { number: b2.prNumber } } as unknown as EvaluationSnapshot))
+      .resolves.toMatchObject({ state: "none" });
+    github.__baseSha = HIST_B3;
+    const b3 = currentDriftIdentity(seeded.oldIdentity, HIST_B3, "d");
+    await expect(currentIntegrationState(github, { identity: b3, pr: { number: b3.prNumber } } as unknown as EvaluationSnapshot))
+      .resolves.toMatchObject({ state: "none" });
+  });
+
+  it("reclaims more than 64 generations of delayed opposite-kind C without Authority exhaustion", async () => {
+    const github = makeHistoricalGithub();
+    for (let index = 0; index < 65; index += 1) {
+      github.__baseSha = HIST_B1;
+      const seeded = await seedHistoricalAmbiguity(github, 900 + index, (0x1000 + index).toString(16).padStart(16, "0"));
+      const exactC = await claimHistoricalExactC(github, seeded, 190000 + index);
+      github.__baseSha = HIST_B2;
+      const b2 = currentDriftIdentity(seeded.oldIdentity, HIST_B2, "e");
+      await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T22:00:00.000Z") + index * 10, [b2]);
+      const fenceDigest = `sha256:${createHash("sha256").update(seeded.fenceRaw, "utf8").digest("hex")}`;
+      await claimIdentityLostIntegrationCommit(github, {
+        requestId: seeded.request.request_id,
+        prNumber: seeded.oldIdentity.prNumber,
+        headSha: seeded.oldIdentity.headSha,
+        baseSha: seeded.oldIdentity.baseSha,
+        anchorName: seeded.authorized.authorization.anchor_name,
+      }, {
+        boundaryCreatedAt: seeded.fence.created_at,
+        fenceDigest,
+        createdAt: new Date(Date.parse("2026-08-18T22:00:01.000Z") + index * 10).toISOString(),
+      });
+      expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(true);
+      await reclaimOrphanIntegrationAuthorityVariables(github, Date.parse("2026-08-18T22:00:02.000Z") + index * 10, [b2]);
+      expect(github.__authorityVariables.has(integrationCommitVariableName(seeded.request.request_id))).toBe(false);
+      const bridges = historicalExactBridges(github, seeded.request.request_id, seeded.oldIdentity.prNumber);
+      expect(bridges).toHaveLength(1);
+      expect((bridges[0]?.commit as { run_id?: number }).run_id).toBe(exactC.runId);
+      expect(historicalTombstones(github, seeded.request.request_id, seeded.oldIdentity.prNumber)).toEqual([]);
+    }
+    expect([...github.__authorityVariables.keys()].filter((name) => /^FUGUE_INT_[ABCFS]_/.test(name))).toEqual([]);
+  }, 45000);
+});
