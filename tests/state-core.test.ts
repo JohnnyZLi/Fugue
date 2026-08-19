@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseConfig } from "../src/core/config.js";
 import { findDependencyCycle } from "../src/core/dependencies.js";
 import { digestCanonical } from "../src/core/hash.js";
+import type { FugueGitHub } from "../src/core/github.js";
 import {
   assertWorkMetadataForIssue,
   createWorkId,
@@ -14,11 +15,68 @@ import {
 import { parseGitHubRepository } from "../src/core/git.js";
 import {
   canonicalRequirements,
+  compactFugueRecoveryAuthorityVariables,
   createCanonicalWorkState,
+  createFugueAuthorityVariable,
+  deleteFugueAuthorityVariable,
+  listFugueAuthorityVariables,
   parseCanonicalWorkState,
+  recoverDurableProtocolRecord,
   serializeCanonicalWorkState,
 } from "../src/core/state.js";
 import { claimWorker, slugify } from "../src/core/worker.js";
+
+const ORIGINAL_AUTHORITY_TOKEN = process.env.FUGUE_AUTHORITY_TOKEN;
+const RECOVERY_IDLE = "FUGUE_D3GI_00";
+const RECOVERY_IDLE_PREFIX = "reserved-for-fugue-recovery-mutation-guard";
+const RECOVERY_BASE = "b".repeat(40);
+
+afterEach(() => {
+  if (ORIGINAL_AUTHORITY_TOKEN === undefined) delete process.env.FUGUE_AUTHORITY_TOKEN;
+  else process.env.FUGUE_AUTHORITY_TOKEN = ORIGINAL_AUTHORITY_TOKEN;
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+function recoveryGithub(authorityVariables?: Map<string, string>): FugueGitHub {
+  return {
+    repository: { owner: "owner", repo: "repo", fullName: "owner/repo" },
+    ...(authorityVariables ? { __authorityVariables: authorityVariables } : {}),
+  } as unknown as FugueGitHub;
+}
+
+function emptyRecoveryOptions(scope: string) {
+  return {
+    storageSha: RECOVERY_BASE,
+    publisherSha: RECOVERY_BASE,
+    scope,
+    issueNumber: 1,
+    parse: () => null,
+    timestamp: () => 0,
+    order: () => "",
+  };
+}
+
+class CountingAuthorityMap extends Map<string, string> {
+  snapshots = 0;
+
+  override entries(): MapIterator<[string, string]> {
+    this.snapshots += 1;
+    return super.entries();
+  }
+}
+
+class RotateEpochOnSnapshotMap extends CountingAuthorityMap {
+  rotated = false;
+
+  override entries(): MapIterator<[string, string]> {
+    if (!this.rotated) {
+      this.rotated = true;
+      super.set(RECOVERY_IDLE, `${RECOVERY_IDLE_PREFIX}:${"2".repeat(32)}`);
+    }
+    return super.entries();
+  }
+}
 
 describe("canonical digests", () => {
   it("does not depend on object key order", () => {
@@ -94,6 +152,132 @@ describe("work metadata", () => {
     const body = serializeCanonicalWorkState(state);
     expect(body.match(/<!-- fugue-/g)).toHaveLength(1);
     expect(canonicalRequirements(parseCanonicalWorkState(body)!)).toBe(requirements);
+  });
+});
+
+describe("bounded Fugue Authority reads", () => {
+  it("reads a full 500-variable namespace in five list requests and reuses the pinned snapshot across scopes", async () => {
+    process.env.FUGUE_AUTHORITY_TOKEN = "authority-test-token";
+    const idle = `${RECOVERY_IDLE_PREFIX}:${"1".repeat(32)}`;
+    const variables = [
+      { name: RECOVERY_IDLE, value: idle },
+      ...Array.from({ length: 499 }, (_, index) => ({
+        name: `UNRELATED_${String(index).padStart(4, "0")}`,
+        value: "unrelated",
+      })),
+    ];
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname.endsWith(`/actions/variables/${RECOVERY_IDLE}`)) {
+        return Response.json({ name: RECOVERY_IDLE, value: idle });
+      }
+      if (url.pathname.endsWith("/actions/variables")) {
+        const page = Number(url.searchParams.get("page") ?? "1");
+        const start = (page - 1) * 100;
+        return Response.json({ total_count: variables.length, variables: variables.slice(start, start + 100) });
+      }
+      return Response.json({ message: "unexpected request" }, { status: 500 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const github = recoveryGithub();
+
+    for (const scope of ["budget/a", "budget/b", "budget/c"]) {
+      await expect(recoverDurableProtocolRecord(github, emptyRecoveryOptions(scope))).resolves.toEqual({ exhausted: true });
+    }
+
+    const listRequests = fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes("/actions/variables?per_page=100&page="));
+    expect(listRequests).toHaveLength(5);
+    expect(fetchMock).toHaveBeenCalledTimes(10);
+  });
+
+  it("bounded-recaptures when the idle epoch rotates while the namespace snapshot is being built", async () => {
+    const variables = new RotateEpochOnSnapshotMap([
+      [RECOVERY_IDLE, `${RECOVERY_IDLE_PREFIX}:${"1".repeat(32)}`],
+    ]);
+    const github = recoveryGithub(variables);
+
+    await expect(recoverDurableProtocolRecord(github, emptyRecoveryOptions("epoch/rotate"))).resolves.toEqual({ exhausted: true });
+    expect(variables.snapshots).toBe(2);
+  });
+
+  it("fails closed on a structurally corrupt simultaneous idle epoch and active guard", async () => {
+    const variables = new Map<string, string>([
+      [RECOVERY_IDLE, `${RECOVERY_IDLE_PREFIX}:${"1".repeat(32)}`],
+      ["FUGUE_D3GT_CORRUPT", JSON.stringify({
+        version: 1,
+        publisher_sha: RECOVERY_BASE,
+        target_name: "FUGUE_D3_DEADBEEF_DEADBEEF",
+        target_value: "candidate",
+        created_at: new Date().toISOString(),
+        maintenance: true,
+      })],
+    ]);
+    const github = recoveryGithub(variables);
+
+    await expect(recoverDurableProtocolRecord(github, emptyRecoveryOptions("epoch/corrupt")))
+      .rejects.toThrow(/simultaneously exposes an idle epoch and an active mutation guard/i);
+  });
+
+  it("fences a recent legacy active guard when the idle slot is missing instead of scanning past it", async () => {
+    const variables = new Map<string, string>([[
+      "FUGUE_D3GT_LEGACY",
+      JSON.stringify({
+        version: 1,
+        publisher_sha: RECOVERY_BASE,
+        target_name: "__fugue_recovery_maintenance__",
+        target_value: "maintenance",
+        created_at: new Date().toISOString(),
+        maintenance: true,
+      }),
+    ]]);
+    const github = recoveryGithub(variables);
+
+    await expect(recoverDurableProtocolRecord(github, emptyRecoveryOptions("epoch/legacy")))
+      .rejects.toThrow(/still provisional|remains fenced/i);
+  });
+
+  it("invalidates the shared snapshot after create, delete, guarded rename, and compaction mutations", async () => {
+    const variables = new CountingAuthorityMap([
+      [RECOVERY_IDLE, `${RECOVERY_IDLE_PREFIX}:${"1".repeat(32)}`],
+    ]);
+    const github = recoveryGithub(variables);
+
+    await recoverDurableProtocolRecord(github, emptyRecoveryOptions("cache/a"));
+    await recoverDurableProtocolRecord(github, emptyRecoveryOptions("cache/b"));
+    expect(variables.snapshots).toBe(1);
+
+    await createFugueAuthorityVariable(github, "UNRELATED_CACHE_TEST", "value");
+    await recoverDurableProtocolRecord(github, emptyRecoveryOptions("cache/c"));
+    expect(variables.snapshots).toBe(2);
+
+    await deleteFugueAuthorityVariable(github, "UNRELATED_CACHE_TEST");
+    await recoverDurableProtocolRecord(github, emptyRecoveryOptions("cache/d"));
+    expect(variables.snapshots).toBe(3);
+
+    await compactFugueRecoveryAuthorityVariables(github);
+    const afterCompaction = variables.snapshots;
+    await recoverDurableProtocolRecord(github, emptyRecoveryOptions("cache/e"));
+    expect(variables.snapshots).toBe(afterCompaction + 1);
+  });
+
+  it("distinguishes GitHub rate exhaustion from Authority-variable permission denial", async () => {
+    process.env.FUGUE_AUTHORITY_TOKEN = "authority-test-token";
+    const github = recoveryGithub();
+
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json(
+      { message: "API rate limit exceeded for installation" },
+      { status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1800000000" } },
+    )));
+    await expect(listFugueAuthorityVariables(github, "FUGUE_D3"))
+      .rejects.toThrow(/rate limit.*remaining=0/i);
+
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json(
+      { message: "Resource not accessible by integration" },
+      { status: 403, headers: { "x-ratelimit-remaining": "4999" } },
+    )));
+    await expect(listFugueAuthorityVariables(recoveryGithub(), "FUGUE_D3"))
+      .rejects.toThrow(/permissions \(403: Resource not accessible by integration\)/i);
   });
 });
 
