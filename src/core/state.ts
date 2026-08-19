@@ -624,35 +624,36 @@ export async function recoverDurableProtocolRecord<T>(
   github: FugueGitHub,
   options: DurableRecordOptions<T>,
 ): Promise<DurableRecoveryResult<T>> {
-  const session = await getRecoveryReadSession(github);
-  const inspected = await inspectRecoveryIdentity(github, options, session);
-  if (inspected.uncertain) {
-    invalidateRecoveryReadSession(github);
-    await assertRecoveryReadEpoch(github, session.epoch);
-    throw new DurableProtocolRecoveryPendingError(
-      `Protected durable commit witness for ${options.scope} exists but is not currently verifiable.`,
-    );
-  }
-  const cursor = inspected.best?.cursor;
-  if (!cursor?.commit_witness || !cursor.best_body_b64 || !cursor.best_manifest) {
-    await assertRecoveryReadEpoch(github, session.epoch);
-    if (inspected.structural) {
+  return withRecoveryReadSession(github, async (session) => {
+    const inspected = await inspectRecoveryIdentity(github, options, session);
+    if (inspected.uncertain) {
+      await assertRecoveryReadEpoch(github, session.epoch);
       invalidateRecoveryReadSession(github);
       throw new DurableProtocolRecoveryPendingError(
         `Protected durable commit witness for ${options.scope} exists but is not currently verifiable.`,
       );
     }
-    return { exhausted: true };
-  }
-  const body = Buffer.from(cursor.best_body_b64, "base64url").toString("utf8");
-  const value = await validateDurableBody(github, options, body);
-  await assertRecoveryReadEpoch(github, session.epoch);
-  if (!value || options.order(value) !== manifestOrder(cursor.best_manifest)) {
-    throw new CanonicalWorkStateIntegrityError(
-      `Protected durable commit witness for ${options.scope} failed body/order validation.`,
-    );
-  }
-  return { record: { value, body }, exhausted: true };
+    const cursor = inspected.best?.cursor;
+    if (!cursor?.commit_witness || !cursor.best_body_b64 || !cursor.best_manifest) {
+      await assertRecoveryReadEpoch(github, session.epoch);
+      if (inspected.structural) {
+        invalidateRecoveryReadSession(github);
+        throw new DurableProtocolRecoveryPendingError(
+          `Protected durable commit witness for ${options.scope} exists but is not currently verifiable.`,
+        );
+      }
+      return { exhausted: true };
+    }
+    const body = Buffer.from(cursor.best_body_b64, "base64url").toString("utf8");
+    const value = await validateDurableBody(github, options, body);
+    await assertRecoveryReadEpoch(github, session.epoch);
+    if (!value || options.order(value) !== manifestOrder(cursor.best_manifest)) {
+      throw new CanonicalWorkStateIntegrityError(
+        `Protected durable commit witness for ${options.scope} failed body/order validation.`,
+      );
+    }
+    return { record: { value, body }, exhausted: true };
+  });
 }
 
 async function validateDurableBody<T>(
@@ -771,7 +772,6 @@ interface FugueAuthorityVariable {
 interface RecoveryReadSession {
   epoch: string;
   variables: readonly FugueAuthorityVariable[];
-  verifiedBuckets: Map<string, Promise<VerifiedRecoveryBucket>>;
 }
 
 const recoveryReadSessions = new WeakMap<FugueGitHub, RecoveryReadSession>();
@@ -1582,14 +1582,12 @@ async function ensureRecoveryReserveVariablesLocked(
   const existing = new Set(variables
     .filter((entry) => entry.name.startsWith(RECOVERY_RESERVE_PREFIX))
     .map((entry) => entry.name));
-  let allCount = variables.length;
+  // Reserve restoration is a fixed eight-name create budget. Capacity/conflict returns false;
+  // no namespace rescan or scan-until-progress loop is needed when compaction frees a slot.
   for (let index = 0; index < RECOVERY_RESERVE_COUNT; index += 1) {
     const name = recoveryReserveName(index);
-    if (existing.has(name) || allCount >= REPOSITORY_AUTHORITY_VARIABLE_CAPACITY) continue;
-    if (await createFugueAuthorityVariable(github, name, RECOVERY_RESERVE_VALUE)) {
-      existing.add(name);
-      allCount += 1;
-    }
+    if (existing.has(name)) continue;
+    if (await createFugueAuthorityVariable(github, name, RECOVERY_RESERVE_VALUE)) existing.add(name);
   }
 }
 
@@ -1673,7 +1671,7 @@ async function captureRecoveryReadSession(github: FugueGitHub): Promise<Recovery
           "Protected recovery guard state shifted during the bounded namespace snapshot.",
         );
       }
-      const session: RecoveryReadSession = { epoch, variables, verifiedBuckets: new Map() };
+      const session: RecoveryReadSession = { epoch, variables };
       recoveryReadSessions.set(github, session);
       return session;
     } catch (error) {
@@ -1690,12 +1688,37 @@ async function getRecoveryReadSession(github: FugueGitHub): Promise<RecoveryRead
 }
 
 async function assertRecoveryReadEpoch(github: FugueGitHub, epoch: string): Promise<void> {
-  if (await getFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_IDLE) !== epoch) {
-    invalidateRecoveryReadSession(github);
+  const current = await getFugueAuthorityVariable(github, RECOVERY_MUTATION_GUARD_IDLE);
+  if (current === epoch) return;
+  invalidateRecoveryReadSession(github);
+  if (current === undefined) {
     throw new DurableProtocolRecoveryPendingError(
-      "Protected recovery authority changed during the read; restart from a fresh committed epoch.",
+      "Protected recovery mutation became active during the read; committed authority remains fenced.",
     );
   }
+  throw new RecoveryReadEpochChangedError(
+    "Protected recovery authority rotated during the read; restart from a fresh committed epoch.",
+  );
+}
+
+async function withRecoveryReadSession<T>(
+  github: FugueGitHub,
+  operation: (session: RecoveryReadSession) => Promise<T>,
+): Promise<T> {
+  let lastChanged: RecoveryReadEpochChangedError | undefined;
+  for (let attempt = 0; attempt < RECOVERY_READ_BUILD_ATTEMPTS; attempt += 1) {
+    try {
+      const session = await getRecoveryReadSession(github);
+      return await operation(session);
+    } catch (error) {
+      invalidateRecoveryReadSession(github);
+      if (!(error instanceof RecoveryReadEpochChangedError)) throw error;
+      lastChanged = error;
+    }
+  }
+  throw lastChanged ?? new DurableProtocolRecoveryPendingError(
+    "Protected recovery authority kept changing during the bounded read.",
+  );
 }
 
 async function verifiedRecoveryBucketForSession(
@@ -1703,12 +1726,9 @@ async function verifiedRecoveryBucketForSession(
   bucket: string,
   session: RecoveryReadSession,
 ): Promise<VerifiedRecoveryBucket> {
-  let pending = session.verifiedBuckets.get(bucket);
-  if (!pending) {
-    pending = verifiedRecoveryEntriesForBucket(github, bucket, session.variables);
-    session.verifiedBuckets.set(bucket, pending);
-  }
-  return pending;
+  // The namespace is cached for the epoch, but proof verification is intentionally fresh per
+  // top-level read so transient provenance failures and concurrent readers cannot poison/share a promise.
+  return verifiedRecoveryEntriesForBucket(github, bucket, session.variables);
 }
 
 async function inspectRecoveryIdentity(
@@ -1757,16 +1777,17 @@ async function findRecoveryCursorForPublisher(
   github: FugueGitHub,
   options: RecoveryIdentityOptions,
 ): Promise<{ variableName: string; cursor: RecoveryCursor } | undefined> {
-  const session = await getRecoveryReadSession(github);
-  const inspected = await inspectRecoveryIdentity(github, options, session);
-  await assertRecoveryReadEpoch(github, session.epoch);
-  if (inspected.uncertain || (inspected.structural && !inspected.best)) {
-    invalidateRecoveryReadSession(github);
-    throw new DurableProtocolRecoveryPendingError(
-      `Protected durable commit witness for ${options.scope} is structurally present but not currently verifiable.`,
-    );
-  }
-  return inspected.best ? { variableName: inspected.best.sourceVariableName, cursor: inspected.best.cursor } : undefined;
+  return withRecoveryReadSession(github, async (session) => {
+    const inspected = await inspectRecoveryIdentity(github, options, session);
+    await assertRecoveryReadEpoch(github, session.epoch);
+    if (inspected.uncertain || (inspected.structural && !inspected.best)) {
+      invalidateRecoveryReadSession(github);
+      throw new DurableProtocolRecoveryPendingError(
+        `Protected durable commit witness for ${options.scope} is structurally present but not currently verifiable.`,
+      );
+    }
+    return inspected.best ? { variableName: inspected.best.sourceVariableName, cursor: inspected.best.cursor } : undefined;
+  });
 }
 
 async function findRecoveryCursor(
@@ -1780,10 +1801,11 @@ async function hasStructuralRecoveryWitness(
   github: FugueGitHub,
   options: RecoveryIdentityOptions,
 ): Promise<boolean> {
-  const session = await getRecoveryReadSession(github);
-  const inspected = await inspectRecoveryIdentity(github, options, session);
-  await assertRecoveryReadEpoch(github, session.epoch);
-  return inspected.structural;
+  return withRecoveryReadSession(github, async (session) => {
+    const inspected = await inspectRecoveryIdentity(github, options, session);
+    await assertRecoveryReadEpoch(github, session.epoch);
+    return inspected.structural;
+  });
 }
 
 interface RecoveryAllocation {
@@ -2141,6 +2163,10 @@ export async function compactFugueRecoveryAuthorityVariables(
         maintenanceGuard,
       );
     }
+    // Refill any reserve consumed to bootstrap the maintenance guard after compaction has freed
+    // representation capacity. Reuse the same bounded namespace snapshot; at most eight direct
+    // create attempts are made and no second list/scan is introduced.
+    await ensureRecoveryReserveVariablesLocked(github, allVariables);
   } finally {
     await releaseRecoveryMutationGuard(github, maintenanceGuard);
   }
