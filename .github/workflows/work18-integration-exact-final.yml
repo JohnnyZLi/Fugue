@@ -13,11 +13,11 @@ jobs:
     env:
       GITHUB_TOKEN: ""
       GH_TOKEN: ""
-      EXPECTED_SHA: 6df9420df4fca60bb1d25d81cef3a0f943f37041
+      EXPECTED_SHA: 803b50ac9a1cd13c5d45ccd6e624855268c1f9e7
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 6df9420df4fca60bb1d25d81cef3a0f943f37041
+          ref: 803b50ac9a1cd13c5d45ccd6e624855268c1f9e7
           persist-credentials: false
       - name: Confirm detached exact head and credential isolation
         run: |
@@ -33,6 +33,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - name: Run focused historical winner barrier regressions
+        run: npx vitest run tests/integration-plan.test.ts -t "historical current-revision winner arbitration"
       - run: npm test
       - run: npm run build
 
@@ -49,7 +51,7 @@ jobs:
       - name: Record exact-head validation
         run: |
           set -euo pipefail
-          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '6df9420df4fca60bb1d25d81cef3a0f943f37041' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-integration-exact-final-result.txt
+          printf 'run_id=%s\ntest_result=%s\nvalidated_sha=%s\nwork_spec_digest=%s\n' '${{ github.run_id }}' '${{ needs.test.result }}' '803b50ac9a1cd13c5d45ccd6e624855268c1f9e7' 'sha256:249cd537997213f217727edfc9c86d2b41d7447219c1ee886ee4c61a9e6ee985' > .github/work18-integration-exact-final-result.txt
           git config user.name Johnny
           git config user.email 92900710+JohnnyZLi@users.noreply.github.com
           git add .github/work18-integration-exact-final-result.txt
