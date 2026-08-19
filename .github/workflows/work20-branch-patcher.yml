@@ -1,0 +1,77 @@
+name: Work 20 Branch Patcher
+
+on:
+  push:
+    branches:
+      - bootstrap/work18-status-bridge-20260819
+
+permissions:
+  contents: write
+  statuses: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message == '[bootstrap] patch work-20 branch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply scoped work-20 changes via Contents API
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: agent/20-fix-fugue-authority-token-bootstrap
+        run: |
+          node --input-type=module <<'NODE'
+          const repo = process.env.GITHUB_REPOSITORY;
+          const branch = process.env.TARGET_BRANCH;
+          const headers = {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+          };
+          const api = `https://api.github.com/repos/${repo}`;
+          async function getFile(path) {
+            const r = await fetch(`${api}/contents/${path}?ref=${encodeURIComponent(branch)}`, { headers });
+            const body = await r.json();
+            if (!r.ok) throw new Error(`GET ${path} failed ${r.status}: ${JSON.stringify(body).slice(0,300)}`);
+            return { sha: body.sha, text: Buffer.from(body.content.replace(/\n/g, ''), 'base64').toString('utf8') };
+          }
+          async function putFile(path, text, sha, message) {
+            const r = await fetch(`${api}/contents/${path}`, {
+              method: 'PUT', headers,
+              body: JSON.stringify({ message, content: Buffer.from(text, 'utf8').toString('base64'), sha, branch }),
+            });
+            const body = await r.json();
+            if (!r.ok) throw new Error(`PUT ${path} failed ${r.status}: ${JSON.stringify(body).slice(0,300)}`);
+            return body.commit.sha;
+          }
+
+          let finalSha;
+          for (const path of ['.github/workflows/fugue-control-plane.yml', '.github/workflows/fugue-integration.yml']) {
+            const file = await getFile(path);
+            const patched = file.text
+              .replace(/^\s*permission-actions:\s*write\s*\n/gm, '')
+              .replace(/^\s*permission-variables:\s*write\s*\n/gm, '');
+            if (patched === file.text) throw new Error(`${path} did not contain expected permission selector(s)`);
+            finalSha = await putFile(path, patched, file.sha, '[work-20] Fix Authority App token permission inheritance');
+          }
+
+          const testPath = 'tests/ci.test.ts';
+          const test = await getFile(testPath);
+          let testText = test.text;
+          const marker = 'describe("Fugue Authority App token workflow configuration"';
+          if (!testText.includes(marker)) {
+            testText += `\n\ndescribe("Fugue Authority App token workflow configuration", () => {\n  it("inherits the deliberately narrow App installation permissions instead of using unsupported permission selectors", async () => {\n    for (const path of [\n      ".github/workflows/fugue-control-plane.yml",\n      ".github/workflows/fugue-integration.yml",\n    ]) {\n      const workflow = await readFile(path, "utf8");\n      expect(workflow).toContain("actions/create-github-app-token@v3");\n      expect(workflow).toContain("FUGUE_AUTHORITY_APP_CLIENT_ID");\n      expect(workflow).toContain("FUGUE_AUTHORITY_APP_PRIVATE_KEY");\n      expect(workflow).not.toContain("permission-variables:");\n      expect(workflow).not.toContain("permission-actions:");\n    }\n  });\n});\n`;
+            finalSha = await putFile(testPath, testText, test.sha, '[work-20] Regress unsupported Authority token permission selectors');
+          }
+
+          const s = await fetch(`${api}/statuses/${process.env.GITHUB_SHA}`, {
+            method: 'POST', headers,
+            body: JSON.stringify({
+              state: 'success',
+              context: `fugue/bootstrap-work20-patched/${String(finalSha).slice(0,12)}`,
+              description: `work-20 branch patched at ${String(finalSha).slice(0,12)}`,
+              target_url: `https://github.com/${repo}/commit/${finalSha}`,
+            }),
+          });
+          if (!s.ok) throw new Error(`status publish failed ${s.status}`);
+          NODE
