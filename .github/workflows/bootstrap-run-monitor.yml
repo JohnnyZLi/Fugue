@@ -8,6 +8,7 @@ on:
 permissions:
   actions: read
   contents: read
+  issues: read
   statuses: write
 
 jobs:
@@ -22,7 +23,7 @@ jobs:
           node --input-type=module <<'NODE'
           const repo = process.env.GITHUB_REPOSITORY;
           const sha = process.env.GITHUB_SHA;
-          const expectedHead = '39ad40cbba34a18d5942a4aacf9ceb2e2e462b40';
+          const expectedHead = '50ccb53cd6298f9f8984d1d99e59fb1086e3f352';
           const headers = {
             Accept: 'application/vnd.github+json',
             Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
@@ -54,6 +55,55 @@ jobs:
           const statusResponse = await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
             method: 'POST', headers,
             body: JSON.stringify({ state, context, description: desc, target_url: run.html_url }),
+          });
+          if (!statusResponse.ok) throw new Error(`status publish failed ${statusResponse.status}`);
+          NODE
+
+  work24-digest:
+    if: github.event.head_commit.message == '[bootstrap] inspect PR25 protected CI current'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout protected base
+        uses: actions/checkout@v4
+        with:
+          ref: fc1620432f774a98a3798fb0f7c44076c2384a78
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+      - run: npm run build
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+      - name: Publish current canonical work-spec digest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOOTSTRAP_SHA: ${{ github.sha }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { parseWorkMetadata, stripWorkMetadata, canonicalWorkSpecIdentity } from './dist/core/metadata.js';
+          const repo = process.env.GITHUB_REPOSITORY;
+          const headers = {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+          };
+          const issueResponse = await fetch(`https://api.github.com/repos/${repo}/issues/24`, { headers });
+          const issue = await issueResponse.json();
+          if (!issueResponse.ok) throw new Error(`Issue fetch failed ${issueResponse.status}`);
+          const metadata = parseWorkMetadata(issue.body ?? '');
+          if (!metadata) throw new Error('Issue #24 has no canonical work metadata.');
+          const identity = canonicalWorkSpecIdentity(stripWorkMetadata(issue.body ?? ''), metadata);
+          const context = `fugue/bootstrap-work24/${identity.digest}`;
+          const statusResponse = await fetch(`https://api.github.com/repos/${repo}/statuses/${process.env.BOOTSTRAP_SHA}`, {
+            method: 'POST', headers,
+            body: JSON.stringify({ state: 'success', context, description: 'Current canonical Issue #24 work-spec digest' }),
           });
           if (!statusResponse.ok) throw new Error(`status publish failed ${statusResponse.status}`);
           NODE
