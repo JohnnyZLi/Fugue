@@ -1063,7 +1063,14 @@ function activeRecoveryMutationGuardsFromVariables(
 }
 
 async function activeRecoveryMutationGuards(github: FugueGitHub): Promise<Array<{ name: string; guard: RecoveryMutationGuard }>> {
-  return activeRecoveryMutationGuardsFromVariables(await listFugueAuthorityVariables(github, ""));
+  const variables = await listFugueAuthorityVariables(github, "");
+  const guards = activeRecoveryMutationGuardsFromVariables(variables);
+  if (guards.length && variables.some((variable) => variable.name === RECOVERY_MUTATION_GUARD_IDLE)) {
+    throw new CanonicalWorkStateIntegrityError(
+      "Protected recovery namespace simultaneously exposes an idle epoch and an active mutation guard.",
+    );
+  }
+  return guards;
 }
 
 function isRecoveryMutationGuardIdleValue(value: string): boolean {
@@ -1211,6 +1218,7 @@ async function acquireRecoveryMutationGuard(
   sourceName?: string,
   sourceValue?: string,
 ): Promise<{ name: string; value: string } | undefined> {
+  if (await recoverInterruptedRecoveryMutation(github)) return undefined;
   await assertRepositoryDefaultBranchRevision(github, publisherSha);
   const guard: RecoveryMutationGuard = {
     version: 1, publisher_sha: publisherSha, target_name: targetName, target_value: targetValue,
@@ -1235,6 +1243,7 @@ async function acquireRecoveryMutationGuard(
 async function acquireRecoveryMaintenanceGuard(
   github: FugueGitHub,
 ): Promise<{ name: string; value: string } | undefined> {
+  if (await recoverInterruptedRecoveryMutation(github)) return undefined;
   const guard: RecoveryMutationGuard = {
     version: 1,
     publisher_sha: "0".repeat(40),
