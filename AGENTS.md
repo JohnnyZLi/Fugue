@@ -74,7 +74,9 @@ The protected base branch supplies the active policy used to evaluate candidate 
 ```text
 src/cli.ts                     command surface / protected dispatch boundary
 src/commands/                  local recovery/bootstrap + hosted runtime entrypoints
-src/core/state.ts              bounded d3 durable-record + Variables-permission recovery/work/Coordinator authority
+src/core/state.ts              public d3/Authority state facade
+src/core/state-raw.ts          bounded d3 durable-record + Variables-permission recovery/work/Coordinator authority
+src/core/authority-namespace.ts shared Authority namespace-mutation coherence boundary for Integration writers
 src/core/workflow.ts           next-action planning
 src/core/reconcile.ts          durable event-snapshot replay + idempotent reconciliation
 src/core/state-comment.ts      mutable Human-facing next-action dashboard

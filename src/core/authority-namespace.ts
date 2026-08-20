@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes } from "node:crypto";
 import type { FugueGitHub } from "./github.js";
 import {
@@ -22,6 +23,9 @@ interface NamespaceMutationGuard {
   created_at: string;
   maintenance: true;
 }
+
+const namespaceMutationContext = new AsyncLocalStorage<ReadonlySet<FugueGitHub>>();
+const verifiedNamespaceEpochs = new WeakMap<FugueGitHub, string>();
 
 function injectedAuthorityVariables(github: FugueGitHub): Map<string, string> | undefined {
   return (github as FugueGitHub & { __authorityVariables?: Map<string, string> }).__authorityVariables;
@@ -69,31 +73,63 @@ function nextIdleEpoch(name: string, value: string): string {
   return `${NAMESPACE_GUARD_IDLE_PREFIX}:${epoch}`;
 }
 
-async function acquireNamespaceMutationGuard(
-  github: FugueGitHub,
-): Promise<{ name: string; value: string }> {
-  const variables = await listFugueAuthorityVariables(github, "");
-  const active = variables.filter((variable) => variable.name.startsWith(NAMESPACE_GUARD_PREFIX));
-  const idle = variables.find((variable) => variable.name === NAMESPACE_GUARD_IDLE);
-  if (active.length && idle) {
-    throw new CanonicalWorkStateIntegrityError(
-      "Protected Authority namespace simultaneously exposes an idle epoch and an active mutation guard.",
-    );
-  }
-  if (active.length || !idle) {
+function namespaceMutationActive(github: FugueGitHub): boolean {
+  return namespaceMutationContext.getStore()?.has(github) ?? false;
+}
+
+async function verifiedIdleEpoch(github: FugueGitHub): Promise<string> {
+  const directIdle = await getFugueAuthorityVariable(github, NAMESPACE_GUARD_IDLE);
+  if (directIdle === undefined) {
+    verifiedNamespaceEpochs.delete(github);
     throw new DurableProtocolRecoveryPendingError(
       "Protected Authority namespace mutation is already active; Integration mutation remains pending.",
     );
   }
-  if (!isIdleEpoch(idle.value)) {
+  if (!isIdleEpoch(directIdle)) {
+    verifiedNamespaceEpochs.delete(github);
     throw new CanonicalWorkStateIntegrityError("Protected Authority namespace idle epoch is malformed.");
   }
-  if (await getFugueAuthorityVariable(github, NAMESPACE_GUARD_IDLE) !== idle.value) {
+
+  // A successful transaction release produced this exact idle epoch under exclusive guard ownership.
+  // Reusing that certificate avoids multiplying full 500-variable scans across bounded cleanup loops.
+  // Any compliant external writer must first remove the idle slot and then expose a different epoch,
+  // so the direct read above forces a new full corruption preflight after cross-process mutation.
+  if (verifiedNamespaceEpochs.get(github) === directIdle) return directIdle;
+
+  const variables = await listFugueAuthorityVariables(github, "");
+  const active = variables.filter((variable) => variable.name.startsWith(NAMESPACE_GUARD_PREFIX));
+  const listedIdle = variables.find((variable) => variable.name === NAMESPACE_GUARD_IDLE);
+  if (active.length && listedIdle) {
+    verifiedNamespaceEpochs.delete(github);
+    throw new CanonicalWorkStateIntegrityError(
+      "Protected Authority namespace simultaneously exposes an idle epoch and an active mutation guard.",
+    );
+  }
+  if (active.length || !listedIdle) {
+    verifiedNamespaceEpochs.delete(github);
+    throw new DurableProtocolRecoveryPendingError(
+      "Protected Authority namespace mutation is already active; Integration mutation remains pending.",
+    );
+  }
+  if (!isIdleEpoch(listedIdle.value)) {
+    verifiedNamespaceEpochs.delete(github);
+    throw new CanonicalWorkStateIntegrityError("Protected Authority namespace idle epoch is malformed.");
+  }
+  if (listedIdle.value !== directIdle ||
+      await getFugueAuthorityVariable(github, NAMESPACE_GUARD_IDLE) !== directIdle) {
+    verifiedNamespaceEpochs.delete(github);
     throw new DurableProtocolRecoveryPendingError(
       "Protected Authority namespace rotated while an Integration mutation was acquiring the guard.",
     );
   }
+  verifiedNamespaceEpochs.set(github, directIdle);
+  return directIdle;
+}
 
+async function acquireNamespaceMutationGuard(
+  github: FugueGitHub,
+): Promise<{ name: string; value: string }> {
+  const idle = await verifiedIdleEpoch(github);
   const guard: NamespaceMutationGuard = {
     version: 1,
     publisher_sha: "0".repeat(40),
@@ -108,6 +144,7 @@ async function acquireNamespaceMutationGuard(
     method: "PATCH",
     body: JSON.stringify({ name, value }),
   });
+  verifiedNamespaceEpochs.delete(github);
   if (response.status === 404 || response.status === 409 || response.status === 422) {
     throw new DurableProtocolRecoveryPendingError(
       "Protected Authority namespace changed while an Integration mutation was acquiring the guard.",
@@ -132,9 +169,11 @@ async function releaseNamespaceMutationGuard(
   token: { name: string; value: string },
 ): Promise<void> {
   if (await getFugueAuthorityVariable(github, token.name) !== token.value) {
+    verifiedNamespaceEpochs.delete(github);
     throw new CanonicalWorkStateIntegrityError("Protected Authority namespace mutation guard was replaced while active.");
   }
   if (await getFugueAuthorityVariable(github, NAMESPACE_GUARD_IDLE) !== undefined) {
+    verifiedNamespaceEpochs.delete(github);
     throw new CanonicalWorkStateIntegrityError(
       "Protected Authority namespace idle epoch reappeared while a mutation guard was active.",
     );
@@ -145,20 +184,29 @@ async function releaseNamespaceMutationGuard(
     body: JSON.stringify({ name: NAMESPACE_GUARD_IDLE, value: idle }),
   });
   if (!response.ok) {
+    verifiedNamespaceEpochs.delete(github);
     throw new CanonicalWorkStateIntegrityError(
       `Unable to rotate protected Authority namespace epoch after Integration mutation (${response.status}).`,
     );
   }
   if (await getFugueAuthorityVariable(github, NAMESPACE_GUARD_IDLE) !== idle) {
+    verifiedNamespaceEpochs.delete(github);
     throw new CanonicalWorkStateIntegrityError("Protected Authority namespace epoch rotation did not become durable.");
   }
+  verifiedNamespaceEpochs.set(github, idle);
 }
 
-async function withNamespaceMutation<T>(github: FugueGitHub, operation: () => Promise<T>): Promise<T> {
-  if (injectedAuthorityVariables(github)) return operation();
+export async function withFugueAuthorityNamespaceMutation<T>(
+  github: FugueGitHub,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (injectedAuthorityVariables(github) || namespaceMutationActive(github)) return operation();
   const guard = await acquireNamespaceMutationGuard(github);
+  const parent = namespaceMutationContext.getStore();
+  const active = new Set(parent ?? []);
+  active.add(github);
   try {
-    return await operation();
+    return await namespaceMutationContext.run(active, operation);
   } finally {
     await releaseNamespaceMutationGuard(github, guard);
   }
@@ -169,11 +217,15 @@ export async function createFugueAuthorityVariable(
   name: string,
   value: string,
 ): Promise<boolean> {
-  if (!name.startsWith("FUGUE_INT_")) return createAuthorityVariableUnchecked(github, name, value);
-  return withNamespaceMutation(github, () => createAuthorityVariableUnchecked(github, name, value));
+  if (!name.startsWith("FUGUE_INT_") || namespaceMutationActive(github)) {
+    return createAuthorityVariableUnchecked(github, name, value);
+  }
+  return withFugueAuthorityNamespaceMutation(github, () => createAuthorityVariableUnchecked(github, name, value));
 }
 
 export async function deleteFugueAuthorityVariable(github: FugueGitHub, name: string): Promise<void> {
-  if (!name.startsWith("FUGUE_INT_")) return deleteAuthorityVariableUnchecked(github, name);
-  await withNamespaceMutation(github, () => deleteAuthorityVariableUnchecked(github, name));
+  if (!name.startsWith("FUGUE_INT_") || namespaceMutationActive(github)) {
+    return deleteAuthorityVariableUnchecked(github, name);
+  }
+  await withFugueAuthorityNamespaceMutation(github, () => deleteAuthorityVariableUnchecked(github, name));
 }
