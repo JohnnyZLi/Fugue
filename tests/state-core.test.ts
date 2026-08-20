@@ -295,6 +295,30 @@ describe("bounded Fugue Authority reads", () => {
       .rejects.toThrow(/simultaneously exposes an idle epoch and an active mutation guard/i);
   });
 
+  it("fails closed before a writer can acquire a second guard from simultaneous idle+active state", async () => {
+    const idle = `${RECOVERY_IDLE_PREFIX}:${"4".repeat(32)}`;
+    const guardName = "FUGUE_D3GT_CORRUPT_WRITER";
+    const variables = new Map<string, string>([
+      [RECOVERY_IDLE, idle],
+      [guardName, JSON.stringify({
+        version: 1,
+        publisher_sha: RECOVERY_BASE,
+        target_name: "__fugue_recovery_maintenance__",
+        target_value: "maintenance",
+        created_at: new Date().toISOString(),
+        maintenance: true,
+      })],
+    ]);
+    const before = [...variables.entries()];
+    const github = recoveryGithub(variables);
+
+    await expect(compactFugueRecoveryAuthorityVariables(github))
+      .rejects.toThrow(/simultaneously exposes an idle epoch and an active mutation guard/i);
+    expect([...variables.entries()]).toEqual(before);
+    expect([...variables.keys()].filter((name) => name.startsWith("FUGUE_D3GT_"))).toEqual([guardName]);
+    expect(variables.get(RECOVERY_IDLE)).toBe(idle);
+  });
+
   it("fences a recent legacy active guard when the idle slot is missing instead of scanning past it", async () => {
     const variables = new Map<string, string>([[
       "FUGUE_D3GT_LEGACY",
@@ -385,7 +409,7 @@ describe("bounded historical work rollover", () => {
     expect(listCommits).toHaveBeenLastCalledWith(expect.objectContaining({ sha: currentSha, per_page: 100, page: 2 }));
   });
 
-  it("keeps repository-wide rollover outside the deterministic per-work transition loop", () => {
+  it("keeps repository-wide maintenance outside the deterministic per-work transition loop", () => {
     const source = readFileSync("src/core/reconcile.ts", "utf8");
     const publicStart = source.indexOf("export async function reconcileWork(");
     const transitionStart = source.indexOf("async function reconcileWorkTransitions(", publicStart);
@@ -397,8 +421,235 @@ describe("bounded historical work rollover", () => {
     const publicWrapper = source.slice(publicStart, transitionStart);
     const transitionLoop = source.slice(transitionStart, transitionEnd);
     expect(publicWrapper.match(/rollCanonicalWorkStatesToCurrentBase\(/g)).toHaveLength(1);
+    expect(publicWrapper.match(/reclaimOrphanIntegrationAuthorityVariables\(/g)).toHaveLength(1);
     expect(transitionLoop).not.toContain("rollCanonicalWorkStatesToCurrentBase(");
     expect(transitionLoop).not.toContain("repairCanonicalWorkStateComments(");
+    expect(transitionLoop).not.toContain("reclaimOrphanIntegrationAuthorityVariables(");
+  });
+
+  it("keeps a full 500-variable Integration maintenance budget additive across many 12-transition works", async () => {
+    const savedEnv = {
+      GITHUB_EVENT_NAME: process.env.GITHUB_EVENT_NAME,
+      FUGUE_AUTHORITY_ACTOR_ID: process.env.FUGUE_AUTHORITY_ACTOR_ID,
+      FUGUE_WORKFLOW_SHA: process.env.FUGUE_WORKFLOW_SHA,
+    };
+    process.env.FUGUE_AUTHORITY_TOKEN = "authority-test-token";
+    process.env.GITHUB_EVENT_NAME = "";
+    delete process.env.FUGUE_AUTHORITY_ACTOR_ID;
+    process.env.FUGUE_WORKFLOW_SHA = RECOVERY_BASE;
+
+    const variables = Array.from({ length: 500 }, (_, index) => ({
+      name: `UNRELATED_BUDGET_${String(index).padStart(4, "0")}`,
+      value: "unrelated",
+    }));
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      if (!url.pathname.endsWith("/actions/variables")) {
+        return Response.json({ message: "unexpected request" }, { status: 500 });
+      }
+      const page = Number(url.searchParams.get("page") ?? "1");
+      const start = (page - 1) * 100;
+      return Response.json({ total_count: variables.length, variables: variables.slice(start, start + 100) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const policy = {
+      identity: {
+        baseBranch: "main",
+        baseSha: RECOVERY_BASE,
+        policyDigest: `sha256:${"1".repeat(64)}`,
+        protocolVersion: 1,
+      },
+      config: { branches: { worker_pattern: "agent/{issue}-{slug}" } },
+    };
+    const works = Array.from({ length: 6 }, (_, index) => {
+      const issueNumber = 100 + index;
+      const workerId = `wkr-${(index + 1).toString(16).padStart(8, "0")}`;
+      const branch = `agent/${issueNumber}-budget`;
+      const metadata = workMetadataSchema.parse({
+        version: 1,
+        work_id: `work-${issueNumber}`,
+        spec: {
+          dependencies: [],
+          ownership: { owned: ["src/**"], coordinate: [], forbidden: [] },
+          qa: { force: ["code"] },
+          authorized_changes: { agents_invariants: [] },
+        },
+        execution: { worker_id: workerId, branch },
+      });
+      const requirements = `## Outcome\nBudget work ${issueNumber}.`;
+      const prMetadata = {
+        version: 1 as const,
+        work_id: metadata.work_id,
+        issue: issueNumber,
+        worker_id: workerId,
+        branch,
+      };
+      const canonical = createCanonicalWorkState({
+        issue: issueNumber,
+        title: `Budget work ${issueNumber}`,
+        state: "state:working",
+        agentReady: true,
+        requirements,
+        metadata,
+        pr: { number: 200 + index, metadata: prMetadata, draft: false },
+        baseSha: RECOVERY_BASE,
+        createdAt: "2026-08-19T00:00:00.000Z",
+        logicalRoot: true,
+      });
+      return {
+        issueNumber,
+        title: canonical.title,
+        url: `https://github.com/owner/repo/issues/${issueNumber}`,
+        stateLabel: canonical.state,
+        agentReady: canonical.agent_ready,
+        metadata,
+        requirements,
+        workSpecDigest: workSpecDigestFromRequirements(requirements, metadata),
+        pr: {
+          number: 200 + index,
+          url: `https://github.com/owner/repo/pull/${200 + index}`,
+          headSha: (index + 1).toString(16).padStart(40, "0"),
+          headBranch: branch,
+          draft: false,
+          metadata: prMetadata,
+        },
+        drift: [],
+        presentationDrift: [],
+        canonical,
+      };
+    });
+    const repositoryState = { policy, works, drift: [] };
+
+    vi.resetModules();
+    const actualState = await vi.importActual<typeof import("../src/core/state.js")>("../src/core/state.js");
+    const actualPolicy = await vi.importActual<typeof import("../src/core/policy.js")>("../src/core/policy.js");
+    const actualIntegration = await vi.importActual<typeof import("../src/core/integration-status.js")>("../src/core/integration-status.js");
+    const actualEvaluation = await vi.importActual<typeof import("../src/core/evaluation.js")>("../src/core/evaluation.js");
+    const actualSubmissions = await vi.importActual<typeof import("../src/core/submissions.js")>("../src/core/submissions.js");
+    const actualStateComment = await vi.importActual<typeof import("../src/core/state-comment.js")>("../src/core/state-comment.js");
+    const reclaim = vi.fn(async (github: FugueGitHub) => {
+      await actualState.listFugueAuthorityVariables(github, "FUGUE_INT_");
+    });
+
+    vi.doMock("../src/core/state.js", () => ({
+      ...actualState,
+      rollCanonicalWorkStatesToCurrentBase: vi.fn(async () => []),
+      repairCanonicalWorkStateComments: vi.fn(async () => []),
+      recoverCoordinatorSnapshots: vi.fn(async () => []),
+      reconstructState: vi.fn(async () => repositoryState),
+    }));
+    vi.doMock("../src/core/policy.js", () => ({
+      ...actualPolicy,
+      resolveActivePolicy: vi.fn(async () => policy),
+    }));
+    vi.doMock("../src/core/integration-status.js", () => ({
+      ...actualIntegration,
+      getCurrentIntegrationRecord: vi.fn(async () => undefined),
+      reclaimOrphanIntegrationAuthorityVariables: reclaim,
+      sealIntegrationWorkflowRunEvent: vi.fn(async () => false),
+    }));
+    vi.doMock("../src/core/evaluation.js", () => ({
+      ...actualEvaluation,
+      captureEvaluation: vi.fn(async (_github: FugueGitHub, prNumber: number) => {
+        const work = works.find((candidate) => candidate.pr.number === prNumber)!;
+        return {
+          identity: {
+            prNumber,
+            headSha: work.pr.headSha,
+            baseBranch: policy.identity.baseBranch,
+            baseSha: policy.identity.baseSha,
+            policyDigest: policy.identity.policyDigest,
+            protocolVersion: policy.identity.protocolVersion,
+            issueNumber: work.issueNumber,
+            workId: work.metadata.work_id,
+            workSpecDigest: work.workSpecDigest,
+          },
+          pr: { number: prNumber },
+        };
+      }),
+    }));
+    vi.doMock("../src/core/submissions.js", () => ({
+      ...actualSubmissions,
+      processCurrentSubmissions: vi.fn(async () => ({ accepted: 1, rejected: 0 })),
+    }));
+    vi.doMock("../src/core/state-comment.js", () => ({
+      ...actualStateComment,
+      upsertStateComment: vi.fn(async () => undefined),
+    }));
+
+    const pulls = works.map((work) => ({
+      number: work.pr.number,
+      node_id: `PR_${work.pr.number}`,
+      state: "open",
+      merged: false,
+      draft: false,
+      body: "",
+      html_url: work.pr.url,
+      base: { ref: "main" },
+      head: { ref: work.pr.headBranch, sha: work.pr.headSha },
+    }));
+    const listPulls = vi.fn(async () => ({ data: pulls }));
+    const github = {
+      repository: { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      octokit: {
+        graphql: vi.fn(async () => ({})),
+        paginate: vi.fn(async (method: unknown) => {
+          if (method === listPulls) return pulls;
+          throw new Error("Unexpected pagination in bounded reconciliation budget test.");
+        }),
+        rest: {
+          issues: {
+            get: vi.fn(async ({ issue_number }: { issue_number: number }) => {
+              const work = works.find((candidate) => candidate.issueNumber === issue_number)!;
+              return {
+                data: {
+                  number: issue_number,
+                  state: "open",
+                  title: work.title,
+                  body: upsertWorkMetadata(work.requirements, work.metadata),
+                  labels: ["state:working", "agent:ready"],
+                  comments: 0,
+                },
+              };
+            }),
+            update: vi.fn(async () => ({ data: {} })),
+          },
+          pulls: {
+            list: listPulls,
+            get: vi.fn(async ({ pull_number }: { pull_number: number }) => ({
+              data: pulls.find((pull) => pull.number === pull_number)!,
+            })),
+            update: vi.fn(async () => ({ data: {} })),
+            updateBranch: vi.fn(async () => ({ data: {} })),
+          },
+        },
+      },
+    } as unknown as FugueGitHub;
+
+    try {
+      const { reconcileRepository } = await import("../src/core/reconcile.js");
+      await expect(reconcileRepository(github)).resolves.toEqual({
+        processed: works.map((work) => work.issueNumber),
+      });
+      const listRequests = fetchMock.mock.calls.filter(([input]) =>
+        String(input).includes("/actions/variables?per_page=100&page="));
+      expect(reclaim).toHaveBeenCalledTimes(2);
+      expect(listRequests).toHaveLength(10);
+      expect(listRequests.length).toBeLessThan(5 * 12 * works.length);
+    } finally {
+      vi.doUnmock("../src/core/state.js");
+      vi.doUnmock("../src/core/policy.js");
+      vi.doUnmock("../src/core/integration-status.js");
+      vi.doUnmock("../src/core/evaluation.js");
+      vi.doUnmock("../src/core/submissions.js");
+      vi.doUnmock("../src/core/state-comment.js");
+      vi.resetModules();
+      for (const [name, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 });
 
