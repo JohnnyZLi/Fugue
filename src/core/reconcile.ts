@@ -184,20 +184,22 @@ export async function reconcileRepository(
   const selected = selectWorks(initial.works, options);
   const issueNumbers = selected.map((work) => work.issueNumber);
 
-  // Repository-wide rollover/locator repair is maintenance, not a deterministic work transition.
-  // The repository entry point already performed it exactly once above, so selected works enter the
-  // bounded transition loop directly instead of amplifying global scans up to 12x per work.
+  // Repository-wide rollover/locator and Integration orphan reclamation are maintenance, not
+  // deterministic work transitions. The repository entry point already performed them above, so
+  // selected works enter the bounded transition loop without multiplying namespace scans by work.
   for (const issueNumber of issueNumbers) await reconcileWorkTransitions(github, issueNumber);
   return { processed: issueNumbers };
 }
 
 export async function reconcileWork(github: FugueGitHub, issueNumber: number): Promise<void> {
-  // Standalone issue reconciliation still gets one maintenance pass. It is deliberately outside the
-  // transition loop: advancing a deterministic work state must never restart repository-wide rollover.
+  // Standalone issue reconciliation gets one repository-maintenance pass before deterministic work
+  // transitions. Keeping it outside the loop bounds global Authority work independently of transition count.
   const policy = await resolveActivePolicy(github);
   assertProtectedWorkflowRuntimeCurrent(policy);
   await rollCanonicalWorkStatesToCurrentBase(github, policy);
   await repairCanonicalWorkStateComments(github, policy);
+  const state = await reconstructState(github);
+  await reclaimOrphanIntegrationAuthorityVariables(github, Date.now(), currentIntegrationEvaluationIdentities(state));
   await reconcileWorkTransitions(github, issueNumber);
 }
 
@@ -210,7 +212,6 @@ async function reconcileWorkTransitions(github: FugueGitHub, issueNumber: number
     await repairCanonicalMirrors(github, policy, issueNumber);
 
     const state = await reconstructState(github);
-    await reclaimOrphanIntegrationAuthorityVariables(github, Date.now(), currentIntegrationEvaluationIdentities(state));
     const work = state.works.find((candidate) => candidate.issueNumber === issueNumber);
     if (!work) return;
 
