@@ -86,6 +86,21 @@ jobs:
           private-key: ${{ secrets.FUGUE_AUTHORITY_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
+      - name: Build protected namespace-writer runtime
+        env:
+          FUGUE_RUNTIME_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/fugue-protected-runtime.tar.gz"
+          curl --fail --silent --show-error --location \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/tarball/$FUGUE_RUNTIME_SHA" \
+            -o "$archive"
+          tar -xzf "$archive" --strip-components=1
+          npm ci
+          npm run build
       - name: Commit protected Integration run-start evidence
         id: run-start
         env:
@@ -95,9 +110,12 @@ jobs:
           node --input-type=module <<'NODE'
           import { createHash, createHmac } from 'node:crypto';
           import { appendFileSync, readFileSync } from 'node:fs';
+          import { withFugueAuthorityNamespaceMutation } from './dist/core/authority-namespace.js';
 
           const repository = process.env.GITHUB_REPOSITORY;
           const [owner, repo] = repository.split('/');
+          if (!owner || !repo) throw new Error('GitHub repository identity is unavailable.');
+          const authorityGithub = { repository: { owner, repo, fullName: repository } };
           const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
           const inputs = event.inputs ?? {};
           const requestId = String(inputs.request_id ?? '');
@@ -213,9 +231,6 @@ jobs:
             throw new Error('Protected Integration dispatch capability was already consumed by another run.');
           }
 
-          // C is the request-local first-writer-wins serialization point shared by B/S/d3 exact
-          // binding and identity_lost. Claim it before publishing S; if identity_lost already won,
-          // this delayed run-start is permanently inert.
           const candidateCreatedAt = new Date().toISOString();
           const htmlUrl = `https://github.com/${repository}/actions/runs/${runId}`;
           const exactCommit = {
@@ -231,69 +246,78 @@ jobs:
             run_created_at: candidateCreatedAt,
             html_url: htmlUrl,
           };
-          await createVariable(commitName, JSON.stringify(exactCommit));
-          const commitVariable = await read(`/actions/variables/${commitName}`);
-          let commit;
-          try { commit = JSON.parse(String(commitVariable.value ?? '')); }
-          catch { throw new Error('Protected Integration request-local commit is malformed.'); }
-          if (commit?.kind === 'integration_identity_lost_commit') process.exit(0);
-          if (commit?.version !== 1 || commit?.kind !== 'integration_exact_run_commit' ||
-              commit.request_id !== requestId || commit.pr_number !== prNumber ||
-              commit.head_sha?.toLowerCase() !== anchor.request.identity.headSha.toLowerCase() ||
-              commit.base_sha?.toLowerCase() !== baseSha.toLowerCase() || commit.anchor_name !== anchorName ||
-              commit.run_id !== runId || commit.run_attempt !== 1 || commit.html_url !== htmlUrl ||
-              !Number.isFinite(Date.parse(String(commit.run_created_at ?? '')))) {
-            throw new Error('Protected Integration request-local commit was already claimed by another run.');
-          }
 
-          // Cleanup deletes F/A before C. Re-read both after C so a run-start job that was already
-          // executing cannot recreate C/S after terminal cleanup. Missing prerequisites make the
-          // delayed writer inert and it self-reclaims its recreated C slot.
-          const fenceAfterCommit = await read(`/actions/variables/${fenceName}`, true);
-          const anchorAfterCommit = await read(`/actions/variables/${anchorName}`, true);
-          if (!fenceAfterCommit || !anchorAfterCommit) {
-            await deleteVariable(commitName);
-            deferCleanupProof('prerequisites-disappeared-after-commit');
-          }
-          if (String(fenceAfterCommit.value ?? '') !== String(fenceVariable.value ?? '') ||
-              String(anchorAfterCommit.value ?? '') !== String(variable.value ?? '')) {
-            throw new Error('Protected Integration prerequisites changed across exact-run serialization.');
-          }
-
-          const createdAt = commit.run_created_at;
-          const startEvidence = {
-            version: 1,
-            kind: 'integration_run_start',
-            request_id: requestId,
-            pr_number: prNumber,
-            head_sha: anchor.request.identity.headSha,
-            base_sha: baseSha,
-            secret_digest: digest,
-            anchor_name: anchorName,
-            run_id: runId,
-            run_attempt: 1,
-            created_at: createdAt,
-          };
-          const canonical = evidenceBody('<!-- fugue-integration-run-start', startEvidence, 'INTEGRATION RUN — STARTED');
-          const bodyDigest = createHash('sha256').update(canonical, 'utf8').digest('hex');
-          const audience = `fugue:v1:${repository}:comment:${bodyDigest}`;
-          const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
-          oidcUrl.searchParams.set('audience', audience);
-          const oidcResponse = await fetch(oidcUrl, {
-            headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
-          });
-          if (!oidcResponse.ok) throw new Error(`Unable to mint protected Integration OIDC proof (${oidcResponse.status}).`);
-          const oidc = await oidcResponse.json();
-          if (typeof oidc.value !== 'string' || !oidc.value) throw new Error('GitHub OIDC response did not contain a token.');
-          const signed = `${canonical}\n\n<!-- fugue-publisher-proof\nversion: 1\ntoken: ${oidc.value}\n-->`;
-          await createVariable(startName, signed);
-          const committed = await read(`/actions/variables/${startName}`);
-          if (committed.value !== signed) {
-            const winner = parseBlock(String(committed.value ?? ''), '<!-- fugue-integration-run-start');
-            if (winner?.run_id !== runId || winner?.run_attempt !== 1 || winner?.secret_digest !== digest || winner?.anchor_name !== anchorName) {
-              throw new Error('Protected Integration dispatch capability was consumed by another attempt-1 run.');
+          const runStartOutcome = await withFugueAuthorityNamespaceMutation(authorityGithub, async () => {
+            // C is the request-local first-writer-wins serialization point shared by B/S/d3 exact
+            // binding and identity_lost. C, any stale-writer C rollback, and S all live in one
+            // namespace epoch so no run-start writer can recreate a constant-count page-shift race.
+            await createVariable(commitName, JSON.stringify(exactCommit));
+            const commitVariable = await read(`/actions/variables/${commitName}`);
+            let commit;
+            try { commit = JSON.parse(String(commitVariable.value ?? '')); }
+            catch { throw new Error('Protected Integration request-local commit is malformed.'); }
+            if (commit?.kind === 'integration_identity_lost_commit') return 'integration_identity_lost_commit';
+            if (commit?.version !== 1 || commit?.kind !== 'integration_exact_run_commit' ||
+                commit.request_id !== requestId || commit.pr_number !== prNumber ||
+                commit.head_sha?.toLowerCase() !== anchor.request.identity.headSha.toLowerCase() ||
+                commit.base_sha?.toLowerCase() !== baseSha.toLowerCase() || commit.anchor_name !== anchorName ||
+                commit.run_id !== runId || commit.run_attempt !== 1 || commit.html_url !== htmlUrl ||
+                !Number.isFinite(Date.parse(String(commit.run_created_at ?? '')))) {
+              throw new Error('Protected Integration request-local commit was already claimed by another run.');
             }
-          }
+
+            // Cleanup deletes F/A before C. Re-read both after C so a run-start job that was already
+            // executing cannot recreate C/S after terminal cleanup. Missing prerequisites make the
+            // delayed writer inert and it self-reclaims its recreated C slot before releasing the epoch.
+            const fenceAfterCommit = await read(`/actions/variables/${fenceName}`, true);
+            const anchorAfterCommit = await read(`/actions/variables/${anchorName}`, true);
+            if (!fenceAfterCommit || !anchorAfterCommit) {
+              await deleteVariable(commitName);
+              return 'prerequisites-disappeared-after-commit';
+            }
+            if (String(fenceAfterCommit.value ?? '') !== String(fenceVariable.value ?? '') ||
+                String(anchorAfterCommit.value ?? '') !== String(variable.value ?? '')) {
+              throw new Error('Protected Integration prerequisites changed across exact-run serialization.');
+            }
+
+            const createdAt = commit.run_created_at;
+            const startEvidence = {
+              version: 1,
+              kind: 'integration_run_start',
+              request_id: requestId,
+              pr_number: prNumber,
+              head_sha: anchor.request.identity.headSha,
+              base_sha: baseSha,
+              secret_digest: digest,
+              anchor_name: anchorName,
+              run_id: runId,
+              run_attempt: 1,
+              created_at: createdAt,
+            };
+            const canonical = evidenceBody('<!-- fugue-integration-run-start', startEvidence, 'INTEGRATION RUN — STARTED');
+            const bodyDigest = createHash('sha256').update(canonical, 'utf8').digest('hex');
+            const audience = `fugue:v1:${repository}:comment:${bodyDigest}`;
+            const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+            oidcUrl.searchParams.set('audience', audience);
+            const oidcResponse = await fetch(oidcUrl, {
+              headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+            });
+            if (!oidcResponse.ok) throw new Error(`Unable to mint protected Integration OIDC proof (${oidcResponse.status}).`);
+            const oidc = await oidcResponse.json();
+            if (typeof oidc.value !== 'string' || !oidc.value) throw new Error('GitHub OIDC response did not contain a token.');
+            const signed = `${canonical}\n\n<!-- fugue-publisher-proof\nversion: 1\ntoken: ${oidc.value}\n-->`;
+            await createVariable(startName, signed);
+            const committed = await read(`/actions/variables/${startName}`);
+            if (committed.value !== signed) {
+              const winner = parseBlock(String(committed.value ?? ''), '<!-- fugue-integration-run-start');
+              if (winner?.run_id !== runId || winner?.run_attempt !== 1 || winner?.secret_digest !== digest || winner?.anchor_name !== anchorName) {
+                throw new Error('Protected Integration dispatch capability was consumed by another attempt-1 run.');
+              }
+            }
+            return 'started';
+          });
+          if (runStartOutcome === 'integration_identity_lost_commit') process.exit(0);
+          if (runStartOutcome !== 'started') deferCleanupProof(runStartOutcome);
           NODE
       - uses: actions/checkout@v4
         with:

@@ -90,7 +90,7 @@ function installMutableAuthorityApi(variables: Array<{ name: string; value: stri
 }
 
 describe("Authority namespace pagination coherence", () => {
-  it("recaptures a constant-count cross-page Integration shift instead of accepting a hybrid without W", async () => {
+  it("recaptures the production run-start C/S constant-count page shift instead of accepting a hybrid without W", async () => {
     process.env.FUGUE_AUTHORITY_TOKEN = "authority-test-token";
     const scope = "pagination/coherence";
     const key = "1".repeat(32);
@@ -131,15 +131,15 @@ describe("Authority namespace pagination coherence", () => {
     const witnessValue = `<!-- fugue-durable-recovery\nversion: 1\npayload: ${cursorPayload}\n-->`;
     const identity = `${BASE.toLowerCase()}\0${BASE.toLowerCase()}\0${scope}`;
     const witnessName = `FUGUE_D3_${createHash("sha256").update(identity, "utf8").digest("hex").slice(0, 16).toUpperCase()}_AAAAAAAAAAAAAAAA`;
-    const oldIntegrationName = "FUGUE_INT_A_0000000001_0000000000000001";
-    const newIntegrationName = "FUGUE_INT_Z_9999999999_FFFFFFFFFFFFFFFF";
+    const oldCommitName = `FUGUE_INT_C_${"A".repeat(32)}`;
+    const newStartName = `FUGUE_INT_S_0000000001_${"F".repeat(16)}`;
 
     const variables = Array.from({ length: 500 }, (_, index) => ({
       name: `UNRELATED_${String(index).padStart(4, "0")}`,
       value: "unrelated",
     }));
     variables[0] = { name: IDLE, value: `${IDLE_PREFIX}:${"1".repeat(32)}` };
-    variables[50] = { name: oldIntegrationName, value: "old" };
+    variables[50] = { name: oldCommitName, value: "old-run-start-commit" };
     variables[100] = { name: witnessName, value: witnessValue };
 
     const reader = github("reader");
@@ -194,8 +194,8 @@ describe("Authority namespace pagination coherence", () => {
         if (repository === "reader" && page === 1 && !shifted) stalePageOne = variables.slice(0, 100);
         if (repository === "reader" && page === 2 && !shifted) {
           await withFugueAuthorityNamespaceMutation(writer, async () => {
-            await deleteFugueAuthorityVariable(writer, oldIntegrationName);
-            await createFugueAuthorityVariable(writer, newIntegrationName, "new");
+            await deleteFugueAuthorityVariable(writer, oldCommitName);
+            await createFugueAuthorityVariable(writer, newStartName, "new-run-start");
           });
           shifted = true;
           const hybrid = [...stalePageOne, ...variables.slice(100)];
@@ -288,7 +288,7 @@ describe("Authority namespace pagination coherence", () => {
     expect(variables).toHaveLength(500);
   });
 
-  it("reuses a self-rotated certified epoch so bounded cleanup loops do not multiply full namespace scans", async () => {
+  it("keeps bounded cleanup cost by batching one logical cleanup transaction", async () => {
     process.env.FUGUE_AUTHORITY_TOKEN = "authority-test-token";
     const variables = Array.from({ length: 500 }, (_, index) => ({
       name: `UNRELATED_${String(index).padStart(4, "0")}`,
@@ -300,7 +300,9 @@ describe("Authority namespace pagination coherence", () => {
     const writer = github("writer-cleanup");
     const fetchMock = installMutableAuthorityApi(variables);
 
-    for (const name of oldNames) await deleteFugueAuthorityVariable(writer, name);
+    await withFugueAuthorityNamespaceMutation(writer, async () => {
+      for (const name of oldNames) await deleteFugueAuthorityVariable(writer, name);
+    });
 
     const listRequests = fetchMock.mock.calls.filter(([input, init]) => {
       const { url, method } = requestParts(input, init);
@@ -310,19 +312,88 @@ describe("Authority namespace pagination coherence", () => {
     for (const name of oldNames) expect(variables.some((entry) => entry.name === name)).toBe(false);
   });
 
-  it("routes the protected workflow writer through the shared boundary and classifies the real state paths", () => {
-    const workflow = readFileSync(".github/workflows/fugue-control-plane.yml", "utf8");
-    const start = workflow.indexOf("- name: Persist protected Integration binding witness");
-    const end = workflow.indexOf("- name: Reconcile durable Fugue state", start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    const persist = workflow.slice(start, end);
+  it("fails closed on idle plus active corruption after a previously successful self-rotated epoch", async () => {
+    process.env.FUGUE_AUTHORITY_TOKEN = "authority-test-token";
+    const variables = Array.from({ length: 500 }, (_, index) => ({
+      name: `UNRELATED_${String(index).padStart(4, "0")}`,
+      value: "unrelated",
+    }));
+    variables[0] = { name: IDLE, value: `${IDLE_PREFIX}:${"9".repeat(32)}` };
+    const staleName = `FUGUE_INT_F_${"B".repeat(32)}`;
+    variables[1] = { name: staleName, value: "stale" };
+    const writer = github("writer-corruption-after-success");
+    const fetchMock = installMutableAuthorityApi(variables);
+
+    // Complete one successful mutation so this writer itself rotates the idle slot to epoch E.
+    await deleteFugueAuthorityVariable(writer, staleName);
+    const certifiedIdle = variables.find((entry) => entry.name === IDLE)?.value;
+    expect(certifiedIdle).toMatch(new RegExp(`^${IDLE_PREFIX}:[0-9a-f]{32}$`, "i"));
+
+    // Inject the exact corrupt state that the old cached-E shortcut skipped: the same idle E plus
+    // an already-active guard G. The second transaction must detect it before any Authority mutation.
+    const existingGuard = `FUGUE_D3GT_${"C".repeat(24)}`;
+    variables.push({ name: existingGuard, value: "existing-active-guard" });
+    expect(variables).toHaveLength(500);
+    const beforeSecond = fetchMock.mock.calls.length;
+    const secondCommit = `FUGUE_INT_C_${"D".repeat(32)}`;
+
+    await expect(createFugueAuthorityVariable(writer, secondCommit, "must-not-commit"))
+      .rejects.toThrow(/simultaneously exposes an idle epoch and an active mutation guard/);
+
+    const secondCalls = fetchMock.mock.calls.slice(beforeSecond);
+    const secondListRequests = secondCalls.filter(([input, init]) => {
+      const { url, method } = requestParts(input, init);
+      return method === "GET" &&
+        url.pathname === "/repos/writer-corruption-after-success/repo/actions/variables" &&
+        url.searchParams.has("page");
+    });
+    const secondAuthorityMutations = secondCalls.filter(([input, init]) => {
+      const { url, method } = requestParts(input, init);
+      return ["PATCH", "POST", "DELETE"].includes(method) && url.pathname.includes("/actions/variables");
+    });
+    expect(secondListRequests).toHaveLength(5);
+    expect(secondAuthorityMutations).toHaveLength(0);
+    expect(variables.find((entry) => entry.name === IDLE)?.value).toBe(certifiedIdle);
+    expect(variables.filter((entry) => entry.name.startsWith("FUGUE_D3GT_")).map((entry) => entry.name)).toEqual([existingGuard]);
+    expect(variables.some((entry) => entry.name === secondCommit)).toBe(false);
+  });
+
+  it("routes both protected workflow writers through the shared boundary and classifies the real state paths", () => {
+    const controlWorkflow = readFileSync(".github/workflows/fugue-control-plane.yml", "utf8");
+    const persistStart = controlWorkflow.indexOf("- name: Persist protected Integration binding witness");
+    const persistEnd = controlWorkflow.indexOf("- name: Reconcile durable Fugue state", persistStart);
+    expect(persistStart).toBeGreaterThanOrEqual(0);
+    expect(persistEnd).toBeGreaterThan(persistStart);
+    const persist = controlWorkflow.slice(persistStart, persistEnd);
     expect(persist).toContain("withFugueAuthorityNamespaceMutation");
     expect(persist).toContain("createFugueAuthorityVariable");
     expect(persist).toContain("deleteFugueAuthorityVariable");
     expect(persist).toContain("./dist/core/authority-namespace.js");
     expect(persist).not.toContain("method: 'POST'");
     expect(persist).not.toContain("method: 'DELETE'");
+
+    const integrationWorkflow = readFileSync(".github/workflows/fugue-integration.yml", "utf8");
+    const buildProtected = integrationWorkflow.indexOf("- name: Build protected namespace-writer runtime");
+    const runStartStart = integrationWorkflow.indexOf("- name: Commit protected Integration run-start evidence");
+    const runStartEnd = integrationWorkflow.indexOf("- uses: actions/checkout@v4", runStartStart);
+    expect(buildProtected).toBeGreaterThanOrEqual(0);
+    expect(runStartStart).toBeGreaterThan(buildProtected);
+    expect(runStartEnd).toBeGreaterThan(runStartStart);
+    const runStart = integrationWorkflow.slice(runStartStart, runStartEnd);
+    expect(integrationWorkflow.slice(buildProtected, runStartStart)).toContain("tarball/$FUGUE_RUNTIME_SHA");
+    expect(runStart).toContain("./dist/core/authority-namespace.js");
+    const guard = runStart.indexOf("const runStartOutcome = await withFugueAuthorityNamespaceMutation");
+    const commitCreate = runStart.indexOf("await createVariable(commitName, JSON.stringify(exactCommit))", guard);
+    const staleCommitDelete = runStart.indexOf("await deleteVariable(commitName)", commitCreate);
+    const startCreate = runStart.indexOf("await createVariable(startName, signed)", staleCommitDelete);
+    const guardEnd = runStart.indexOf("          });", startCreate);
+    const identityLostExit = runStart.indexOf("if (runStartOutcome === 'integration_identity_lost_commit') process.exit(0);", guardEnd);
+    expect(guard).toBeGreaterThanOrEqual(0);
+    expect(commitCreate).toBeGreaterThan(guard);
+    expect(staleCommitDelete).toBeGreaterThan(commitCreate);
+    expect(startCreate).toBeGreaterThan(staleCommitDelete);
+    expect(guardEnd).toBeGreaterThan(startCreate);
+    expect(identityLostExit).toBeGreaterThan(guardEnd);
 
     const config = readFileSync(".fugue/config.yml", "utf8");
     expect(config.match(/"src\/core\/state-raw\.ts"/g)).toHaveLength(2);
