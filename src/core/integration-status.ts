@@ -34,6 +34,7 @@ import {
   listFugueAuthorityVariables,
   publishDurableProtocolRecord,
   recoverDurableProtocolRecord,
+  withFugueAuthorityNamespaceMutation,
 } from "./state.js";
 
 const INTEGRATION_COMMIT_PREFIX = "FUGUE_INT_C_";
@@ -676,40 +677,46 @@ export async function authorizeIntegrationDispatch(
         );
       }
     }
-    const created = await createFugueAuthorityVariable(github, electionName, signedCandidate);
-    electionBody = created ? signedCandidate : await getFugueAuthorityVariable(github, electionName);
+  }
+
+  return withFugueAuthorityNamespaceMutation(github, async () => {
+    electionBody = await getFugueAuthorityVariable(github, electionName);
     if (!electionBody) {
-      throw new IntegrationAuthorityCapacityPendingError(
-        "Repository Authority-variable capacity is temporarily full; Fugue retained every live d3 cursor/request authority and will retry after safe reclamation.",
-      );
+      const created = await createFugueAuthorityVariable(github, electionName, signedCandidate);
+      electionBody = created ? signedCandidate : await getFugueAuthorityVariable(github, electionName);
+      if (!electionBody) {
+        throw new IntegrationAuthorityCapacityPendingError(
+          "Repository Authority-variable capacity is temporarily full; Fugue retained every live d3 cursor/request authority and will retry after safe reclamation.",
+        );
+      }
     }
-  }
 
-  const winner = await verifiedIntegrationAnchor(github, electionBody, request.identity);
-  if (!winner || winner.election_name !== electionName ||
-      (winner.predecessor_request_id ?? undefined) !== predecessorRequestId) {
-    throw new Error(`Protected Integration election ${electionName} is malformed or belongs to another retry generation.`);
-  }
+    const winner = await verifiedIntegrationAnchor(github, electionBody, request.identity);
+    if (!winner || winner.election_name !== electionName ||
+        (winner.predecessor_request_id ?? undefined) !== predecessorRequestId) {
+      throw new Error(`Protected Integration election ${electionName} is malformed or belongs to another retry generation.`);
+    }
 
-  let anchorBody = await getFugueAuthorityVariable(github, winner.anchor_name);
-  if (!anchorBody) {
-    const created = await createFugueAuthorityVariable(github, winner.anchor_name, electionBody);
-    anchorBody = created ? electionBody : await getFugueAuthorityVariable(github, winner.anchor_name);
-  }
-  if (anchorBody !== electionBody) {
-    throw new Error(`Protected Integration request anchor ${winner.anchor_name} did not preserve the elected immutable value.`);
-  }
+    let anchorBody = await getFugueAuthorityVariable(github, winner.anchor_name);
+    if (!anchorBody) {
+      const created = await createFugueAuthorityVariable(github, winner.anchor_name, electionBody);
+      anchorBody = created ? electionBody : await getFugueAuthorityVariable(github, winner.anchor_name);
+    }
+    if (anchorBody !== electionBody) {
+      throw new Error(`Protected Integration request anchor ${winner.anchor_name} did not preserve the elected immutable value.`);
+    }
 
-  return {
-    secret: winner.dispatch_secret,
-    request: winner.request,
-    electionName,
-    authorization: integrationDispatchAuthorizationSchema.parse({
-      secret_digest: winner.secret_digest,
-      authorized_at: winner.authorized_at,
-      anchor_name: winner.anchor_name,
-    }),
-  };
+    return {
+      secret: winner.dispatch_secret,
+      request: winner.request,
+      electionName,
+      authorization: integrationDispatchAuthorizationSchema.parse({
+        secret_digest: winner.secret_digest,
+        authorized_at: winner.authorized_at,
+        anchor_name: winner.anchor_name,
+      }),
+    };
+  });
 }
 
 async function verifyIntegrationDispatchAnchor(
@@ -778,11 +785,13 @@ export async function getIntegrationRunStartEvidence(
 
 export async function releaseIntegrationAuthorityVariable(github: FugueGitHub, record: IntegrationRecord): Promise<void> {
   if (!record.dispatch) return;
-  await deleteFugueAuthorityVariable(github, integrationDispatchFenceName(record.request.request_id));
-  await deleteFugueAuthorityVariable(github, record.dispatch.anchor_name);
-  await deleteFugueAuthorityVariable(github, integrationBindingWitnessName(record.request.request_id));
-  await deleteFugueAuthorityVariable(github, integrationRunStartVariableName(record.request));
-  await releaseIntegrationCommit(github, record.request.request_id);
+  await withFugueAuthorityNamespaceMutation(github, async () => {
+    await deleteFugueAuthorityVariable(github, integrationDispatchFenceName(record.request.request_id));
+    await deleteFugueAuthorityVariable(github, record.dispatch!.anchor_name);
+    await deleteFugueAuthorityVariable(github, integrationBindingWitnessName(record.request.request_id));
+    await deleteFugueAuthorityVariable(github, integrationRunStartVariableName(record.request));
+    await releaseIntegrationCommit(github, record.request.request_id);
+  });
 }
 
 async function retireIntegrationElection(github: FugueGitHub, electionName: string): Promise<void> {
@@ -1238,25 +1247,63 @@ function historicalWinnerCreatedAt(commit: IntegrationCommit, now: number): stri
   return new Date(Math.max(Date.now(), now, Number.isFinite(commitTime) ? commitTime : 0)).toISOString();
 }
 
+interface HistoricalIntegrationCommitTransaction {
+  commit: IntegrationCommit;
+  protectedBaseSha: string;
+  winnerClaim?: HistoricalIntegrationWinnerClaim;
+}
+
+async function claimHistoricalIntegrationCommitTransaction(
+  github: FugueGitHub,
+  historical: RecoveredHistoricalIntegrationRecord,
+  now: number,
+  claimCommit: () => Promise<IntegrationCommit>,
+  validateCommit?: (commit: IntegrationCommit) => void,
+): Promise<HistoricalIntegrationCommitTransaction> {
+  return withFugueAuthorityNamespaceMutation(github, async () => {
+    const commit = await claimCommit();
+    validateCommit?.(commit);
+    const protectedBase = await readRepositoryDefaultBranchIdentity(github);
+    if (protectedBase.sha.toLowerCase() === historical.record.identity.baseSha.toLowerCase()) {
+      return { commit, protectedBaseSha: protectedBase.sha };
+    }
+    const winnerClaim = await claimHistoricalIntegrationWinnerForRevision(
+      github,
+      historical,
+      commit,
+      protectedBase.sha,
+      historicalWinnerCreatedAt(commit, now),
+    );
+    return { commit, protectedBaseSha: protectedBase.sha, winnerClaim };
+  });
+}
+
 async function ensureHistoricalIntegrationWinner(
   github: FugueGitHub,
   historical: RecoveredHistoricalIntegrationRecord,
   proposedCommit: IntegrationCommit,
   now: number,
+  preclaimedClaim?: HistoricalIntegrationWinnerClaim,
 ): Promise<HistoricalIntegrationWinner | undefined> {
-  const existing = await recoverHistoricalIntegrationWinner(github, historical);
-  if (existing) return existing;
-  const protectedBase = await readRepositoryDefaultBranchIdentity(github);
-  const claimCreatedAt = historicalWinnerCreatedAt(proposedCommit, now);
-  let claim: HistoricalIntegrationWinnerClaim;
-  try {
-    claim = await claimHistoricalIntegrationWinnerForRevision(
-      github, historical, proposedCommit, protectedBase.sha, claimCreatedAt,
-    );
-  } catch (error) {
-    const latest = await readRepositoryDefaultBranchIdentity(github);
-    if (latest.sha.toLowerCase() !== protectedBase.sha.toLowerCase()) return undefined;
-    throw error;
+  let claim = preclaimedClaim;
+  if (claim) {
+    if (!historicalWinnerClaimMatches(github, claim, historical)) {
+      throw new Error(`Historical Integration winner claim for ${historical.record.request.request_id} is malformed or belongs to another historical identity.`);
+    }
+  } else {
+    const existing = await recoverHistoricalIntegrationWinner(github, historical);
+    if (existing) return existing;
+    const protectedBase = await readRepositoryDefaultBranchIdentity(github);
+    const claimCreatedAt = historicalWinnerCreatedAt(proposedCommit, now);
+    try {
+      claim = await claimHistoricalIntegrationWinnerForRevision(
+        github, historical, proposedCommit, protectedBase.sha, claimCreatedAt,
+      );
+    } catch (error) {
+      const latest = await readRepositoryDefaultBranchIdentity(github);
+      if (latest.sha.toLowerCase() !== protectedBase.sha.toLowerCase()) return undefined;
+      throw error;
+    }
   }
 
   // This read is causally after acquiring the revision-qualified create-only H claim. If a stale
@@ -1465,46 +1512,48 @@ async function releaseVerifiedHistoricalIntegrationAuthority(
   record: IntegrationRecord,
 ): Promise<void> {
   if (!record.dispatch) return;
-  const beforeCommit = [
-    integrationDispatchFenceName(record.request.request_id),
-    record.dispatch.anchor_name,
-    integrationBindingWitnessName(record.request.request_id),
-    integrationRunStartVariableName(record.request),
-  ];
-  for (const name of beforeCommit) {
-    const value = await getFugueAuthorityVariable(github, name);
-    if (value === undefined) continue;
-    if (await historicalTransientMatchesRecord(github, name, value, record)) {
-      await deleteFugueAuthorityVariable(github, name);
+  await withFugueAuthorityNamespaceMutation(github, async () => {
+    const beforeCommit = [
+      integrationDispatchFenceName(record.request.request_id),
+      record.dispatch!.anchor_name,
+      integrationBindingWitnessName(record.request.request_id),
+      integrationRunStartVariableName(record.request),
+    ];
+    for (const name of beforeCommit) {
+      const value = await getFugueAuthorityVariable(github, name);
+      if (value === undefined) continue;
+      if (await historicalTransientMatchesRecord(github, name, value, record)) {
+        await deleteFugueAuthorityVariable(github, name);
+      }
     }
-  }
 
-  const claimPrefix = historicalIntegrationWinnerClaimPrefix(record.request.request_id);
-  const claims = (await listFugueAuthorityVariables(github, claimPrefix)).sort((left, right) => left.name.localeCompare(right.name));
-  let claimBudget = HISTORICAL_INTEGRATION_WINNER_CLAIM_CLEANUP_BUDGET;
-  for (const variable of claims) {
-    if (claimBudget <= 0) break;
-    const claim = parseHistoricalJson(variable.value, historicalIntegrationWinnerClaimSchema);
-    if (!claim || variable.name !== historicalIntegrationWinnerClaimName(claim.request_id, claim.recovery_base_sha) ||
-        !historicalWinnerClaimMatches(github, claim, historical)) continue;
-    await deleteFugueAuthorityVariable(github, variable.name);
-    claimBudget -= 1;
-  }
-  const remainingClaim = (await listFugueAuthorityVariables(github, claimPrefix)).some((variable) => {
-    const claim = parseHistoricalJson(variable.value, historicalIntegrationWinnerClaimSchema);
-    return Boolean(claim && variable.name === historicalIntegrationWinnerClaimName(claim.request_id, claim.recovery_base_sha) &&
-      historicalWinnerClaimMatches(github, claim, historical));
+    const claimPrefix = historicalIntegrationWinnerClaimPrefix(record.request.request_id);
+    const claims = (await listFugueAuthorityVariables(github, claimPrefix)).sort((left, right) => left.name.localeCompare(right.name));
+    let claimBudget = HISTORICAL_INTEGRATION_WINNER_CLAIM_CLEANUP_BUDGET;
+    for (const variable of claims) {
+      if (claimBudget <= 0) break;
+      const claim = parseHistoricalJson(variable.value, historicalIntegrationWinnerClaimSchema);
+      if (!claim || variable.name !== historicalIntegrationWinnerClaimName(claim.request_id, claim.recovery_base_sha) ||
+          !historicalWinnerClaimMatches(github, claim, historical)) continue;
+      await deleteFugueAuthorityVariable(github, variable.name);
+      claimBudget -= 1;
+    }
+    const remainingClaim = (await listFugueAuthorityVariables(github, claimPrefix)).some((variable) => {
+      const claim = parseHistoricalJson(variable.value, historicalIntegrationWinnerClaimSchema);
+      return Boolean(claim && variable.name === historicalIntegrationWinnerClaimName(claim.request_id, claim.recovery_base_sha) &&
+        historicalWinnerClaimMatches(github, claim, historical));
+    });
+    if (remainingClaim) return;
+
+    // C is deliberately last. A producer that was already running before historical cleanup either
+    // still owns a valid H transaction claim (so C is retained) or recreates H after cleanup and must
+    // perform the post-H durable-winner read before it can publish an opposite historical outcome.
+    const commitName = integrationCommitVariableName(record.request.request_id);
+    const commitValue = await getFugueAuthorityVariable(github, commitName);
+    if (commitValue !== undefined && await historicalTransientMatchesRecord(github, commitName, commitValue, record)) {
+      await deleteFugueAuthorityVariable(github, commitName);
+    }
   });
-  if (remainingClaim) return;
-
-  // C is deliberately last. A producer that was already running before historical cleanup either
-  // still owns a valid H transaction claim (so C is retained) or recreates H after cleanup and must
-  // perform the post-H durable-winner read before it can publish an opposite historical outcome.
-  const commitName = integrationCommitVariableName(record.request.request_id);
-  const commitValue = await getFugueAuthorityVariable(github, commitName);
-  if (commitValue !== undefined && await historicalTransientMatchesRecord(github, commitName, commitValue, record)) {
-    await deleteFugueAuthorityVariable(github, commitName);
-  }
 }
 
 async function reclaimHistoricalIntegrationWinnerClaimOrphans(
@@ -1516,6 +1565,7 @@ async function reclaimHistoricalIntegrationWinnerClaimOrphans(
   const claims = variables
     .filter((variable) => variable.name.startsWith(INTEGRATION_HISTORICAL_WINNER_PREFIX))
     .sort((left, right) => left.name.localeCompare(right.name));
+  const reclaimable: Array<{ name: string; value: string }> = [];
   for (const variable of claims) {
     if (budget <= 0) break;
     const claim = parseHistoricalJson(variable.value, historicalIntegrationWinnerClaimSchema);
@@ -1565,9 +1615,15 @@ async function reclaimHistoricalIntegrationWinnerClaimOrphans(
       historicalBody: historical.body,
       durableWinnerCommit: winner.commit,
     })) continue;
-    if (await getFugueAuthorityVariable(github, variable.name) !== variable.value) continue;
-    await deleteFugueAuthorityVariable(github, variable.name);
+    reclaimable.push(variable);
   }
+  if (!reclaimable.length) return;
+  await withFugueAuthorityNamespaceMutation(github, async () => {
+    for (const variable of reclaimable) {
+      if (await getFugueAuthorityVariable(github, variable.name) !== variable.value) continue;
+      await deleteFugueAuthorityVariable(github, variable.name);
+    }
+  });
 }
 
 async function reclaimHistoricalIntegrationAuthorityVariables(
@@ -1611,10 +1667,12 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
 
     const context = integrationCommitContext(record)!;
     let commit = await readIntegrationCommit(github, context);
+    let commitProtectedBaseSha: string | undefined;
+    let preclaimedWinnerClaim: HistoricalIntegrationWinnerClaim | undefined;
     if (!commit) {
       const candidate = await historicalExactCandidateFromHints(github, historical, group);
       if (candidate) {
-        commit = await claimIntegrationCommit(github, context, integrationExactRunCommitSchema.parse({
+        const candidateCommit = integrationExactRunCommitSchema.parse({
           version: 1,
           kind: "integration_exact_run_commit",
           request_id: context.requestId,
@@ -1626,7 +1684,22 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
           run_attempt: 1,
           run_created_at: candidate.createdAt,
           html_url: candidate.htmlUrl,
-        }));
+        });
+        const transaction = await claimHistoricalIntegrationCommitTransaction(
+          github,
+          historical,
+          now,
+          () => claimIntegrationCommit(github, context, candidateCommit),
+          (winner) => {
+            if (winner.kind === "integration_exact_run_commit" &&
+                (winner.run_id !== candidate.runId || winner.html_url !== candidate.htmlUrl)) {
+              throw new Error(`Historical Integration request ${record.request.request_id} has protected exact-run evidence conflicting with C.`);
+            }
+          },
+        );
+        commit = transaction.commit;
+        commitProtectedBaseSha = transaction.protectedBaseSha;
+        preclaimedWinnerClaim = transaction.winnerClaim;
       }
     }
 
@@ -1636,8 +1709,8 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
       if (exactEvidence && (exactEvidence.runId !== binding.id || exactEvidence.htmlUrl !== binding.html_url)) {
         throw new Error(`Historical Integration request ${record.request.request_id} has protected exact-run evidence conflicting with C.`);
       }
-      const protectedBase = await readRepositoryDefaultBranchIdentity(github);
-      if (protectedBase.sha.toLowerCase() === record.identity.baseSha.toLowerCase()) {
+      const protectedBaseSha = commitProtectedBaseSha ?? (await readRepositoryDefaultBranchIdentity(github)).sha;
+      if (protectedBaseSha.toLowerCase() === record.identity.baseSha.toLowerCase()) {
         await bindDispatchedIntegrationRun(
           github,
           { identity: record.identity } as EvaluationSnapshot,
@@ -1648,7 +1721,7 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
         );
         continue;
       }
-      const winner = await ensureHistoricalIntegrationWinner(github, historical, commit, now);
+      const winner = await ensureHistoricalIntegrationWinner(github, historical, commit, now, preclaimedWinnerClaim);
       if (!winner) continue;
       await releaseVerifiedHistoricalIntegrationAuthority(
         github, historical, historicalRecordFromWinner(github, historical, winner),
@@ -1661,18 +1734,27 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
       const fence = parseHistoricalJson(fenceHint.raw, historicalIntegrationFenceSchema);
       if (fence && historicalFenceMatchesRecord(fence, record)) {
         const terminalAt = new Date(Math.max(now, Date.parse(record.created_at) + 1)).toISOString();
-        commit = await claimIdentityLostIntegrationCommit(github, context, {
+        const identityLostCandidate: IntegrationIdentityLostCandidate = {
           boundaryCreatedAt: fence.created_at,
           fenceDigest: `sha256:${createHash("sha256").update(fenceHint.raw, "utf8").digest("hex")}`,
           createdAt: terminalAt,
-        });
+        };
+        const transaction = await claimHistoricalIntegrationCommitTransaction(
+          github,
+          historical,
+          now,
+          () => claimIdentityLostIntegrationCommit(github, context, identityLostCandidate),
+        );
+        commit = transaction.commit;
+        commitProtectedBaseSha = transaction.protectedBaseSha;
+        preclaimedWinnerClaim = transaction.winnerClaim;
       }
     }
 
     if (commit?.kind === "integration_exact_run_commit") {
-      const protectedBase = await readRepositoryDefaultBranchIdentity(github);
-      if (protectedBase.sha.toLowerCase() === record.identity.baseSha.toLowerCase()) continue;
-      const winner = await ensureHistoricalIntegrationWinner(github, historical, commit, now);
+      const protectedBaseSha = commitProtectedBaseSha ?? (await readRepositoryDefaultBranchIdentity(github)).sha;
+      if (protectedBaseSha.toLowerCase() === record.identity.baseSha.toLowerCase()) continue;
+      const winner = await ensureHistoricalIntegrationWinner(github, historical, commit, now, preclaimedWinnerClaim);
       if (!winner) continue;
       await releaseVerifiedHistoricalIntegrationAuthority(
         github, historical, historicalRecordFromWinner(github, historical, winner),
@@ -1680,8 +1762,8 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
       continue;
     }
     if (commit?.kind === "integration_identity_lost_commit") {
-      const protectedBase = await readRepositoryDefaultBranchIdentity(github);
-      if (protectedBase.sha.toLowerCase() === record.identity.baseSha.toLowerCase()) {
+      const protectedBaseSha = commitProtectedBaseSha ?? (await readRepositoryDefaultBranchIdentity(github)).sha;
+      if (protectedBaseSha.toLowerCase() === record.identity.baseSha.toLowerCase()) {
         await publishIntegrationRecord(github, {
           ...record,
           dispatch_started_at: record.dispatch_started_at ?? commit.boundary_created_at,
@@ -1697,7 +1779,7 @@ async function reclaimHistoricalIntegrationAuthorityVariables(
         });
         continue;
       }
-      const winner = await ensureHistoricalIntegrationWinner(github, historical, commit, now);
+      const winner = await ensureHistoricalIntegrationWinner(github, historical, commit, now, preclaimedWinnerClaim);
       if (!winner) continue;
       await releaseVerifiedHistoricalIntegrationAuthority(
         github, historical, historicalRecordFromWinner(github, historical, winner),
@@ -1714,8 +1796,10 @@ async function abandonIntegrationAuthorization(
   electionName: string,
   request: IntegrationRequest,
 ): Promise<void> {
-  await deleteFugueAuthorityVariable(github, integrationAnchorVariableName(request));
-  await deleteFugueAuthorityVariable(github, electionName);
+  await withFugueAuthorityNamespaceMutation(github, async () => {
+    await deleteFugueAuthorityVariable(github, integrationAnchorVariableName(request));
+    await deleteFugueAuthorityVariable(github, electionName);
+  });
 }
 
 function integrationAuthorizationAge(anchor: IntegrationDispatchAnchor, now: number): number {
@@ -1729,12 +1813,20 @@ export async function reclaimOrphanIntegrationAuthorityVariables(
   currentIdentities?: IntegrationRequest["identity"][],
 ): Promise<void> {
   const variables = await listFugueAuthorityVariables(github, "FUGUE_INT_");
+  const expectedValues = new Map(variables.map((variable) => [variable.name, variable.value]));
+  const scheduled = new Set<string>();
+  const reclaimable: string[] = [];
+  const scheduleReclaim = (name: string): void => {
+    if (!expectedValues.has(name) || scheduled.has(name)) return;
+    scheduled.add(name);
+    reclaimable.push(name);
+  };
   const anchors = new Map<string, IntegrationDispatchAnchor>();
   for (const variable of variables) {
     if (!variable.name.startsWith(INTEGRATION_ELECTION_PREFIX) && !variable.name.startsWith(INTEGRATION_ANCHOR_PREFIX)) continue;
     const anchor = await verifiedIntegrationAnchor(github, variable.value);
     if (!anchor) {
-      await deleteFugueAuthorityVariable(github, variable.name);
+      scheduleReclaim(variable.name);
       continue;
     }
     if (variable.name.startsWith(INTEGRATION_ANCHOR_PREFIX)) anchors.set(variable.name, anchor);
@@ -1749,12 +1841,9 @@ export async function reclaimOrphanIntegrationAuthorityVariables(
       if (error instanceof DurableProtocolRecoveryPendingError) continue;
       throw error;
     }
-    if (current?.request.request_id === anchor.request.request_id) {
-      await deleteFugueAuthorityVariable(github, variable.name);
-      continue;
-    }
-    await deleteFugueAuthorityVariable(github, variable.name);
-    await deleteFugueAuthorityVariable(github, anchor.anchor_name);
+    scheduleReclaim(variable.name);
+    if (current?.request.request_id === anchor.request.request_id) continue;
+    scheduleReclaim(anchor.anchor_name);
   }
 
   for (const [name, anchor] of anchors) {
@@ -1766,7 +1855,17 @@ export async function reclaimOrphanIntegrationAuthorityVariables(
       throw error;
     }
     if (current?.request.request_id === anchor.request.request_id) continue;
-    await deleteFugueAuthorityVariable(github, name);
+    scheduleReclaim(name);
+  }
+
+  if (reclaimable.length) {
+    await withFugueAuthorityNamespaceMutation(github, async () => {
+      for (const name of reclaimable) {
+        const expected = expectedValues.get(name);
+        if (expected === undefined || await getFugueAuthorityVariable(github, name) !== expected) continue;
+        await deleteFugueAuthorityVariable(github, name);
+      }
+    });
   }
 
   if (currentIdentities !== undefined) {
