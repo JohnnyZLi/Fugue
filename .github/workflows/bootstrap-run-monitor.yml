@@ -23,7 +23,7 @@ jobs:
           node --input-type=module <<'NODE'
           const repo = process.env.GITHUB_REPOSITORY;
           const sha = process.env.GITHUB_SHA;
-          const expectedHead = 'ae2cd20691d63ce89c977c099a2f05d29fb1452e';
+          const expectedHead = '789c85c5de96652f1ef2350cf3d87abadcb06c5e';
           const headers = {
             Accept: 'application/vnd.github+json',
             Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
