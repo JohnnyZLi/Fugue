@@ -267,7 +267,14 @@ describe("GitHub-hosted Integration plan", () => {
     expect(control).toContain("Persist protected Integration binding witness");
     expect(control).toContain("actorId !== expectedActorId");
     expect(control).toContain("run.actor?.type !== 'Bot'");
-    expect(control.indexOf("Persist protected Integration binding witness")).toBeLessThan(control.indexOf("uses: actions/checkout@v4"));
+    const protectedCheckout = control.indexOf("ref: ${{ github.workflow_sha }}");
+    const protectedBuild = control.indexOf("- run: npm run build", protectedCheckout);
+    const bindingWitness = control.indexOf("- name: Persist protected Integration binding witness", protectedBuild);
+    expect(control).toContain("withFugueAuthorityNamespaceMutation");
+    expect(control).toContain("persist-credentials: false");
+    expect(protectedCheckout).toBeGreaterThanOrEqual(0);
+    expect(protectedBuild).toBeGreaterThan(protectedCheckout);
+    expect(bindingWitness).toBeGreaterThan(protectedBuild);
   });
 
   it("makes bounded monotonic progress across arbitrarily deep later history and page shifts", () => {
@@ -437,15 +444,22 @@ describe("request-local Integration terminal serialization", () => {
     const control = readFileSync(new URL("../.github/workflows/fugue-control-plane.yml", import.meta.url), "utf8");
     const integration = readFileSync(new URL("../.github/workflows/fugue-integration.yml", import.meta.url), "utf8");
 
-    const bCommit = control.indexOf("const committedRaw =");
+    const bGuard = control.indexOf("const outcome = await withFugueAuthorityNamespaceMutation");
+    const bCommit = control.indexOf("const committedRaw =", bGuard);
+    const bIdentityLost = control.indexOf("if (committed?.kind === 'integration_identity_lost_commit') return 'identity_lost';", bCommit);
     const bRevalidate = control.indexOf("const fenceAfterCommit =", bCommit);
     const bPublish = control.indexOf("const witness =", bCommit);
+    const bGuardReturn = control.indexOf("return 'bound';", bPublish);
+    const bExit = control.indexOf("if (outcome !== 'bound') process.exit(0);", bGuardReturn);
     expect(control).toContain("FUGUE_INT_C_${suffix}");
-    expect(control).toContain("integration_identity_lost_commit') process.exit(0)");
-    expect(bCommit).toBeGreaterThanOrEqual(0);
-    expect(bRevalidate).toBeGreaterThan(bCommit);
+    expect(bGuard).toBeGreaterThanOrEqual(0);
+    expect(bCommit).toBeGreaterThan(bGuard);
+    expect(bIdentityLost).toBeGreaterThan(bCommit);
+    expect(bRevalidate).toBeGreaterThan(bIdentityLost);
     expect(bPublish).toBeGreaterThan(bRevalidate);
-    expect(control).toContain("await deleteVariable(commitName)");
+    expect(bGuardReturn).toBeGreaterThan(bPublish);
+    expect(bExit).toBeGreaterThan(bGuardReturn);
+    expect(control).toContain("await deleteFugueAuthorityVariable(authorityGithub, commitName)");
 
     const sCommit = integration.indexOf("const commitVariable =");
     const sFenceRevalidate = integration.indexOf("const fenceAfterCommit =", sCommit);
