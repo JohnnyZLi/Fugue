@@ -7,6 +7,14 @@ import {
   deleteFugueAuthorityVariable,
   withFugueAuthorityNamespaceMutation,
 } from "../src/core/authority-namespace.js";
+import { createIntegrationRecord, createIntegrationRequest } from "../src/core/integration-plan.js";
+import {
+  integrationAnchorVariableName,
+  integrationCommitVariableName,
+  integrationRunStartVariableName,
+  reclaimOrphanIntegrationAuthorityVariables,
+  releaseIntegrationAuthorityVariable,
+} from "../src/core/integration-status.js";
 import { recoverDurableProtocolRecord } from "../src/core/state.js";
 
 vi.mock("../src/core/provenance.js", async (importOriginal) => {
@@ -288,28 +296,106 @@ describe("Authority namespace pagination coherence", () => {
     expect(variables).toHaveLength(500);
   });
 
-  it("keeps bounded cleanup cost by batching one logical cleanup transaction", async () => {
+  it("keeps production terminal F/A/B/S/C cleanup to one namespace preflight with C last", async () => {
     process.env.FUGUE_AUTHORITY_TOKEN = "authority-test-token";
+    const createdAt = "2026-08-22T00:00:00.000Z";
+    const request = createIntegrationRequest({
+      prNumber: 24,
+      headSha: "a".repeat(40),
+      baseBranch: "main",
+      baseSha: BASE,
+      policyDigest: "policy-test",
+      protocolVersion: 1,
+      issueNumber: 24,
+      workId: "work-24",
+      workSpecDigest: "work-spec-test",
+    }, createdAt, "3".repeat(16));
+    const anchorName = integrationAnchorVariableName(request);
+    const record = createIntegrationRecord(request, {
+      dispatch: {
+        secret_digest: "4".repeat(64),
+        authorized_at: createdAt,
+        anchor_name: anchorName,
+      },
+      terminal: {
+        state: "failure",
+        detail: "terminal writer budget regression",
+        created_at: createdAt,
+      },
+      createdAt,
+    });
+    const suffix = createHash("sha256").update(request.request_id, "utf8").digest("hex").slice(0, 32).toUpperCase();
+    const terminalNames = [
+      `FUGUE_INT_F_${suffix}`,
+      anchorName,
+      `FUGUE_INT_B_${suffix}`,
+      integrationRunStartVariableName(request),
+      integrationCommitVariableName(request.request_id),
+    ];
     const variables = Array.from({ length: 500 }, (_, index) => ({
       name: `UNRELATED_${String(index).padStart(4, "0")}`,
       value: "unrelated",
     }));
     variables[0] = { name: IDLE, value: `${IDLE_PREFIX}:${"8".repeat(32)}` };
-    const oldNames = Array.from({ length: 5 }, (_, index) => `FUGUE_INT_F_${String(index + 1).padStart(32, "A")}`);
-    oldNames.forEach((name, index) => { variables[index + 1] = { name, value: `stale-${index}` }; });
+    terminalNames.forEach((name, index) => { variables[index + 1] = { name, value: `terminal-${index}` }; });
     const writer = github("writer-cleanup");
     const fetchMock = installMutableAuthorityApi(variables);
 
-    await withFugueAuthorityNamespaceMutation(writer, async () => {
-      for (const name of oldNames) await deleteFugueAuthorityVariable(writer, name);
-    });
+    await releaseIntegrationAuthorityVariable(writer, record);
 
     const listRequests = fetchMock.mock.calls.filter(([input, init]) => {
       const { url, method } = requestParts(input, init);
       return method === "GET" && url.pathname === "/repos/writer-cleanup/repo/actions/variables" && url.searchParams.has("page");
     });
+    const guardPatches = fetchMock.mock.calls.filter(([input, init]) => {
+      const { url, method } = requestParts(input, init);
+      return method === "PATCH" && url.pathname.startsWith("/repos/writer-cleanup/repo/actions/variables/FUGUE_D3G");
+    });
+    const deletes = fetchMock.mock.calls.flatMap(([input, init]) => {
+      const { url, method } = requestParts(input, init);
+      const encodedName = url.pathname.match(/\/actions\/variables\/(.+)$/)?.[1];
+      return method === "DELETE" && encodedName ? [decodeURIComponent(encodedName)] : [];
+    }).filter((name) => name.startsWith("FUGUE_INT_"));
     expect(listRequests).toHaveLength(5);
-    for (const name of oldNames) expect(variables.some((entry) => entry.name === name)).toBe(false);
+    expect(guardPatches).toHaveLength(2);
+    expect(deletes).toEqual(terminalNames);
+    for (const name of terminalNames) expect(variables.some((entry) => entry.name === name)).toBe(false);
+  });
+
+  it("keeps production orphan reclamation to one discovery scan plus one mutation preflight", async () => {
+    process.env.FUGUE_AUTHORITY_TOKEN = "authority-test-token";
+    const variables = Array.from({ length: 500 }, (_, index) => ({
+      name: `UNRELATED_${String(index).padStart(4, "0")}`,
+      value: "unrelated",
+    }));
+    variables[0] = { name: IDLE, value: `${IDLE_PREFIX}:${"6".repeat(32)}` };
+    const invalidElection = `FUGUE_INT_E_${String(24).padStart(10, "0")}_${"A".repeat(16)}_${"B".repeat(8)}`;
+    const invalidAnchor = `FUGUE_INT_A_${String(24).padStart(10, "0")}_${"C".repeat(16)}`;
+    variables[1] = { name: invalidElection, value: "malformed-election" };
+    variables[2] = { name: invalidAnchor, value: "malformed-anchor" };
+    const writer = github("writer-orphan-cleanup");
+    const fetchMock = installMutableAuthorityApi(variables);
+
+    await reclaimOrphanIntegrationAuthorityVariables(writer, Date.parse("2026-08-22T00:30:00.000Z"));
+
+    const listRequests = fetchMock.mock.calls.filter(([input, init]) => {
+      const { url, method } = requestParts(input, init);
+      return method === "GET" && url.pathname === "/repos/writer-orphan-cleanup/repo/actions/variables" && url.searchParams.has("page");
+    });
+    const guardPatches = fetchMock.mock.calls.filter(([input, init]) => {
+      const { url, method } = requestParts(input, init);
+      return method === "PATCH" && url.pathname.startsWith("/repos/writer-orphan-cleanup/repo/actions/variables/FUGUE_D3G");
+    });
+    const deletes = fetchMock.mock.calls.flatMap(([input, init]) => {
+      const { url, method } = requestParts(input, init);
+      const encodedName = url.pathname.match(/\/actions\/variables\/(.+)$/)?.[1];
+      return method === "DELETE" && encodedName ? [decodeURIComponent(encodedName)] : [];
+    }).filter((name) => name.startsWith("FUGUE_INT_"));
+    expect(listRequests).toHaveLength(10);
+    expect(guardPatches).toHaveLength(2);
+    expect(deletes).toEqual([invalidElection, invalidAnchor]);
+    expect(variables.some((entry) => entry.name === invalidElection)).toBe(false);
+    expect(variables.some((entry) => entry.name === invalidAnchor)).toBe(false);
   });
 
   it("fails closed on idle plus active corruption after a previously successful self-rotated epoch", async () => {
